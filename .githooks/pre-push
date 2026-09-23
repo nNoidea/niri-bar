@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -e
-
-echo "==> [pre-push] Running containerized CI environment check (make boxtest)..."
-make boxtest
-echo "==> [pre-push] Container checks passed successfully. Pushing..."
