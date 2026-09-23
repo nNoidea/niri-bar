@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+
+echo "==> [pre-commit] Running local CI checks (fmt, clippy, unit tests)..."
+make test
+echo "==> [pre-commit] Checks passed successfully."
