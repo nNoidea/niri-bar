@@ -1,0 +1,355 @@
+/* Clean Base Reset */
+*,
+*:backdrop {
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    background-image: none;
+    font-family: "JetBrainsMono Nerd Font", "AdwaitaMono Nerd Font", monospace;
+    font-size: 13px;
+    min-height: 0;
+    min-width: 0;
+}
+
+label,
+label:backdrop {
+    margin: 0;
+    padding: 0;
+}
+
+window,
+window.background,
+window.niri-bar,
+window:backdrop,
+window.niri-bar:backdrop,
+.niri-bar,
+.modules-box {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+/* Module and Taskbar button reset */
+button,
+button:backdrop,
+button.module-item,
+button.module-item:backdrop,
+button.app-button,
+button.app-button:backdrop,
+button.tray-item,
+button.tray-item:backdrop,
+.module-item button,
+.taskbar button,
+.tray button {
+    background: transparent;
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    border-radius: 8px;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+}
+
+/* Hover effect for interactive elements */
+button.clickable:hover,
+button.module-item.clickable:hover,
+button.app-button:hover,
+button.tray-item:hover,
+.taskbar button:hover,
+.tray button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.taskbar button:hover,
+.taskbar button.app-button:hover {
+    background: rgba(88, 91, 112, 0.45);
+    background-color: rgba(88, 91, 112, 0.45);
+}
+
+/* Non-clickable modules or modules with disabled hover */
+button.non-clickable:hover,
+button.module-item.non-clickable:hover,
+button.no-hover:hover,
+.no-hover:hover {
+    background: transparent;
+    background-color: transparent;
+}
+
+/* Tray Specific Styling */
+.tray {
+    margin: 4px 0;
+}
+
+button.tray-item,
+.tray-item {
+    padding: 0;
+    margin: 2px 0;
+    border-radius: 6px;
+    min-width: 0;
+    min-height: 0;
+}
+
+/* Module Styling - Vertical Dividers */
+window.niri-bar.vertical button.module-item {
+    padding: 8px 0;
+    min-height: 30px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
+}
+
+/* Module Styling - Horizontal Dividers */
+window.niri-bar.horizontal button.module-item {
+    padding: 0 8px;
+    min-width: 30px;
+    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
+}
+
+/* Taskbar specific buttons - Perfect Square Boxes */
+.taskbar {
+    padding: 0;
+    margin: 0;
+}
+
+.taskbar button,
+.taskbar button.app-button {
+    padding: 0;
+    margin: 0;
+    min-width: 50px;
+    min-height: 50px;
+    border-radius: 8px;
+}
+
+.taskbar button image,
+.taskbar button.app-button image {
+    padding: 0;
+    margin: 0;
+}
+
+.taskbar button.focused,
+.taskbar button.app-button.focused {
+    background: #585b70;
+    background-color: #585b70;
+}
+
+
+/* Dragged icon / ghost landing placeholder */
+.taskbar button.drag-placeholder,
+.taskbar button.is-dragging,
+.taskbar button.cross-monitor-preview {
+    opacity: 0.55;
+    background: rgba(137, 180, 250, 0.15);
+    box-shadow: inset 0 0 0 2px #89b4fa;
+}
+
+/* Collapsed source icon when dragged over another monitor */
+.taskbar button.drag-source-away {
+    opacity: 0;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+}
+
+/* Individual Module Accent Colors */
+.module-volume {
+    color: #fab387;
+}
+
+.module-volume.muted {
+    color: #585b70;
+}
+
+.module-brightness {
+    color: #f9e2af;
+}
+
+.module-bluetooth {
+    color: #89b4fa;
+}
+
+.module-bluetooth.loading {
+    color: #f9e2af;
+}
+
+.module-bluetooth.disabled,
+.module-bluetooth.off {
+    color: #585b70;
+}
+
+.module-network {
+    color: #94e2d5;
+}
+
+.module-network.disconnected {
+    color: #f38ba8;
+}
+
+.module-memory {
+    color: #f9e2af;
+}
+
+.module-battery {
+    color: #f9e2af;
+}
+
+.module-battery.charging {
+    color: #a6e3a1;
+}
+
+.module-battery.warning:not(.charging) {
+    color: #fab387;
+}
+
+.module-battery.critical:not(.charging) {
+    color: #f38ba8;
+    animation: blink 0.5s linear infinite alternate;
+}
+
+.module-clock {
+    color: #cba6f7;
+    font-weight: bold;
+}
+
+/* Spacer Module */
+button.module-spacer,
+button.module-spacer:backdrop,
+button.module-spacer label {
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+    border: none;
+}
+
+window.niri-bar.vertical button.module-spacer {
+    border-bottom: none;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+}
+
+window.niri-bar.horizontal button.module-spacer {
+    border-right: none;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+}
+
+button.module-spacer,
+button.module-spacer:hover,
+.module-spacer,
+.module-spacer:hover {
+    background: transparent;
+    background-color: transparent;
+}
+
+
+.module-tray {
+    background-color: transparent;
+}
+
+/* System Tray Popup Menu Dark Mode Styling */
+menu,
+menu.background,
+.tray-menu {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    padding: 3px 2px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+menuitem,
+menuitem.menuitem,
+.tray-menu-item {
+    background-color: transparent;
+    color: #cdd6f4;
+    border-radius: 4px;
+    padding: 3px 8px;
+    margin: 1px 2px;
+    min-height: 0;
+    min-width: 0;
+    transition: background 0.1s ease-in-out;
+}
+
+menuitem label,
+.tray-menu-item label {
+    color: #cdd6f4;
+    font-size: 11px;
+    margin: 0;
+    padding: 0;
+}
+
+menuitem:hover,
+menuitem:selected,
+.tray-menu-item:hover,
+.tray-menu-item:selected {
+    background-color: #45475a;
+    color: #89b4fa;
+}
+
+menuitem:hover label,
+menuitem:selected label,
+.tray-menu-item:hover label,
+.tray-menu-item:selected label {
+    color: #ffffff;
+    font-weight: 500;
+}
+
+menuitem:disabled,
+menuitem:disabled label,
+.tray-menu-item:disabled,
+.tray-menu-item:disabled label {
+    color: #585b70;
+}
+
+separator,
+separator.horizontal,
+menu separator,
+.tray-menu-separator {
+    background-color: #45475a;
+    min-height: 1px;
+    margin: 2px 4px;
+    padding: 0;
+}
+
+checkmenuitem check,
+radiomenuitem radio {
+    min-width: 10px;
+    min-height: 10px;
+    border: 1px solid #585b70;
+    border-radius: 2px;
+    background-color: #313244;
+    color: transparent;
+    margin-right: 5px;
+    padding: 0;
+}
+
+checkmenuitem check:checked,
+radiomenuitem radio:checked {
+    background-color: #89b4fa;
+    border-color: #89b4fa;
+    color: #1e1e2e;
+}
+
+arrow {
+    color: #cdd6f4;
+    min-width: 8px;
+    min-height: 8px;
+}
+
+menuitem:hover arrow,
+menuitem:selected arrow {
+    color: #ffffff;
+}
+
+@keyframes blink {
+    to {
+        color: #ffffff;
+    }
+}

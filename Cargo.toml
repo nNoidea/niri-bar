@@ -1,0 +1,54 @@
+[package]
+name = "niri-bar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["nNoidea"]
+description = "A fast, lightweight, standalone Wayland status bar and spatial window taskbar for Niri"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nNoidea/niri-bar"
+
+# NOTE: GTK3 is intentional. This bar stays resident at all times, so we
+# prefer the lower memory/CPU overhead of GTK3 over GTK4. Do not migrate
+# to gtk4 / gtk4-layer-shell without measuring resident RSS first.
+
+[[bin]]
+name = "niri-bar"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+gdk = "0.18"
+gdk-pixbuf = "0.18"
+gio = "0.18"
+glib = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1"
+async-channel = "2.3"
+chrono = "0.4"
+freedesktop-desktop-entry = "0.8"
+libc = "0.2"
+zbus = { version = "5", features = ["tokio"] }
+zvariant = "5"
+futures-util = "0.3"
+tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# "unwind" (not "abort") so the panic hook in src/logger.rs can log
+# location + payload to stderr / log file / journald.
+panic = "unwind"
+strip = true
+
+[lints.rust]
+# Zero `unsafe` in this codebase; deny so any future use is explicit.
+unsafe_code = "deny"
+missing_debug_implementations = "allow"
+
+[lints.clippy]
+pedantic = "allow"
+nursery = "allow"

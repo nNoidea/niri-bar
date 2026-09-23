@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets --locked -- --test-threads=1
+        env:
+          GDK_BACKEND: memory
+
+  release:
+    name: Release Binary
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release action from commit message
+        id: release_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          # Extract X.Y.Z version from commit message (e.g. 0.1.1, v0.1.1, release 1.0.0)
+          VERSION=$(echo "$COMMIT_MSG" | grep -oP '\b[vV]?\K\d+\.\d+\.\d+\b' | head -n 1 || true)
+
+          if [ -z "$VERSION" ]; then
+            echo "No version pattern found in commit message. Skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found version candidate in commit message: $VERSION"
+
+          # Get latest release tag if one exists
+          LATEST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No prior releases exist. Creating initial release v$VERSION."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "action=create" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LATEST_VERSION=$(echo "$LATEST_TAG" | sed 's/^[vV]//')
+          echo "Latest existing release version: $LATEST_VERSION"
+
+          if [ "$VERSION" = "$LATEST_VERSION" ]; then
+            echo "Requested version matches latest release ($VERSION == $LATEST_VERSION)."
+            echo "Replacing previous release with a fresh build."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "action=replace" >> "$GITHUB_OUTPUT"
+          else
+            OLDER=$(printf "%s\n%s\n" "$VERSION" "$LATEST_VERSION" | sort -V | head -n 1)
+            if [ "$OLDER" = "$VERSION" ]; then
+              echo "Requested version $VERSION is older than latest release $LATEST_VERSION. Skipping release."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Requested version $VERSION is newer than latest release $LATEST_VERSION. Creating release v$VERSION."
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "action=create" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install system dependencies
+        if: steps.release_check.outputs.should_release == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+
+      - name: Install Rust
+        if: steps.release_check.outputs.should_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        if: steps.release_check.outputs.should_release == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary and package
+        if: steps.release_check.outputs.should_release == 'true'
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/package
+          cp target/release/niri-bar dist/package/
+          cp resources/config.default.toml resources/style.default.css dist/package/
+          tar -czvf "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
+          cp target/release/niri-bar dist/niri-bar
+
+      - name: Publish GitHub Release
+        if: steps.release_check.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: "v${{ steps.release_check.outputs.version }}"
+          ACTION: ${{ steps.release_check.outputs.action }}
+        run: |
+          if [ "$ACTION" = "replace" ]; then
+            echo "Deleting existing release and tag $TAG..."
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            git push --delete origin "$TAG" 2>/dev/null || true
+          fi
+
+          echo "Creating release $TAG..."
+          gh release create "$TAG" \
+            dist/niri-bar \
+            "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" \
+            --title "Release $TAG" \
+            --generate-notes

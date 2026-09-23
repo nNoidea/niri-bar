@@ -1,0 +1,110 @@
+# Niri-Bar Configuration File
+position = "left" # "left", "right", "top", "bottom"
+size = 50         # width for vertical bars, height for horizontal bars
+spacing = 0
+
+[taskbar]
+enabled = true
+icon_size = 32
+only_current_workspace = true
+show_tooltips = true
+
+[tray]
+icon_size = 22
+spacing = 4
+
+[modules]
+start = [
+    "spacer",
+    "taskbar",
+]
+end = [
+    "tray",
+    "volume",
+    "bluetooth",
+    "network",
+    "memory",
+    "brightness",
+    "battery",
+    "clock",
+]
+
+[volume]
+step = 10
+max_volume = 150 # Allows up to 150% volume boost
+# on_click_left = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+# on_click_right = "" # Defaults to switching / cycling between audio outputs
+# on_click_middle = "pavucontrol" # e.g. "pavucontrol" or "alacritty -e wiremix"
+
+[volume.levels]
+0 = "\n%v%"
+1 = "\n%v%"
+100 = "\n%v%"
+muted = "\nM"
+
+[bluetooth]
+# on_click_left = "" # Defaults to smart toggle (turns on when off, turns off when on)
+# on_click_right = ""
+# on_click_middle = "blueman-manager"
+
+[bluetooth.modes]
+connected = "󰂱\nOn"
+on = "\nOn"
+off = "󰂲\nOff"
+loading = "󰂯\n..."
+
+[network]
+# on_click_left = "nm-connection-editor"
+# on_click_right = ""
+# on_click_middle = ""
+
+[network.modes]
+wifi = "󰤨\nWiFi"
+lan = "󰈀\nLAN"
+disconnected = "󰤮\nOff"
+
+[memory]
+format = "󰍛\n%uG"
+# on_click_left = "alacritty -e btop"
+# on_click_right = ""
+# on_click_middle = ""
+
+[brightness]
+step = 10
+# on_click_left = ""
+# on_click_right = ""
+# on_click_middle = ""
+
+[brightness.levels]
+0 = "󰃞\n%v%"
+33 = "󰃟\n%v%"
+66 = "󰃠\n%v%"
+100 = "󰃡\n%v%"
+
+[battery]
+warning_threshold = 30
+critical_threshold = 15
+# on_click_left = ""
+# on_click_right = ""
+# on_click_middle = ""
+
+[battery.levels]
+0 = "\n%v%"
+33 = "\n%v%"
+66 = "\n%v%"
+100 = "\n%v%"
+charging = "\n%v%"
+full = "\nFull"
+
+[clock]
+format_vertical = "%H:%M\n%a\n%b\n%d/%m"
+format_horizontal = "%H:%M %a %b %d/%m"
+# on_click_left = ""
+# on_click_right = ""
+# on_click_middle = ""
+
+[spacer]
+size = 5
+# on_click_left = ""
+# on_click_right = ""
+# on_click_middle = ""
