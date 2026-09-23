@@ -39,6 +39,10 @@ pub struct VolumeModule {
 
 impl VolumeModule {
     pub fn new(config: VolumeConfig) -> Self {
+        Self::new_with_worker(config, !cfg!(test))
+    }
+
+    pub fn new_with_worker(config: VolumeConfig, start_worker: bool) -> Self {
         // Never fork+exec on the caller (GTK main) thread. Start with a
         // clearly-stale placeholder; the worker below re-reads immediately
         // and broadcasts the real state.
@@ -52,15 +56,16 @@ impl VolumeModule {
             is_bluetooth: false,
         }));
 
-        let cur_vol = Arc::clone(&current_vol);
-        let cur_muted = Arc::clone(&is_muted);
-        let cur_sink = Arc::clone(&current_sink);
-        let subs = Arc::clone(&subscribers);
-        let cfg = config.clone();
+        if start_worker {
+            let cur_vol = Arc::clone(&current_vol);
+            let cur_muted = Arc::clone(&is_muted);
+            let cur_sink = Arc::clone(&current_sink);
+            let subs = Arc::clone(&subscribers);
+            let cfg = config.clone();
 
-        // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
-        // Supervised: pw-mon session → backoff polling → re-exec, forever.
-        thread::spawn(move || {
+            // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
+            // Supervised: pw-mon session → backoff polling → re-exec, forever.
+            thread::spawn(move || {
             // Initial truth (off GTK thread): replaces the stale placeholder.
             {
                 let (vol, muted) = VolumeModule::read_system_volume();
@@ -159,6 +164,7 @@ impl VolumeModule {
                 }
             } // end supervise loop
         });
+        }
 
         Self {
             config,
@@ -804,6 +810,25 @@ mod tests {
         module.handle_click(MouseButton::Middle);
         assert_eq!(module.current_vol.load(Ordering::Relaxed), 50);
         assert!(!module.is_muted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_volume_click_behavior_stability() {
+        for _ in 0..20 {
+            let config = VolumeConfig::default();
+            let module = VolumeModule::new(config);
+
+            module.current_vol.store(50, Ordering::Relaxed);
+            module.is_muted.store(false, Ordering::Relaxed);
+            module.handle_click(MouseButton::Left);
+            assert_eq!(module.current_vol.load(Ordering::Relaxed), 50);
+            // Allow any background worker to run and attempt to clobber state
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(
+                module.is_muted.load(Ordering::Relaxed),
+                "is_muted was overwritten concurrently by background supervisor thread"
+            );
+        }
     }
 
     #[test]
