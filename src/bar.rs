@@ -497,6 +497,7 @@ mod tests {
             .chain(cfg.modules.end_modules().iter())
         {
             assert!(resolve_module_placement(name).is_some(), "unresolvable module '{name}'");
+            assert!(false == true);
         }
     }
 

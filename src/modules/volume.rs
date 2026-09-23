@@ -66,104 +66,104 @@ impl VolumeModule {
             // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
             // Supervised: pw-mon session → backoff polling → re-exec, forever.
             thread::spawn(move || {
-            // Initial truth (off GTK thread): replaces the stale placeholder.
-            {
-                let (vol, muted) = VolumeModule::read_system_volume();
-                let new_sink = VolumeModule::read_current_sink();
-                cur_vol.store(vol, Ordering::Relaxed);
-                cur_muted.store(muted, Ordering::Relaxed);
-                *crate::util::lock(&cur_sink) = new_sink.clone();
-                crate::modules::broadcast(&subs, |orient| {
-                    VolumeModule::format_state_with_config(&cfg, vol, muted, &new_sink, orient)
-                });
-            }
-            let apply = |vol: u32, muted: bool, new_sink: &SinkInfo| {
-                let old_vol = cur_vol.load(Ordering::Relaxed);
-                let old_muted = cur_muted.load(Ordering::Relaxed);
-                let sink_changed = {
-                    let guard = crate::util::lock(&cur_sink);
-                    *guard != *new_sink
-                };
-                let mut muted = muted;
-
-                // If volume changed while muted (e.g. media keys), auto-unmute sink
-                if old_muted && vol != old_vol {
-                    spawn_command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0");
-                    muted = false;
-                }
-
-                if vol != old_vol || muted != old_muted || sink_changed {
-                    cur_vol.store(vol, Ordering::Relaxed);
-                    cur_muted.store(muted, Ordering::Relaxed);
-                    {
-                        let mut guard = crate::util::lock(&cur_sink);
-                        *guard = new_sink.clone();
-                    }
-
-                    crate::modules::broadcast(&subs, |orient| {
-                        VolumeModule::format_state_with_config(&cfg, vol, muted, new_sink, orient)
-                    });
-                }
-            };
-
-            // Supervise pw-mon forever: event session → backoff polling → re-exec.
-            loop {
-                let spawned_child = VolumeModule::spawn_pw_mon();
-
-                if let Some(mut child) = spawned_child {
-                    if let Some(stdout) = child.stdout.take() {
-                        let reader = BufReader::new(stdout);
-                        for line in reader.lines() {
-                            let l = match line {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    // Transient read error: don't kill the event
-                                    // loop permanently; log and keep listening.
-                                    log_warn!("volume", "pw-mon read error: {e}");
-                                    continue;
-                                }
-                            };
-                            if VolumeModule::is_volume_event_line(&l) {
-                                let (vol, muted) = VolumeModule::read_system_volume();
-                                let new_sink = VolumeModule::read_current_sink();
-                                apply(vol, muted, &new_sink);
-                            }
-                        }
-                    }
-                    // `pw-mon` exited (or stdout closed): reap, then polling.
-                    if let Err(e) = child.kill() {
-                        log_debug!("volume", "pw-mon kill during teardown: {e}");
-                    }
-                    match child.wait() {
-                        Ok(status) => log_debug!("volume", "pw-mon exited with {status}; using polling fallback"),
-                        Err(e) => log_warn!("volume", "Failed waiting on pw-mon: {e}"),
-                    }
-                } else {
-                    log_debug!("volume", "pw-mon unavailable; using polling fallback");
-                }
-
-                // Fallback polling with backoff while PipeWire is down
-                // (250ms → 5s). Returns after ~120 polls so the outer
-                // supervisor re-execs pw-mon to resume event mode.
-                let mut fail_streak: u32 = 0;
-                for _ in 0..120 {
-                    let ok_before = VolumeModule::probe_audio_ok();
+                // Initial truth (off GTK thread): replaces the stale placeholder.
+                {
                     let (vol, muted) = VolumeModule::read_system_volume();
                     let new_sink = VolumeModule::read_current_sink();
-                    apply(vol, muted, &new_sink);
-                    let healthy = ok_before && new_sink.name != "@DEFAULT_AUDIO_SINK@";
-                    if healthy {
-                        fail_streak = 0;
-                        thread::sleep(Duration::from_millis(250));
-                    } else {
-                        fail_streak = fail_streak.saturating_add(1);
-                        let backoff = (250u64.saturating_mul(2u64.saturating_pow(fail_streak.min(5)))).min(5000);
-                        log_debug!("volume", "Audio backend unhealthy, backing off {backoff}ms");
-                        thread::sleep(Duration::from_millis(backoff));
-                    }
+                    cur_vol.store(vol, Ordering::Relaxed);
+                    cur_muted.store(muted, Ordering::Relaxed);
+                    *crate::util::lock(&cur_sink) = new_sink.clone();
+                    crate::modules::broadcast(&subs, |orient| {
+                        VolumeModule::format_state_with_config(&cfg, vol, muted, &new_sink, orient)
+                    });
                 }
-            } // end supervise loop
-        });
+                let apply = |vol: u32, muted: bool, new_sink: &SinkInfo| {
+                    let old_vol = cur_vol.load(Ordering::Relaxed);
+                    let old_muted = cur_muted.load(Ordering::Relaxed);
+                    let sink_changed = {
+                        let guard = crate::util::lock(&cur_sink);
+                        *guard != *new_sink
+                    };
+                    let mut muted = muted;
+
+                    // If volume changed while muted (e.g. media keys), auto-unmute sink
+                    if old_muted && vol != old_vol {
+                        spawn_command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0");
+                        muted = false;
+                    }
+
+                    if vol != old_vol || muted != old_muted || sink_changed {
+                        cur_vol.store(vol, Ordering::Relaxed);
+                        cur_muted.store(muted, Ordering::Relaxed);
+                        {
+                            let mut guard = crate::util::lock(&cur_sink);
+                            *guard = new_sink.clone();
+                        }
+
+                        crate::modules::broadcast(&subs, |orient| {
+                            VolumeModule::format_state_with_config(&cfg, vol, muted, new_sink, orient)
+                        });
+                    }
+                };
+
+                // Supervise pw-mon forever: event session → backoff polling → re-exec.
+                loop {
+                    let spawned_child = VolumeModule::spawn_pw_mon();
+
+                    if let Some(mut child) = spawned_child {
+                        if let Some(stdout) = child.stdout.take() {
+                            let reader = BufReader::new(stdout);
+                            for line in reader.lines() {
+                                let l = match line {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        // Transient read error: don't kill the event
+                                        // loop permanently; log and keep listening.
+                                        log_warn!("volume", "pw-mon read error: {e}");
+                                        continue;
+                                    }
+                                };
+                                if VolumeModule::is_volume_event_line(&l) {
+                                    let (vol, muted) = VolumeModule::read_system_volume();
+                                    let new_sink = VolumeModule::read_current_sink();
+                                    apply(vol, muted, &new_sink);
+                                }
+                            }
+                        }
+                        // `pw-mon` exited (or stdout closed): reap, then polling.
+                        if let Err(e) = child.kill() {
+                            log_debug!("volume", "pw-mon kill during teardown: {e}");
+                        }
+                        match child.wait() {
+                            Ok(status) => log_debug!("volume", "pw-mon exited with {status}; using polling fallback"),
+                            Err(e) => log_warn!("volume", "Failed waiting on pw-mon: {e}"),
+                        }
+                    } else {
+                        log_debug!("volume", "pw-mon unavailable; using polling fallback");
+                    }
+
+                    // Fallback polling with backoff while PipeWire is down
+                    // (250ms → 5s). Returns after ~120 polls so the outer
+                    // supervisor re-execs pw-mon to resume event mode.
+                    let mut fail_streak: u32 = 0;
+                    for _ in 0..120 {
+                        let ok_before = VolumeModule::probe_audio_ok();
+                        let (vol, muted) = VolumeModule::read_system_volume();
+                        let new_sink = VolumeModule::read_current_sink();
+                        apply(vol, muted, &new_sink);
+                        let healthy = ok_before && new_sink.name != "@DEFAULT_AUDIO_SINK@";
+                        if healthy {
+                            fail_streak = 0;
+                            thread::sleep(Duration::from_millis(250));
+                        } else {
+                            fail_streak = fail_streak.saturating_add(1);
+                            let backoff = (250u64.saturating_mul(2u64.saturating_pow(fail_streak.min(5)))).min(5000);
+                            log_debug!("volume", "Audio backend unhealthy, backing off {backoff}ms");
+                            thread::sleep(Duration::from_millis(backoff));
+                        }
+                    }
+                } // end supervise loop
+            });
         }
 
         Self {
