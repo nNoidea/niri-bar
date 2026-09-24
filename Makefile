@@ -10,7 +10,7 @@ all: build
 build:
 	cargo build --release
 
-install: test build
+install: build
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/niri-bar"
 	install -d "$(DESTDIR)$(DATADIR)/niri-bar"
