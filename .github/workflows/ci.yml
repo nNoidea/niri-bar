@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Check & Test
@@ -93,30 +100,36 @@ jobs:
 
       - name: Generate release notes
         if: steps.release_check.outputs.should_release == 'true'
+        env:
+          PREV_TAG: ${{ steps.release_check.outputs.prev_tag }}
         run: |
           mkdir -p dist
-          python3 scripts/generate_changelog.py "${{ steps.release_check.outputs.prev_tag }}" "HEAD" > dist/release_notes.md
+          python3 scripts/generate_changelog.py "$PREV_TAG" "HEAD" > dist/release_notes.md
           cat dist/release_notes.md
 
       - name: Build release binary and package
         if: steps.release_check.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ steps.release_check.outputs.version }}
         run: |
           cargo build --release --locked
           mkdir -p dist/package
           cp target/release/niri-bar dist/package/
           cp resources/config.default.toml resources/style.default.css dist/package/
-          tar -czvf "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
+          tar -czvf "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
           cp target/release/niri-bar dist/niri-bar
 
       - name: Publish GitHub Release
         if: steps.release_check.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: "${{ steps.release_check.outputs.tag }}"
+          TAG: ${{ steps.release_check.outputs.tag }}
+          VERSION: ${{ steps.release_check.outputs.version }}
         run: |
           echo "Creating GitHub Release $TAG with categorized changelog..."
           gh release create "$TAG" \
             dist/niri-bar \
-            "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             --title "Release $TAG" \
             --notes-file dist/release_notes.md
+
