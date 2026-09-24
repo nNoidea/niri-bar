@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
 set -e
+# Prevent accidental leaks of developer username or home directory paths
+CURRENT_USER="$(id -un 2>/dev/null || whoami 2>/dev/null || echo "$USER")"
+if [ -n "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
+    leaks=$(git diff --cached -U0 | \
+        grep -E '^\+[^+]' | \
+        grep -iE "(/home/$CURRENT_USER|\b$CURRENT_USER\b)" || true)
+
+    if [ -n "$leaks" ]; then
+        echo "==> [pre-commit] ERROR: Personal information leak detected in staged changes!" >&2
+        echo "$leaks" >&2
+        echo "Please remove any personal username or home directory path before committing." >&2
+        exit 1
+    fi
+fi
 
 # If Cargo.toml is staged, automatically sync and stage Cargo.lock
 if git diff --cached --name-only | grep -q '^Cargo.toml$'; then
