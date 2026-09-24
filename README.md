@@ -1,6 +1,6 @@
 # niri-bar
 
-A fast, lightweight Wayland status bar and spatial window taskbar built in Rust **SPECIFICALLY for the [Niri](https://github.com/YaLTeR/niri) scrollable-tiling compositor.**
+A fast, lightweight Wayland taskbar built in Rust **SPECIFICALLY for the [Niri](https://github.com/YaLTeR/niri) scrollable-tiling compositor.**
 
 > **Why niri-bar instead of any other bar?**  
 

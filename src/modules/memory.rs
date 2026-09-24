@@ -4,25 +4,26 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::MemoryConfig;
-use crate::modules::{BarModule, ModuleState, ModuleSubscribers, ScrollDirection};
-
-use std::sync::{Arc, Mutex};
+use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
 
 pub struct MemoryModule {
     config: MemoryConfig,
-    subscribers: ModuleSubscribers,
+    core: ModuleCore,
 }
 
 impl MemoryModule {
     pub fn new(config: MemoryConfig) -> Self {
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
-        let subs_clone = Arc::clone(&subscribers);
+        let core = ModuleCore::new();
+        let core_worker = core.clone();
         let cfg = config.clone();
 
         thread::spawn(move || {
             let mut last_used_tenth = -1i64;
 
             loop {
+                if core_worker.is_stopped() {
+                    break;
+                }
                 let (used_gb, total_gb) = MemoryModule::read_memory_static();
 
                 if total_gb > 0.0 {
@@ -31,17 +32,18 @@ impl MemoryModule {
                     if used_tenth != last_used_tenth {
                         last_used_tenth = used_tenth;
 
-                        crate::modules::broadcast(&subs_clone, |orient| {
-                            MemoryModule::format_state_static(&cfg, used_gb, total_gb, orient)
-                        });
+                        core_worker
+                            .broadcast(|orient| MemoryModule::format_state_static(&cfg, used_gb, total_gb, orient));
                     }
                 }
 
-                thread::sleep(Duration::from_secs(2));
+                if core_worker.wait_timeout(Duration::from_secs(2)) {
+                    break;
+                }
             }
         });
 
-        Self { config, subscribers }
+        Self { config, core }
     }
 
     fn read_memory_static() -> (f64, f64) {
@@ -128,8 +130,8 @@ impl BarModule for MemoryModule {
         Self::format_state_static(&self.config, used, total, orientation)
     }
 
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        crate::modules::subscribe_to(&self.subscribers, orientation)
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {

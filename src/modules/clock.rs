@@ -4,13 +4,11 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::ClockConfig;
-use crate::modules::{BarModule, ModuleState, ModuleSubscribers, ScrollDirection};
-
-use std::sync::{Arc, Mutex};
+use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
 
 pub struct ClockModule {
     config: ClockConfig,
-    subscribers: ModuleSubscribers,
+    core: ModuleCore,
 }
 
 /// Specifiers whose value can change within a minute and therefore require
@@ -24,19 +22,21 @@ pub fn needs_per_second_tick(fmt_vert: &str, fmt_horiz: &str) -> bool {
 
 impl ClockModule {
     pub fn new(config: ClockConfig) -> Self {
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
-        let subs_clone = Arc::clone(&subscribers);
+        let core = ModuleCore::new();
+        let core_worker = core.clone();
         let cfg = config.clone();
 
         let fmt_vert = cfg.format_vertical.clone();
         let fmt_horiz = cfg.format_horizontal.clone();
-        // Any specifier that changes within a minute requires per-second ticks.
         let has_seconds = needs_per_second_tick(&fmt_vert, &fmt_horiz);
 
         thread::spawn(move || {
             let mut last_tick = 999;
 
             loop {
+                if core_worker.is_stopped() {
+                    break;
+                }
                 let now = Local::now();
                 let cur_tick = if has_seconds { now.second() } else { now.minute() };
 
@@ -47,7 +47,7 @@ impl ClockModule {
                     let text_horiz = now.format(&fmt_horiz).to_string();
                     let tooltip = now.format("%A, %d %B (%m) %Y, %H:%M").to_string();
 
-                    crate::modules::broadcast(&subs_clone, |orient| {
+                    core_worker.broadcast(|orient| {
                         let text = if orient == Orientation::Vertical {
                             text_vert.clone()
                         } else {
@@ -62,11 +62,13 @@ impl ClockModule {
                     });
                 }
 
-                thread::sleep(Duration::from_millis(if has_seconds { 250 } else { 1000 }));
+                if core_worker.wait_timeout(Duration::from_millis(if has_seconds { 250 } else { 1000 })) {
+                    break;
+                }
             }
         });
 
-        Self { config, subscribers }
+        Self { config, core }
     }
 
     fn format_now(&self, orientation: Orientation) -> ModuleState {
@@ -97,8 +99,8 @@ impl BarModule for ClockModule {
         self.format_now(orientation)
     }
 
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        crate::modules::subscribe_to(&self.subscribers, orientation)
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {

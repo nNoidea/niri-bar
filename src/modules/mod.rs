@@ -12,7 +12,8 @@ use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Button, Label, Orientation};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::modules::battery::BatteryModule;
@@ -23,6 +24,122 @@ use crate::modules::memory::MemoryModule;
 use crate::modules::network::NetworkModule;
 use crate::modules::spacer::SpacerModule;
 use crate::modules::volume::VolumeModule;
+
+/// Cancellation and interruptible-sleep primitive for module workers.
+#[derive(Clone, Debug, Default)]
+struct StopSignal {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn stop(&self) {
+        let (lock, cvar) = &*self.state;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+        }
+        cvar.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        let (lock, _) = &*self.state;
+        lock.lock().map(|s| *s).unwrap_or(true)
+    }
+
+    /// Blocks up to `dur`, but returns immediately if `stop()` is called.
+    /// Returns `true` if stopped, `false` if timed out.
+    fn wait_timeout(&self, dur: Duration) -> bool {
+        let (lock, cvar) = &*self.state;
+        if let Ok(guard) = lock.lock() {
+            if *guard {
+                return true;
+            }
+            if let Ok((guard, _)) = cvar.wait_timeout(guard, dur) {
+                return *guard;
+            }
+        }
+        true
+    }
+}
+
+type WakeupHook = Box<dyn Fn() + Send + Sync>;
+
+/// Core subscription and lifecycle helper shared across modules.
+#[derive(Clone, Default)]
+pub struct ModuleCore {
+    subscribers: ModuleSubscribers,
+    stop_signal: StopSignal,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    wakeup_hooks: Arc<Mutex<Vec<WakeupHook>>>,
+}
+
+impl ModuleCore {
+    pub fn new() -> Self {
+        Self {
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            stop_signal: StopSignal::new(),
+            child: Arc::new(Mutex::new(None)),
+            wakeup_hooks: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn set_child(&self, child: std::process::Child) {
+        *crate::util::lock(&self.child) = Some(child);
+    }
+
+    pub fn take_child(&self) -> Option<std::process::Child> {
+        crate::util::lock(&self.child).take()
+    }
+
+    pub fn on_shutdown<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        crate::util::lock(&self.wakeup_hooks).push(Box::new(hook));
+    }
+
+    pub fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
+        let (tx, rx) = async_channel::unbounded();
+        crate::util::lock(&self.subscribers).push((tx, orientation));
+        rx
+    }
+
+    pub fn broadcast(&self, f: impl Fn(Orientation) -> ModuleState) {
+        let mut guard = crate::util::lock(&self.subscribers);
+        guard.retain(|(t, orient)| {
+            let state = f(*orient);
+            t.try_send(state).is_ok() || !t.is_closed()
+        });
+    }
+
+    pub fn shutdown(&self) {
+        self.stop_signal.stop();
+        if let Some(mut child) = crate::util::lock(&self.child).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let hooks = {
+            let mut guard = crate::util::lock(&self.wakeup_hooks);
+            std::mem::take(&mut *guard)
+        };
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop_signal.is_stopped()
+    }
+
+    pub fn wait_timeout(&self, dur: Duration) -> bool {
+        self.stop_signal.wait_timeout(dur)
+    }
+}
 
 #[derive(Clone)]
 pub struct SharedModules {
@@ -47,6 +164,35 @@ impl SharedModules {
             battery: Arc::new(BatteryModule::new(config.battery.clone())),
             clock: Arc::new(ClockModule::new(config.clock.clone())),
             spacer: Arc::new(SpacerModule::new(config.spacer.clone())),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        for m in [
+            &*self.volume as &dyn BarModule,
+            &*self.bluetooth,
+            &*self.network,
+            &*self.memory,
+            &*self.brightness,
+            &*self.battery,
+            &*self.clock,
+            &*self.spacer,
+        ] {
+            m.shutdown();
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn BarModule>> {
+        match name {
+            "volume" => Some(Arc::clone(&self.volume) as Arc<dyn BarModule>),
+            "bluetooth" => Some(Arc::clone(&self.bluetooth) as Arc<dyn BarModule>),
+            "network" => Some(Arc::clone(&self.network) as Arc<dyn BarModule>),
+            "memory" => Some(Arc::clone(&self.memory) as Arc<dyn BarModule>),
+            "brightness" => Some(Arc::clone(&self.brightness) as Arc<dyn BarModule>),
+            "battery" => Some(Arc::clone(&self.battery) as Arc<dyn BarModule>),
+            "clock" => Some(Arc::clone(&self.clock) as Arc<dyn BarModule>),
+            "spacer" => Some(Arc::clone(&self.spacer) as Arc<dyn BarModule>),
+            _ => None,
         }
     }
 }
@@ -76,7 +222,20 @@ pub type ModuleSubscribers = Arc<std::sync::Mutex<Vec<ModuleSubscriber>>>;
 pub trait BarModule: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn current_state(&self, orientation: Orientation) -> ModuleState;
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState>;
+    fn core(&self) -> &ModuleCore;
+
+    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
+        self.core().subscribe(orientation)
+    }
+
+    fn shutdown(&self) {
+        self.core().shutdown();
+    }
+
+    #[cfg(test)]
+    fn is_stopped(&self) -> bool {
+        self.core().is_stopped()
+    }
     /// Click commands for (left, right, middle). Simple modules implement only
     /// this; `handle_click` / `is_clickable` below provide the shared behavior.
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
@@ -206,25 +365,6 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
             crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
         }
     }
-}
-
-/// Broadcast a freshly formatted state to all live subscribers,
-/// dropping closed receivers. Replaces 9 copies of the same
-/// `guard.retain(|(t, orient)| ...)` loop.
-pub fn broadcast(subs: &ModuleSubscribers, make: impl Fn(Orientation) -> ModuleState) {
-    let mut guard = crate::util::lock(subs);
-    guard.retain(|(t, orient)| {
-        let state = make(*orient);
-        t.try_send(state).is_ok() || !t.is_closed()
-    });
-}
-
-/// Shared `subscribe` body: push a sender + orientation, hand out the receiver.
-/// Replaces 7 identical copies across modules (spacer/tray are special).
-pub fn subscribe_to(subs: &ModuleSubscribers, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-    let (tx, rx) = async_channel::unbounded();
-    crate::util::lock(subs).push((tx, orientation));
-    rx
 }
 
 pub fn enable_hover_cursor(button: &Button) {
@@ -461,22 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe_to_and_broadcast_roundtrip() {
-        let subs: ModuleSubscribers = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rx = subscribe_to(&subs, Orientation::Vertical);
-        assert_eq!(crate::util::lock(&subs).len(), 1);
-
-        broadcast(&subs, |_| ModuleState {
-            icon: None,
-            text: Some("hi".into()),
-            tooltip: None,
-            css_classes: vec!["x".into()],
-        });
-        let state = rx.try_recv().expect("broadcast must deliver");
-        assert_eq!(state.text.as_deref(), Some("hi"));
-    }
-
-    #[test]
     fn test_resolve_helper_absolute_or_fallback() {
         let p = resolve_helper("wpctl");
         assert!(!p.is_empty());
@@ -529,5 +653,157 @@ mod tests {
         spawn_command_argv("test", "/bin/false", &[]);
         spawn_command_argv("test", "/bin/echo", &["hello world; rm -rf /"]);
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_stop_signal_immediate_wake() {
+        let stop = StopSignal::new();
+        assert!(!stop.is_stopped());
+
+        let stop_clone = stop.clone();
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            // Sleep for 60 seconds unless stopped
+            stop_clone.wait_timeout(Duration::from_secs(60))
+        });
+
+        // Trigger stop after a short delay
+        std::thread::sleep(Duration::from_millis(20));
+        stop.stop();
+        assert!(stop.is_stopped());
+
+        let stopped = handle.join().expect("thread must join cleanly");
+        assert!(stopped, "wait_timeout must return true when stopped");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "wait_timeout must wake up immediately on stop, elapsed: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_shared_modules_shutdown_signals_all() {
+        let cfg = AppConfig::default();
+        let shared = SharedModules::new(&cfg);
+
+        assert!(!shared.volume.is_stopped());
+        assert!(!shared.battery.is_stopped());
+        assert!(!shared.bluetooth.is_stopped());
+        assert!(!shared.brightness.is_stopped());
+        assert!(!shared.clock.is_stopped());
+        assert!(!shared.memory.is_stopped());
+        assert!(!shared.network.is_stopped());
+
+        shared.shutdown();
+
+        assert!(shared.volume.is_stopped());
+        assert!(shared.battery.is_stopped());
+        assert!(shared.bluetooth.is_stopped());
+        assert!(shared.brightness.is_stopped());
+        assert!(shared.clock.is_stopped());
+        assert!(shared.memory.is_stopped());
+        assert!(shared.network.is_stopped());
+    }
+
+    #[test]
+    fn test_module_core_subscribe_broadcast_shutdown() {
+        let core = ModuleCore::new();
+        assert!(!core.is_stopped());
+
+        let rx = core.subscribe(Orientation::Vertical);
+        core.broadcast(|_| ModuleState {
+            icon: None,
+            text: Some("core_test".to_string()),
+            tooltip: None,
+            css_classes: Vec::new(),
+        });
+
+        let msg = rx.try_recv().expect("broadcast delivers message");
+        assert_eq!(msg.text.as_deref(), Some("core_test"));
+
+        core.shutdown();
+        assert!(core.is_stopped());
+        assert!(core.wait_timeout(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn test_shared_modules_get() {
+        let cfg = AppConfig::default();
+        let shared = SharedModules::new(&cfg);
+        assert_eq!(shared.get("volume").unwrap().name(), "volume");
+        assert_eq!(shared.get("bluetooth").unwrap().name(), "bluetooth");
+        assert_eq!(shared.get("network").unwrap().name(), "network");
+        assert_eq!(shared.get("memory").unwrap().name(), "memory");
+        assert_eq!(shared.get("brightness").unwrap().name(), "brightness");
+        assert_eq!(shared.get("battery").unwrap().name(), "battery");
+        assert_eq!(shared.get("clock").unwrap().name(), "clock");
+        assert_eq!(shared.get("spacer").unwrap().name(), "spacer");
+        assert!(shared.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_hot_reload_1000_cycles_stress() {
+        let cfg = AppConfig::default();
+
+        let read_proc = || -> (usize, usize) {
+            let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let mut threads = 0;
+            let mut vmrss_kb = 0;
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("Threads:") {
+                    threads = rest.trim().parse().unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    vmrss_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
+            }
+            (threads, vmrss_kb)
+        };
+
+        // Warmup: run 5 cycles so initial runtime buffers / glib allocate once
+        for _ in 0..5 {
+            let s = SharedModules::new(&cfg);
+            s.shutdown();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (init_threads, init_rss) = read_proc();
+
+        // Run 1000 shutdown & recreate cycles
+        for _ in 0..1000 {
+            let s = SharedModules::new(&cfg);
+            s.shutdown();
+        }
+
+        // Give the OS a few milliseconds to reclaim exited thread stacks
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (final_threads, final_rss) = read_proc();
+
+        eprintln!(
+            "1000 Reload Cycles: Threads: {} -> {}, VmRSS: {} KB -> {} KB (diff: {:+} KB)",
+            init_threads,
+            final_threads,
+            init_rss,
+            final_rss,
+            (final_rss as i64) - (init_rss as i64)
+        );
+
+        // Threads MUST NOT leak! If each cycle leaked threads, we would have >7000 threads.
+        assert!(
+            final_threads <= init_threads + 2,
+            "Thread leak detected! Initial: {}, Final: {}",
+            init_threads,
+            final_threads
+        );
+
+        // RSS MUST NOT explode! Over 1000 cycles, growth must be less than 25MB (permits parallel cargo test threads).
+        let diff_kb = (final_rss as i64).saturating_sub(init_rss as i64);
+        assert!(
+            diff_kb < 25600,
+            "Memory leak detected! Initial RSS: {} KB, Final RSS: {} KB, Growth: {} KB",
+            init_rss,
+            final_rss,
+            diff_kb
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
-use crate::modules::{spawn_command, BarModule, ModuleState, ModuleSubscribers, MouseButton, ScrollDirection};
+use crate::modules::{spawn_command, BarModule, ModuleCore, ModuleState, MouseButton, ScrollDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothState {
@@ -18,19 +18,23 @@ pub enum BluetoothState {
 
 pub struct BluetoothModule {
     config: BluetoothConfig,
-    subscribers: ModuleSubscribers,
     trigger_tx: Sender<()>,
     /// Last known state. Updated by the background worker; `current_state`
     /// formats this cache so the GTK thread never does blocking BlueZ D-Bus I/O.
     last: Arc<Mutex<BluetoothState>>,
+    core: ModuleCore,
 }
 
 impl BluetoothModule {
     pub fn new(config: BluetoothConfig) -> Self {
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
-        let subs_clone = Arc::clone(&subscribers);
+        let core = ModuleCore::new();
+        let core_worker = core.clone();
         let cfg = config.clone();
         let (trigger_tx, trigger_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
+        let tx_shutdown = trigger_tx.clone();
+        core.on_shutdown(move || {
+            let _ = tx_shutdown.send(());
+        });
         // Single blocking read at construction (pre-main-loop); worker owns freshness after.
         let initial = Self::read_bluetooth_state();
         let last: Arc<Mutex<BluetoothState>> = Arc::new(Mutex::new(initial.clone()));
@@ -50,6 +54,9 @@ impl BluetoothModule {
             let mut last_renew = std::time::Instant::now();
 
             loop {
+                if core_worker.is_stopped() {
+                    break;
+                }
                 // Drain any pending triggers and enable fast polling if triggered
                 let mut triggered = false;
                 while trigger_rx.try_recv().is_ok() {
@@ -88,9 +95,8 @@ impl BluetoothModule {
                         let mut guard = crate::util::lock(&last_worker);
                         *guard = current_state.clone();
                     }
-                    crate::modules::broadcast(&subs_clone, |orient| {
-                        BluetoothModule::format_state_with_config(&cfg, &current_state, orient)
-                    });
+                    core_worker
+                        .broadcast(|orient| BluetoothModule::format_state_with_config(&cfg, &current_state, orient));
                 }
 
                 // If currently transitioning / loading, keep polling every 100ms until state settles
@@ -112,6 +118,9 @@ impl BluetoothModule {
                     last_renew = std::time::Instant::now();
                 }
 
+                if core_worker.is_stopped() {
+                    break;
+                }
                 if fast_poll_ticks > 0 {
                     fast_poll_ticks -= 1;
                     let _ = trigger_rx.recv_timeout(Duration::from_millis(100));
@@ -122,14 +131,17 @@ impl BluetoothModule {
                         crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30));
                     let _ = trigger_rx.recv_timeout(wait);
                 }
+                if core_worker.is_stopped() {
+                    break;
+                }
             }
         });
 
         Self {
             config,
-            subscribers,
             trigger_tx,
             last,
+            core,
         }
     }
 
@@ -436,8 +448,12 @@ impl BarModule for BluetoothModule {
         Self::format_state_with_config(&self.config, &state, orientation)
     }
 
+    fn core(&self) -> &ModuleCore {
+        &self.core
+    }
+
     fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        let rx = crate::modules::subscribe_to(&self.subscribers, orientation);
+        let rx = self.core.subscribe(orientation);
         let _ = self.trigger_tx.send(());
         rx
     }
@@ -456,7 +472,7 @@ impl BarModule for BluetoothModule {
                         let mut guard = crate::util::lock(&self.last);
                         *guard = BluetoothState::Loading;
                     }
-                    crate::modules::broadcast(&self.subscribers, |orient| {
+                    self.core.broadcast(|orient| {
                         Self::format_state_with_config(&self.config, &BluetoothState::Loading, orient)
                     });
                     Self::toggle_bluetooth();

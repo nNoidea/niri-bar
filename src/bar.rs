@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::config::{AppConfig, BarPosition};
 use crate::layer_shell::{Edge, Layer, LayerShell};
 use crate::modules::tray::{TrayService, TrayWidget};
-use crate::modules::{BarModule, ModuleWidget, SharedModules};
+use crate::modules::{ModuleWidget, SharedModules};
 use crate::niri::taskbar::TaskbarWidget;
 use crate::niri::{detect_monitor_output, NiriService};
 
@@ -324,17 +324,6 @@ impl BarWindow {
         overlay.add_overlay(&end_box);
         overlay.set_overlay_pass_through(&end_box, false);
 
-        let simple_modules: Vec<(&str, Arc<dyn BarModule>)> = vec![
-            ("volume", Arc::clone(&modules.volume) as Arc<dyn BarModule>),
-            ("bluetooth", Arc::clone(&modules.bluetooth) as Arc<dyn BarModule>),
-            ("network", Arc::clone(&modules.network) as Arc<dyn BarModule>),
-            ("memory", Arc::clone(&modules.memory) as Arc<dyn BarModule>),
-            ("brightness", Arc::clone(&modules.brightness) as Arc<dyn BarModule>),
-            ("battery", Arc::clone(&modules.battery) as Arc<dyn BarModule>),
-            ("clock", Arc::clone(&modules.clock) as Arc<dyn BarModule>),
-            ("spacer", Arc::clone(&modules.spacer) as Arc<dyn BarModule>),
-        ];
-
         let add_module = |container: &GtkBox, mod_name: &str| match resolve_module_placement(mod_name) {
             Some(ModulePlacement::Taskbar) => {
                 container.pack_start(&taskbar.container, false, false, 0);
@@ -350,8 +339,8 @@ impl BarWindow {
                 container.pack_start(&tray_w.container, false, false, 0);
             }
             Some(ModulePlacement::Simple) => {
-                if let Some((_, m)) = simple_modules.iter().find(|(n, _)| *n == mod_name) {
-                    let w = ModuleWidget::new(Arc::clone(m), box_orient);
+                if let Some(m) = modules.get(mod_name) {
+                    let w = ModuleWidget::new(m, box_orient);
                     if mod_name == "spacer" {
                         crate::modules::spacer::configure_spacer_button(&w.button, config.spacer.size, is_vertical);
                     }

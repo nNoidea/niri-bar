@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_mode, NetworkConfig};
-use crate::modules::{BarModule, ModuleState, ModuleSubscribers, ScrollDirection};
+use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkType {
@@ -18,10 +18,10 @@ pub enum NetworkType {
 
 pub struct NetworkModule {
     config: NetworkConfig,
-    subscribers: ModuleSubscribers,
     /// Last known raw state. Updated by the background worker; `current_state`
     /// formats this cache so the GTK thread never does blocking D-Bus I/O.
     last: Arc<Mutex<(NetworkType, Option<String>)>>,
+    core: ModuleCore,
 }
 
 /// Extract a string from a `Properties.Get` reply (unwraps the outer variant).
@@ -128,10 +128,14 @@ fn is_virtual_interface(name: &str) -> bool {
 
 impl NetworkModule {
     pub fn new(config: NetworkConfig) -> Self {
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
-        let subs_clone = Arc::clone(&subscribers);
+        let core = ModuleCore::new();
+        let core_worker = core.clone();
         let cfg = config.clone();
         let (trigger_tx, trigger_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
+        let tx_shutdown = trigger_tx.clone();
+        core.on_shutdown(move || {
+            let _ = tx_shutdown.send(());
+        });
         // Single blocking read at construction (pre-main-loop); afterwards the
         // worker owns freshness and `current_state` is lock-only.
         let initial = Self::read_network_state();
@@ -151,6 +155,9 @@ impl NetworkModule {
             let mut last_renew = std::time::Instant::now();
 
             loop {
+                if core_worker.is_stopped() {
+                    break;
+                }
                 let ((net_type, ssid), healthy) = NetworkModule::read_network_state_full();
 
                 if healthy {
@@ -175,7 +182,7 @@ impl NetworkModule {
                         let mut guard = crate::util::lock(&last_worker);
                         *guard = (net_type.clone(), ssid.clone());
                     }
-                    crate::modules::broadcast(&subs_clone, |orient| {
+                    core_worker.broadcast(|orient| {
                         NetworkModule::format_state_with_config(&cfg, &net_type, ssid.as_deref(), orient)
                     });
                 }
@@ -191,17 +198,19 @@ impl NetworkModule {
                     last_renew = std::time::Instant::now();
                 }
 
+                if core_worker.is_stopped() {
+                    break;
+                }
                 // Wait for D-Bus signal trigger, else idle check with backoff.
                 let wait = crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
                 let _ = trigger_rx.recv_timeout(wait);
+                if core_worker.is_stopped() {
+                    break;
+                }
             }
         });
 
-        Self {
-            config,
-            subscribers,
-            last,
-        }
+        Self { config, last, core }
     }
 
     /// Subscribe to NetworkManager signals. Worker-owned (see bluetooth):
@@ -467,8 +476,8 @@ impl BarModule for NetworkModule {
         Self::format_state_with_config(&self.config, &state, ssid.as_deref(), orientation)
     }
 
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        crate::modules::subscribe_to(&self.subscribers, orientation)
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {

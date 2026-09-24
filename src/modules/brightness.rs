@@ -1,17 +1,17 @@
 use gtk::Orientation;
 use std::fs;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_level, BrightnessConfig};
-use crate::modules::{spawn_command_argv, BarModule, ModuleState, ModuleSubscribers, ScrollDirection};
+use crate::modules::{spawn_command_argv, BarModule, ModuleCore, ModuleState, ScrollDirection};
 
 pub struct BrightnessModule {
     config: BrightnessConfig,
-    subscribers: ModuleSubscribers,
     current_brightness: Arc<AtomicU32>,
+    core: ModuleCore,
 }
 
 impl BrightnessModule {
@@ -19,24 +19,25 @@ impl BrightnessModule {
         // `None` means no backlight device (e.g. desktop): keep sentinel
         // u32::MAX so the UI never fabricates `100%`.
         let b = Self::read_system_brightness().unwrap_or(u32::MAX);
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
         let current_brightness = Arc::new(AtomicU32::new(b));
 
         let cur_b = Arc::clone(&current_brightness);
-        let subs = Arc::clone(&subscribers);
         let cfg = config.clone();
+        let core = ModuleCore::new();
+        let core_worker = core.clone();
 
         thread::spawn(move || {
             let mut logged_no_device = false;
             loop {
+                if core_worker.is_stopped() {
+                    break;
+                }
                 match BrightnessModule::read_system_brightness() {
                     Some(b) => {
                         let old_b = cur_b.load(Ordering::Relaxed);
                         if b != old_b {
                             cur_b.store(b, Ordering::Relaxed);
-                            crate::modules::broadcast(&subs, |orient| {
-                                BrightnessModule::format_state_with_config(&cfg, b, orient)
-                            });
+                            core_worker.broadcast(|orient| BrightnessModule::format_state_with_config(&cfg, b, orient));
                         }
                     }
                     None if !logged_no_device => {
@@ -45,14 +46,16 @@ impl BrightnessModule {
                     }
                     None => {}
                 }
-                thread::sleep(Duration::from_millis(500));
+                if core_worker.wait_timeout(Duration::from_millis(500)) {
+                    break;
+                }
             }
         });
 
         Self {
             config,
-            subscribers,
             current_brightness,
+            core,
         }
     }
 
@@ -116,9 +119,8 @@ impl BrightnessModule {
         if b == u32::MAX {
             return;
         }
-        crate::modules::broadcast(&self.subscribers, |orient| {
-            Self::format_state_with_config(&self.config, b, orient)
-        });
+        self.core
+            .broadcast(|orient| Self::format_state_with_config(&self.config, b, orient));
     }
 }
 
@@ -135,8 +137,8 @@ impl BarModule for BrightnessModule {
         Self::format_state_with_config(&self.config, b, orientation)
     }
 
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        crate::modules::subscribe_to(&self.subscribers, orientation)
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
