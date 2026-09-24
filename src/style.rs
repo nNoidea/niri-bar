@@ -70,7 +70,7 @@ pub fn validate_css(css_content: &str) -> Result<(), String> {
         ));
     }
 
-    if gtk::is_initialized() {
+    if gtk::is_initialized_main_thread() {
         let test_provider = gtk::CssProvider::new();
         test_provider
             .load_from_data(css_content.as_bytes())
