@@ -445,6 +445,7 @@ fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -> Op
                             *cfg = new_config.clone();
                         }
                         if let Ok(mut mods) = ctx.modules.try_borrow_mut() {
+                            mods.shutdown();
                             *mods = crate::modules::SharedModules::new(&new_config);
                         }
 

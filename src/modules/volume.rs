@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use crate::config::{resolve_level, VolumeConfig};
 use crate::modules::{
-    resolve_helper, spawn_command, truncate_log, BarModule, ModuleState, ModuleSubscribers, MouseButton,
-    ScrollDirection,
+    resolve_helper, spawn_command, truncate_log, BarModule, ModuleCore, ModuleState, MouseButton, ScrollDirection,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,10 +30,10 @@ pub struct SinkInfo {
 
 pub struct VolumeModule {
     config: VolumeConfig,
-    subscribers: ModuleSubscribers,
     current_vol: Arc<AtomicU32>,
     is_muted: Arc<AtomicBool>,
     current_sink: Arc<Mutex<SinkInfo>>,
+    core: ModuleCore,
 }
 
 impl VolumeModule {
@@ -46,7 +45,7 @@ impl VolumeModule {
         // Never fork+exec on the caller (GTK main) thread. Start with a
         // clearly-stale placeholder; the worker below re-reads immediately
         // and broadcasts the real state.
-        let subscribers: ModuleSubscribers = Arc::new(Mutex::new(Vec::new()));
+        let core = ModuleCore::new();
         let current_vol = Arc::new(AtomicU32::new(50));
         let is_muted = Arc::new(AtomicBool::new(false));
         let current_sink = Arc::new(Mutex::new(SinkInfo {
@@ -60,7 +59,7 @@ impl VolumeModule {
             let cur_vol = Arc::clone(&current_vol);
             let cur_muted = Arc::clone(&is_muted);
             let cur_sink = Arc::clone(&current_sink);
-            let subs = Arc::clone(&subscribers);
+            let core_worker = core.clone();
             let cfg = config.clone();
 
             // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
@@ -73,7 +72,7 @@ impl VolumeModule {
                     cur_vol.store(vol, Ordering::Relaxed);
                     cur_muted.store(muted, Ordering::Relaxed);
                     *crate::util::lock(&cur_sink) = new_sink.clone();
-                    crate::modules::broadcast(&subs, |orient| {
+                    core_worker.broadcast(|orient| {
                         VolumeModule::format_state_with_config(&cfg, vol, muted, &new_sink, orient)
                     });
                 }
@@ -100,25 +99,35 @@ impl VolumeModule {
                             *guard = new_sink.clone();
                         }
 
-                        crate::modules::broadcast(&subs, |orient| {
+                        core_worker.broadcast(|orient| {
                             VolumeModule::format_state_with_config(&cfg, vol, muted, new_sink, orient)
                         });
                     }
                 };
 
-                // Supervise pw-mon forever: event session → backoff polling → re-exec.
+                // Supervise pw-mon: event session → backoff polling → re-exec, until stopped.
                 loop {
+                    if core_worker.is_stopped() {
+                        break;
+                    }
                     let spawned_child = VolumeModule::spawn_pw_mon();
 
                     if let Some(mut child) = spawned_child {
-                        if let Some(stdout) = child.stdout.take() {
+                        let stdout = child.stdout.take();
+                        core_worker.set_child(child);
+
+                        if let Some(stdout) = stdout {
                             let reader = BufReader::new(stdout);
                             for line in reader.lines() {
+                                if core_worker.is_stopped() {
+                                    break;
+                                }
                                 let l = match line {
                                     Ok(l) => l,
                                     Err(e) => {
-                                        // Transient read error: don't kill the event
-                                        // loop permanently; log and keep listening.
+                                        if core_worker.is_stopped() {
+                                            break;
+                                        }
                                         log_warn!("volume", "pw-mon read error: {e}");
                                         continue;
                                     }
@@ -130,16 +139,24 @@ impl VolumeModule {
                                 }
                             }
                         }
-                        // `pw-mon` exited (or stdout closed): reap, then polling.
-                        if let Err(e) = child.kill() {
-                            log_debug!("volume", "pw-mon kill during teardown: {e}");
-                        }
-                        match child.wait() {
-                            Ok(status) => log_debug!("volume", "pw-mon exited with {status}; using polling fallback"),
-                            Err(e) => log_warn!("volume", "Failed waiting on pw-mon: {e}"),
+                        // `pw-mon` exited (or was killed on teardown): reap, then polling.
+                        if let Some(mut child) = core_worker.take_child() {
+                            if let Err(e) = child.kill() {
+                                log_debug!("volume", "pw-mon kill during teardown: {e}");
+                            }
+                            match child.wait() {
+                                Ok(status) => {
+                                    log_debug!("volume", "pw-mon exited with {status}; using polling fallback")
+                                }
+                                Err(e) => log_warn!("volume", "Failed waiting on pw-mon: {e}"),
+                            }
                         }
                     } else {
                         log_debug!("volume", "pw-mon unavailable; using polling fallback");
+                    }
+
+                    if core_worker.is_stopped() {
+                        break;
                     }
 
                     // Fallback polling with backoff while PipeWire is down
@@ -147,19 +164,23 @@ impl VolumeModule {
                     // supervisor re-execs pw-mon to resume event mode.
                     let mut fail_streak: u32 = 0;
                     for _ in 0..120 {
+                        if core_worker.is_stopped() {
+                            break;
+                        }
                         let ok_before = VolumeModule::probe_audio_ok();
                         let (vol, muted) = VolumeModule::read_system_volume();
                         let new_sink = VolumeModule::read_current_sink();
                         apply(vol, muted, &new_sink);
                         let healthy = ok_before && new_sink.name != "@DEFAULT_AUDIO_SINK@";
-                        if healthy {
+                        let backoff = if healthy {
                             fail_streak = 0;
-                            thread::sleep(Duration::from_millis(250));
+                            250
                         } else {
                             fail_streak = fail_streak.saturating_add(1);
-                            let backoff = (250u64.saturating_mul(2u64.saturating_pow(fail_streak.min(5)))).min(5000);
-                            log_debug!("volume", "Audio backend unhealthy, backing off {backoff}ms");
-                            thread::sleep(Duration::from_millis(backoff));
+                            (250u64.saturating_mul(2u64.saturating_pow(fail_streak.min(5)))).min(5000)
+                        };
+                        if core_worker.wait_timeout(Duration::from_millis(backoff)) {
+                            break;
                         }
                     }
                 } // end supervise loop
@@ -168,10 +189,10 @@ impl VolumeModule {
 
         Self {
             config,
-            subscribers,
             current_vol,
             is_muted,
             current_sink,
+            core,
         }
     }
 
@@ -512,9 +533,8 @@ impl VolumeModule {
         let vol = self.current_vol.load(Ordering::Relaxed);
         let muted = self.is_muted.load(Ordering::Relaxed);
         let sink = crate::util::lock(&self.current_sink).clone();
-        crate::modules::broadcast(&self.subscribers, |orient| {
-            Self::format_state_with_config(&self.config, vol, muted, &sink, orient)
-        });
+        self.core
+            .broadcast(|orient| Self::format_state_with_config(&self.config, vol, muted, &sink, orient));
     }
 
     /// Cycle sink + re-read state off the GTK thread, then broadcast.
@@ -528,7 +548,7 @@ impl VolumeModule {
         let cur_vol = Arc::clone(&self.current_vol);
         let cur_muted = Arc::clone(&self.is_muted);
         let cur_sink = Arc::clone(&self.current_sink);
-        let subs = Arc::clone(&self.subscribers);
+        let core = self.core.clone();
         let cfg = self.config.clone();
         thread::spawn(move || {
             Self::cycle_audio_output();
@@ -540,9 +560,7 @@ impl VolumeModule {
                 let mut guard = crate::util::lock(&cur_sink);
                 *guard = sink.clone();
             }
-            crate::modules::broadcast(&subs, |orient| {
-                Self::format_state_with_config(&cfg, vol, muted, &sink, orient)
-            });
+            core.broadcast(|orient| Self::format_state_with_config(&cfg, vol, muted, &sink, orient));
             IN_FLIGHT.store(false, Ordering::SeqCst);
         });
     }
@@ -560,8 +578,8 @@ impl BarModule for VolumeModule {
         Self::format_state_with_config(&self.config, vol, muted, &sink, orientation)
     }
 
-    fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        crate::modules::subscribe_to(&self.subscribers, orientation)
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn handle_click(&self, button: MouseButton) {
@@ -1032,5 +1050,65 @@ Audio
             n("alsa_dp", "DisplayPort Monitor", None, None, None, None).0,
             SinkType::Hdmi
         );
+    }
+
+    #[test]
+    fn test_volume_shutdown_kills_child_and_signals_stop() {
+        let module = VolumeModule::new_with_worker(VolumeConfig::default(), false);
+        assert!(!module.is_stopped());
+
+        // Attach a dummy long-running child process
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("Failed to spawn sleep child");
+        let pid = child.id();
+        module.core.set_child(child);
+
+        // Call shutdown via BarModule
+        module.shutdown();
+        assert!(module.is_stopped());
+        assert!(module.core.take_child().is_none());
+
+        // Verify the child process was terminated and reaped
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "Child process /proc/{pid} should not exist after shutdown and wait"
+        );
+    }
+
+    #[test]
+    fn test_shared_modules_shutdown_kills_volume_child() {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("Failed to spawn sleep child");
+        let pid = child.id();
+        let shared = crate::modules::SharedModules::new(&crate::config::AppConfig::default());
+        shared.volume.core().set_child(child);
+        shared.shutdown();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "Child process /proc/{pid} should not exist after SharedModules shutdown"
+        );
+    }
+
+    #[test]
+    fn test_volume_subprocess_100_cycles_stress() {
+        let cfg = VolumeConfig::default();
+        for _ in 0..100 {
+            let m = VolumeModule::new_with_worker(cfg.clone(), false);
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("Failed to spawn sleep child");
+            let pid = child.id();
+            m.core.set_child(child);
+            m.shutdown();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "Process /proc/{pid} leaked as a zombie after shutdown"
+            );
+        }
     }
 }

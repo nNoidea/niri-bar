@@ -1,22 +1,17 @@
 use crate::config::SpacerConfig;
-use crate::modules::{BarModule, ModuleState, ScrollDirection};
+use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
 use gtk::Orientation;
 
 pub struct SpacerModule {
     config: SpacerConfig,
-    // Keeps the broadcast channel alive: without a stored Sender,
-    // `subscribe()` would hand out an immediately-closed Receiver.
-    _keepalive_tx: async_channel::Sender<ModuleState>,
-    template_rx: async_channel::Receiver<ModuleState>,
+    core: ModuleCore,
 }
 
 impl SpacerModule {
     pub fn new(config: SpacerConfig) -> Self {
-        let (tx, rx) = async_channel::unbounded();
         Self {
             config,
-            _keepalive_tx: tx,
-            template_rx: rx,
+            core: ModuleCore::new(),
         }
     }
 }
@@ -35,8 +30,8 @@ impl BarModule for SpacerModule {
         }
     }
 
-    fn subscribe(&self, _orientation: Orientation) -> async_channel::Receiver<ModuleState> {
-        self.template_rx.clone()
+    fn core(&self) -> &ModuleCore {
+        &self.core
     }
 
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
@@ -87,6 +82,15 @@ mod tests {
             },
         });
         assert!(clickable_spacer.is_clickable());
+    }
+
+    #[test]
+    fn test_spacer_subscribe_and_shutdown() {
+        let spacer = SpacerModule::new(SpacerConfig::default());
+        let rx = spacer.subscribe(Orientation::Horizontal);
+        assert!(!rx.is_closed());
+        spacer.shutdown();
+        assert!(spacer.core.is_stopped());
     }
 
     #[test]
