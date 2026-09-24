@@ -37,3 +37,7 @@ Thumbs.db
 pkgconfig/
 *.so
 *.pc
+
+# Python
+__pycache__/
+*.pyc
