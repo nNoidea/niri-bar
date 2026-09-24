@@ -4,7 +4,27 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      dependencies:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "glib"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gio"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gdk"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gdk-pixbuf"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gtk"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
