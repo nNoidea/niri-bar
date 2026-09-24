@@ -47,55 +47,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine release action from commit message
+      - name: Check version against existing releases
         id: release_check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          # Extract X.Y.Z version from commit message (e.g. 0.1.1, v0.1.1, release 1.0.0)
-          VERSION=$(echo "$COMMIT_MSG" | grep -oP '\b[vV]?\K\d+\.\d+\.\d+\b' | head -n 1 || true)
-
+          # Extract version from Cargo.toml (e.g. 0.1.1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '[:space:]')
           if [ -z "$VERSION" ]; then
-            echo "No version pattern found in commit message. Skipping release."
+            echo "Error: Could not extract version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          echo "Cargo.toml version: $VERSION ($TAG)"
+
+          # Check if this release tag already exists on GitHub
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on GitHub. Skipping release."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Found version candidate in commit message: $VERSION"
-
-          # Get latest release tag if one exists
-          LATEST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
-
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No prior releases exist. Creating initial release v$VERSION."
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "action=create" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          LATEST_VERSION=$(echo "$LATEST_TAG" | sed 's/^[vV]//')
-          echo "Latest existing release version: $LATEST_VERSION"
-
-          if [ "$VERSION" = "$LATEST_VERSION" ]; then
-            echo "Requested version matches latest release ($VERSION == $LATEST_VERSION)."
-            echo "Replacing previous release with a fresh build."
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "action=replace" >> "$GITHUB_OUTPUT"
-          else
-            OLDER=$(printf "%s\n%s\n" "$VERSION" "$LATEST_VERSION" | sort -V | head -n 1)
-            if [ "$OLDER" = "$VERSION" ]; then
-              echo "Requested version $VERSION is older than latest release $LATEST_VERSION. Skipping release."
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "Requested version $VERSION is newer than latest release $LATEST_VERSION. Creating release v$VERSION."
-              echo "should_release=true" >> "$GITHUB_OUTPUT"
-              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-              echo "action=create" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+          echo "Release $TAG does not exist yet. Proceeding with release."
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         if: steps.release_check.outputs.should_release == 'true'
@@ -125,16 +102,9 @@ jobs:
         if: steps.release_check.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: "v${{ steps.release_check.outputs.version }}"
-          ACTION: ${{ steps.release_check.outputs.action }}
+          TAG: "${{ steps.release_check.outputs.tag }}"
         run: |
-          if [ "$ACTION" = "replace" ]; then
-            echo "Deleting existing release and tag $TAG..."
-            gh release delete "$TAG" --yes --cleanup-tag || true
-            git push --delete origin "$TAG" 2>/dev/null || true
-          fi
-
-          echo "Creating release $TAG..."
+          echo "Creating GitHub Release $TAG with automated changelog notes..."
           gh release create "$TAG" \
             dist/niri-bar \
             "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" \

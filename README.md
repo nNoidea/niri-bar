@@ -39,15 +39,11 @@ niri-bar is built from the ground up, only for Niri. When I started using Niri, 
 Download the precompiled binary from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and place it in your `PATH` (e.g. `~/.cargo/bin` or `/usr/local/bin`).
 
 ### From Source
+Default installation installs to `~/.cargo/bin/niri-bar`.
 ```bash
 git clone https://github.com/nNoidea/niri-bar.git
 cd niri-bar
-make build
 make install
-```
-Default installation installs to `~/.cargo/bin/niri-bar`. To install system-wide to `/usr/local/bin`:
-```bash
-sudo make install PREFIX=/usr/local
 ```
 
 Or install directly with Cargo:
