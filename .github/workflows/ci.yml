@@ -70,9 +70,12 @@ jobs:
           fi
 
           echo "Release $TAG does not exist yet. Proceeding with release."
+          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          echo "Previous release tag: ${PREV_TAG:-none}"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         if: steps.release_check.outputs.should_release == 'true'
@@ -87,6 +90,13 @@ jobs:
       - name: Cache Rust dependencies
         if: steps.release_check.outputs.should_release == 'true'
         uses: Swatinem/rust-cache@v2
+
+      - name: Generate release notes
+        if: steps.release_check.outputs.should_release == 'true'
+        run: |
+          mkdir -p dist
+          python3 scripts/generate_changelog.py "${{ steps.release_check.outputs.prev_tag }}" "HEAD" > dist/release_notes.md
+          cat dist/release_notes.md
 
       - name: Build release binary and package
         if: steps.release_check.outputs.should_release == 'true'
@@ -104,9 +114,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: "${{ steps.release_check.outputs.tag }}"
         run: |
-          echo "Creating GitHub Release $TAG with automated changelog notes..."
+          echo "Creating GitHub Release $TAG with categorized changelog..."
           gh release create "$TAG" \
             dist/niri-bar \
             "dist/niri-bar-v${{ steps.release_check.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" \
             --title "Release $TAG" \
-            --generate-notes
+            --notes-file dist/release_notes.md
