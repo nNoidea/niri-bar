@@ -8,6 +8,7 @@ enabled = true
 icon_size = 32
 only_current_workspace = true
 show_tooltips = true
+scroll_safety_margin = 1 # Number of icons kept as buffer before shifting view
 
 [tray]
 icon_size = 22

@@ -29,10 +29,12 @@ pub struct OutputInfo {
     pub logical: Option<LogicalOutput>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct WorkspaceInfo {
     #[serde(default)]
     pub id: u64,
+    #[serde(default)]
+    pub idx: u8,
     #[serde(default)]
     pub output: Option<String>,
     #[serde(default)]
@@ -286,11 +288,13 @@ mod tests {
     fn test_workspace_info_lean_fields() {
         let ws = WorkspaceInfo {
             id: 1,
+            idx: 1,
             output: Some("eDP-1".to_string()),
             is_active: true,
             is_focused: true,
         };
         assert_eq!(ws.id, 1);
+        assert_eq!(ws.idx, 1);
         assert_eq!(ws.output.as_deref(), Some("eDP-1"));
         assert!(ws.is_active);
         assert!(ws.is_focused);

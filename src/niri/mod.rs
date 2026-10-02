@@ -428,12 +428,14 @@ mod tests {
             workspaces: vec![
                 WorkspaceInfo {
                     id: 1,
+                    idx: 1,
                     output: Some("eDP-1".to_string()),
                     is_active: true,
                     is_focused: true,
                 },
                 WorkspaceInfo {
                     id: 2,
+                    idx: 1,
                     output: Some("DP-1".to_string()),
                     is_active: true,
                     is_focused: false,
@@ -495,12 +497,14 @@ mod tests {
             workspaces: vec![
                 WorkspaceInfo {
                     id: 1,
+                    idx: 1,
                     output: Some("eDP-1".to_string()),
                     is_active: true,
                     is_focused: true,
                 },
                 WorkspaceInfo {
                     id: 2,
+                    idx: 2,
                     output: Some("eDP-1".to_string()),
                     is_active: false,
                     is_focused: false,
