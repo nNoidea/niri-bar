@@ -118,6 +118,22 @@ mod tests {
     }
 
     #[test]
+    fn test_taskbar_buttons_disable_transition() {
+        assert!(
+            DEFAULT_CSS.contains(".taskbar button") && DEFAULT_CSS.contains("transition: none;"),
+            "DEFAULT_CSS should explicitly disable transitions on taskbar buttons"
+        );
+    }
+
+    #[test]
+    fn test_taskbar_buttons_not_hardcoded_50px() {
+        assert!(
+            !DEFAULT_CSS.contains("min-width: 50px;"),
+            "DEFAULT_CSS should not hardcode 50px dimensions on taskbar buttons"
+        );
+    }
+
+    #[test]
     fn test_validate_css() {
         let valid_css = ".niri-bar { color: #ffffff; }";
         assert!(validate_css(valid_css).is_ok());

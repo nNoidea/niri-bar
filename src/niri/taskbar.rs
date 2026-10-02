@@ -26,6 +26,7 @@ pub struct TaskbarWidget {
     pub orientation: Orientation,
     pub bar_position: crate::config::BarPosition,
     pub bar_size: i32,
+    pub viewport: Rc<RefCell<TaskbarViewport>>,
 }
 
 /// Active workspace per output: focused > active > any. Pure for testing.
@@ -53,13 +54,28 @@ pub fn active_workspace_per_output(workspaces: &[crate::niri::model::WorkspaceIn
     map
 }
 
-/// Sort spatially by column index, then tile index. Windows without layout go last.
-pub fn sort_windows_spatially(windows: &mut [WindowInfo]) {
+/// Sort spatially by workspace order, then column index, then tile index. Windows without layout go last.
+pub fn sort_windows_spatially(windows: &mut [WindowInfo], workspaces: &[crate::niri::model::WorkspaceInfo]) {
+    let ws_order: HashMap<u64, usize> = workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, ws)| {
+            let order = if ws.idx > 0 { ws.idx as usize } else { i + 1 };
+            (ws.id, order)
+        })
+        .collect();
+
     windows.sort_by_key(|w| {
-        w.layout
+        let ws_idx = w
+            .workspace_id
+            .and_then(|id| ws_order.get(&id).copied())
+            .unwrap_or(usize::MAX);
+        let (col, tile) = w
+            .layout
             .as_ref()
             .and_then(|l| l.pos_in_scrolling_layout)
-            .unwrap_or((usize::MAX, usize::MAX))
+            .unwrap_or((usize::MAX, usize::MAX));
+        (ws_idx, col, tile, w.id)
     });
 }
 
@@ -109,8 +125,120 @@ pub fn filter_windows_for_output(
         })
         .cloned()
         .collect();
-    sort_windows_spatially(&mut filtered);
+    sort_windows_spatially(&mut filtered, workspaces);
     filtered
+}
+
+/// Single Source of Truth (SSOT) for the taskbar's visible scrolling viewport.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskbarViewport {
+    pub start: usize,
+    pub last_focused_id: Option<u64>,
+    pub total_count: usize,
+    pub capacity: usize,
+}
+
+impl TaskbarViewport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// User-initiated scroll: moves `start` by `delta` (+1 or -1), strictly clamped to [0, max_start].
+    /// Preserves manual scroll position without resetting `last_focused_id`.
+    pub fn scroll_by(&mut self, delta: i32) {
+        if self.total_count <= self.capacity || self.capacity == 0 {
+            self.start = 0;
+            return;
+        }
+        let max_start = self.total_count.saturating_sub(self.capacity);
+        if delta > 0 {
+            self.start = (self.start + delta as usize).min(max_start);
+        } else if delta < 0 {
+            self.start = self.start.saturating_sub((-delta) as usize);
+        }
+    }
+
+    /// Update viewport during reconcile.
+    /// - Clamps `start` if window count or capacity shrank.
+    /// - Only shifts `start` based on `focused_idx` if `focused_id` changed (user selected another window).
+    pub fn update(
+        &mut self,
+        focused_id: Option<u64>,
+        focused_idx: Option<usize>,
+        total_count: usize,
+        capacity: usize,
+        safety_margin: usize,
+    ) {
+        self.total_count = total_count;
+        self.capacity = capacity;
+
+        if total_count <= capacity || capacity == 0 {
+            self.start = 0;
+            self.last_focused_id = focused_id;
+            return;
+        }
+
+        let max_start = total_count.saturating_sub(capacity);
+        self.start = self.start.min(max_start);
+
+        let focus_changed = focused_id != self.last_focused_id;
+        self.last_focused_id = focused_id;
+
+        if focus_changed {
+            if let Some(f_idx) = focused_idx {
+                if f_idx < total_count {
+                    let safe_margin = safety_margin.min((capacity.saturating_sub(1)) / 2);
+                    let upper_threshold = self.start + capacity - 1 - safe_margin;
+                    let lower_threshold = self.start + safe_margin;
+
+                    if f_idx > upper_threshold {
+                        let shift = f_idx - upper_threshold;
+                        self.start = (self.start + shift).min(max_start);
+                    } else if f_idx < lower_threshold {
+                        let shift = lower_threshold - f_idx;
+                        self.start = self.start.saturating_sub(shift);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calculate visible window slice `[start, end)`.
+    /// When `total_count > capacity`, renders `capacity + 1` icons so the cut-off
+    /// half icon is visible peeking into the modules area, preserving CSS padding.
+    pub fn visible_range(&self) -> (usize, usize) {
+        if self.total_count == 0 || self.capacity == 0 {
+            return (0, 0);
+        }
+        if self.total_count <= self.capacity {
+            return (0, self.total_count);
+        }
+        let end = (self.start + self.capacity + 1).min(self.total_count);
+        (self.start, end)
+    }
+}
+
+/// Calculate the visible window slice `[start, end)` for taskbar icons.
+///
+/// Ensures the taskbar never renders more than `capacity` items, staying within
+/// the available bar space without overlapping or pushing modules.
+/// Tracks `focused_idx` and shifts `start` with hysteresis and an optional `safety_margin`.
+#[cfg(test)]
+pub fn calculate_sliding_window(
+    current_start: usize,
+    total_count: usize,
+    capacity: usize,
+    safety_margin: usize,
+    focused_idx: Option<usize>,
+) -> (usize, usize) {
+    let mut vp = TaskbarViewport {
+        start: current_start,
+        last_focused_id: None,
+        total_count,
+        capacity,
+    };
+    vp.update(Some(1), focused_idx, total_count, capacity, safety_margin);
+    vp.visible_range()
 }
 
 impl TaskbarWidget {
@@ -119,10 +247,50 @@ impl TaskbarWidget {
         spacing: i32,
         bar_position: crate::config::BarPosition,
         bar_size: i32,
+        update_tx: async_channel::Sender<()>,
     ) -> Self {
         let container = GtkBox::new(orientation, spacing);
         container.style_context().add_class("taskbar");
         let active_widgets = Rc::new(RefCell::new(HashMap::new()));
+        let viewport = Rc::new(RefCell::new(TaskbarViewport::new()));
+
+        container.add_events(gdk::EventMask::SCROLL_MASK);
+        let vp_scroll = Rc::clone(&viewport);
+        let tx_clone = update_tx;
+        let is_vert = orientation == Orientation::Vertical;
+
+        container.connect_scroll_event(move |_, event| {
+            let delta = match event.direction() {
+                gdk::ScrollDirection::Down | gdk::ScrollDirection::Right => 1,
+                gdk::ScrollDirection::Up | gdk::ScrollDirection::Left => -1,
+                gdk::ScrollDirection::Smooth => {
+                    let (dx, dy) = event.scroll_deltas().unwrap_or((0.0, 0.0));
+                    let d = if is_vert {
+                        dy
+                    } else if dx.abs() > dy.abs() {
+                        dx
+                    } else {
+                        dy
+                    };
+                    if d > 0.0 {
+                        1
+                    } else if d < 0.0 {
+                        -1
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+
+            if delta != 0 {
+                vp_scroll.borrow_mut().scroll_by(delta);
+                crate::util::nudge(&tx_clone);
+                Propagation::Stop
+            } else {
+                Propagation::Proceed
+            }
+        });
 
         Self {
             container,
@@ -130,6 +298,7 @@ impl TaskbarWidget {
             orientation,
             bar_position,
             bar_size,
+            viewport,
         }
     }
 
@@ -139,6 +308,7 @@ impl TaskbarWidget {
         state: &Arc<std::sync::Mutex<AppState>>,
         config: &TaskbarConfig,
         niri_service: &Arc<NiriService>,
+        capacity: usize,
     ) {
         if !config.enabled {
             self.container.hide();
@@ -217,8 +387,9 @@ impl TaskbarWidget {
                                 }
                             }
 
+                            let cur_start = self.viewport.borrow().start;
                             let n = filtered_windows.len();
-                            let final_slot = slot.min(n);
+                            let final_slot = (cur_start + slot).min(n);
                             filtered_windows.insert(final_slot, drag_win.clone());
                             preview_window_id = Some(drag.window_id);
                             log_debug!(
@@ -246,10 +417,31 @@ impl TaskbarWidget {
             }
         }
 
-        let mut widgets_map = self.active_widgets.borrow_mut();
-        let current_ids: HashSet<u64> = filtered_windows.iter().map(|w| w.id).collect();
+        let focused_id = filtered_windows.iter().find(|w| w.is_focused).map(|w| w.id);
+        let focused_idx = filtered_windows.iter().position(|w| w.is_focused);
+        let total_count = filtered_windows.len();
+        let (start_idx, end_idx) = {
+            let mut vp = self.viewport.borrow_mut();
+            vp.update(
+                focused_id,
+                focused_idx,
+                total_count,
+                capacity,
+                config.scroll_safety_margin,
+            );
+            vp.visible_range()
+        };
 
-        // 1. Remove widgets for windows that no longer exist
+        let visible_windows = if start_idx < end_idx && end_idx <= total_count {
+            &filtered_windows[start_idx..end_idx]
+        } else {
+            &[]
+        };
+
+        let mut widgets_map = self.active_widgets.borrow_mut();
+        let current_ids: HashSet<u64> = visible_windows.iter().map(|w| w.id).collect();
+
+        // 1. Remove widgets for windows that no longer exist or are outside visible window
         widgets_map.retain(|id, w| {
             if !current_ids.contains(id) {
                 self.container.remove(&w.button);
@@ -259,9 +451,9 @@ impl TaskbarWidget {
             }
         });
 
-        // 2. Reconcile remaining / new windows
+        // 2. Reconcile remaining / new windows in visible window
         let scale_factor = self.container.scale_factor().max(1);
-        for (idx, window) in filtered_windows.iter().enumerate() {
+        for (idx, window) in visible_windows.iter().enumerate() {
             let win_id = window.id;
             let icon_key = window
                 .app_id
@@ -343,8 +535,6 @@ impl TaskbarWidget {
                 // Create new button widget
                 let button = Button::new();
                 button.style_context().add_class("app-button");
-                let btn_size = (config.icon_size + 16).max(36);
-                button.set_size_request(btn_size, btn_size);
                 button.set_halign(gtk::Align::Center);
                 button.set_valign(gtk::Align::Center);
 
@@ -413,6 +603,7 @@ impl TaskbarWidget {
                 let niri_tx = niri_service.update_tx.clone();
                 let bar_pos = self.bar_position;
                 let bar_sz = self.bar_size;
+                let vp_press = Rc::clone(&self.viewport);
 
                 // Button press
                 button.connect_button_press_event(move |b, event| {
@@ -435,6 +626,9 @@ impl TaskbarWidget {
                                 children.iter().position(|c| c == b).unwrap_or(idx)
                             })
                             .unwrap_or(idx);
+
+                        let cur_start = vp_press.borrow().start;
+                        let global_idx = cur_start + current_idx;
 
                         // Anchor the press in Niri space through the monitor
                         // containing it (see `map_root_to_niri`) — no
@@ -459,15 +653,15 @@ impl TaskbarWidget {
                         *drag = Some(GlobalDragState {
                             window_id,
                             source_output: source_out,
-                            source_index: current_idx,
+                            source_index: global_idx,
                             start_root_x: root_x,
                             start_root_y: root_y,
                             current_global_x: start_global_x,
                             current_global_y: start_global_y,
                             is_dragging: false,
-                            current_target_slot: current_idx,
+                            current_target_slot: global_idx,
                             target_output: None,
-                            target_slot: current_idx,
+                            target_slot: global_idx,
                             target_slot_valid: false,
                             generation,
                         });
@@ -478,6 +672,7 @@ impl TaskbarWidget {
 
                 // Motion notify on source button
                 let niri_tx_motion = niri_tx.clone();
+                let vp_motion = Rc::clone(&self.viewport);
 
                 button.connect_motion_notify_event(move |b, event| {
                     let mut drag_guard = crate::util::lock(&GLOBAL_DRAG);
@@ -564,11 +759,13 @@ impl TaskbarWidget {
                                                 parent.reorder_child(b, target_idx as i32);
                                             }
                                             {
+                                                let cur_start = vp_motion.borrow().start;
+                                                let global_target = cur_start + target_idx;
                                                 let mut g = crate::util::lock(&GLOBAL_DRAG);
                                                 if let Some(ref mut d) = *g {
                                                     if d.window_id == window_id {
-                                                        d.current_target_slot = target_idx;
-                                                        d.target_slot = target_idx;
+                                                        d.current_target_slot = global_target;
+                                                        d.target_slot = global_target;
                                                     }
                                                 }
                                             }
@@ -626,7 +823,7 @@ impl TaskbarWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_windows_for_output, sort_windows_spatially};
+    use super::{calculate_sliding_window, filter_windows_for_output, sort_windows_spatially};
     use crate::niri::model::{WindowInfo, WindowLayout, WorkspaceInfo};
 
     #[test]
@@ -674,7 +871,7 @@ mod tests {
             },
         ];
 
-        sort_windows_spatially(&mut windows);
+        sort_windows_spatially(&mut windows, &[]);
 
         assert_eq!(windows[0].id, 3); // (0, 0)
         assert_eq!(windows[1].id, 2); // (0, 1)
@@ -687,18 +884,21 @@ mod tests {
         let workspaces = [
             WorkspaceInfo {
                 id: 1,
+                idx: 1,
                 output: Some("eDP-1".to_string()),
                 is_active: true,
                 is_focused: true,
             },
             WorkspaceInfo {
                 id: 2,
+                idx: 2,
                 output: Some("eDP-1".to_string()),
                 is_active: false,
                 is_focused: false,
             },
             WorkspaceInfo {
                 id: 3,
+                idx: 1,
                 output: Some("DP-1".to_string()),
                 is_active: true,
                 is_focused: false,
@@ -749,9 +949,85 @@ mod tests {
     }
 
     #[test]
+    fn test_taskbar_groups_by_workspace_then_spatial_order() {
+        let workspaces = [
+            WorkspaceInfo {
+                id: 1,
+                idx: 1,
+                output: Some("eDP-1".to_string()),
+                is_active: true,
+                is_focused: true,
+            },
+            WorkspaceInfo {
+                id: 2,
+                idx: 2,
+                output: Some("eDP-1".to_string()),
+                is_active: false,
+                is_focused: false,
+            },
+        ];
+
+        let windows = [
+            // App on WS 2, col 0
+            WindowInfo {
+                id: 10,
+                title: Some("WS 2 Col 0".to_string()),
+                app_id: None,
+                workspace_id: Some(2),
+                is_focused: false,
+                layout: Some(WindowLayout {
+                    pos_in_scrolling_layout: Some((0, 0)),
+                }),
+            },
+            // App on WS 1, col 1
+            WindowInfo {
+                id: 20,
+                title: Some("WS 1 Col 1".to_string()),
+                app_id: None,
+                workspace_id: Some(1),
+                is_focused: false,
+                layout: Some(WindowLayout {
+                    pos_in_scrolling_layout: Some((1, 0)),
+                }),
+            },
+            // App on WS 1, col 0
+            WindowInfo {
+                id: 30,
+                title: Some("WS 1 Col 0".to_string()),
+                app_id: None,
+                workspace_id: Some(1),
+                is_focused: true,
+                layout: Some(WindowLayout {
+                    pos_in_scrolling_layout: Some((0, 0)),
+                }),
+            },
+            // App on WS 2, col 1
+            WindowInfo {
+                id: 40,
+                title: Some("WS 2 Col 1".to_string()),
+                app_id: None,
+                workspace_id: Some(2),
+                is_focused: false,
+                layout: Some(WindowLayout {
+                    pos_in_scrolling_layout: Some((1, 0)),
+                }),
+            },
+        ];
+
+        let current_output = Some("eDP-1".to_string());
+        let result = filter_windows_for_output(&windows, &workspaces, &current_output, false);
+
+        let ids: Vec<u64> = result.iter().map(|w| w.id).collect();
+        // Must group all WS 1 windows first (ordered col 0 then col 1),
+        // followed by all WS 2 windows (ordered col 0 then col 1).
+        assert_eq!(ids, vec![30, 20, 10, 40]);
+    }
+
+    #[test]
     fn test_taskbar_unresolved_output_shows_nothing() {
         let workspaces = [WorkspaceInfo {
             id: 1,
+            idx: 1,
             output: Some("eDP-1".to_string()),
             is_active: true,
             is_focused: true,
@@ -767,5 +1043,160 @@ mod tests {
         // Never leak other monitors' windows when output is unresolved.
         let filtered = filter_windows_for_output(&windows, &workspaces, &None, false);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_sliding_window_empty_or_zero_capacity() {
+        assert_eq!(calculate_sliding_window(0, 0, 5, 1, None), (0, 0));
+        assert_eq!(calculate_sliding_window(0, 10, 0, 1, None), (0, 0));
+    }
+
+    #[test]
+    fn test_sliding_window_fits_within_capacity() {
+        // 4 windows with capacity 5 -> all visible, start is 0
+        assert_eq!(calculate_sliding_window(0, 4, 5, 1, Some(2)), (0, 4));
+        assert_eq!(calculate_sliding_window(0, 5, 5, 1, Some(4)), (0, 5));
+    }
+
+    #[test]
+    fn test_sliding_window_forward_navigation_without_safety() {
+        // Capacity 5 full icons, Total 10, Safety 0
+        // Window 1 to 5 (indices 0..4) -> no shift, renders 6 items (0..6) with 6th as cut-off icon
+        assert_eq!(calculate_sliding_window(0, 10, 5, 0, Some(0)), (0, 6));
+        assert_eq!(calculate_sliding_window(0, 10, 5, 0, Some(4)), (0, 6));
+
+        // Window 6 (index 5) is the cut-off icon -> shifts by 1 app (start becomes 1, renders 1..7)
+        assert_eq!(calculate_sliding_window(0, 10, 5, 0, Some(5)), (1, 7));
+
+        // Window 7 (index 6) from start 1 -> shifts to start 2 (renders 2..8)
+        assert_eq!(calculate_sliding_window(1, 10, 5, 0, Some(6)), (2, 8));
+    }
+
+    #[test]
+    fn test_sliding_window_forward_navigation_with_safety() {
+        // Capacity 5 full icons, Total 10, Safety 1
+        // Threshold: start + 5 - 1 - 1 = 3 (4th window, index 3).
+        // 5th window (index 4) exceeds threshold 3 -> shifts start to 1! (renders 1..7)
+        assert_eq!(calculate_sliding_window(0, 10, 5, 1, Some(3)), (0, 6));
+        assert_eq!(calculate_sliding_window(0, 10, 5, 1, Some(4)), (1, 7));
+        assert_eq!(calculate_sliding_window(1, 10, 5, 1, Some(5)), (2, 8));
+    }
+
+    #[test]
+    fn test_sliding_window_backward_hysteresis_and_threshold() {
+        // Currently at start 4 (showing indices 4..10)
+        // Upper threshold = 4 + 5 - 1 - 1 = 7. Lower threshold = 4 + 1 = 5.
+        // Navigating back: index 7, 6, 5 remain in view without shift (hysteresis)
+        assert_eq!(calculate_sliding_window(4, 10, 5, 1, Some(7)), (4, 10));
+        assert_eq!(calculate_sliding_window(4, 10, 5, 1, Some(6)), (4, 10));
+        assert_eq!(calculate_sliding_window(4, 10, 5, 1, Some(5)), (4, 10));
+
+        // When navigating to index 4 (< lower threshold 5) -> shifts back to start 3 (renders 3..9)
+        assert_eq!(calculate_sliding_window(4, 10, 5, 1, Some(4)), (3, 9));
+
+        // Moving back to index 0 -> clamped at start 0 (renders 0..6)
+        assert_eq!(calculate_sliding_window(3, 10, 5, 1, Some(0)), (0, 6));
+    }
+
+    #[test]
+    fn test_sliding_window_large_jump() {
+        // 100 windows, capacity 10, safety 1. Jump directly from 0 to window 90 (index 89)
+        // Upper threshold for start S: S + 10 - 1 - 1 = S + 8.
+        // For index 89, S = 89 - 8 = 81.
+        // End is (81 + 10 + 1) = 92 (10 full + 1 half icon)
+        let (start, end) = calculate_sliding_window(0, 100, 10, 1, Some(89));
+        assert_eq!((start, end), (81, 92));
+        assert!(89 >= start && 89 < end);
+
+        // Jump to last window 100 (index 99) -> clamped to max_start 90 (renders 90..100)
+        let (start, end) = calculate_sliding_window(0, 100, 10, 1, Some(99));
+        assert_eq!((start, end), (90, 100));
+    }
+
+    #[test]
+    fn test_sliding_window_no_focus_keeps_valid_range() {
+        // No focused window keeps current start clamped, renders capacity + 1
+        assert_eq!(calculate_sliding_window(2, 10, 5, 1, None), (2, 8));
+        assert_eq!(calculate_sliding_window(8, 10, 5, 1, None), (5, 10));
+    }
+
+    #[test]
+    fn test_taskbar_viewport_manual_scroll_retention() {
+        use super::TaskbarViewport;
+        let mut vp = TaskbarViewport::new();
+        // Focus window 1 (id: 101, idx: 0), total 10, capacity 5, safety 1
+        vp.update(Some(101), Some(0), 10, 5, 1);
+        assert_eq!(vp.start, 0);
+
+        // User manually scrolls down by 2 (towards later windows)
+        vp.scroll_by(2);
+        assert_eq!(vp.start, 2);
+
+        // Subsequent reconcile with the SAME focused window (id: 101) must NOT snap back!
+        vp.update(Some(101), Some(0), 10, 5, 1);
+        assert_eq!(
+            vp.start, 2,
+            "Manual scroll must not snap back when focus has not changed"
+        );
+
+        // User scrolls down past max_start (10 - 5 = 5)
+        vp.scroll_by(10);
+        assert_eq!(vp.start, 5);
+
+        // User scrolls up
+        vp.scroll_by(-2);
+        assert_eq!(vp.start, 3);
+    }
+
+    #[test]
+    fn test_taskbar_viewport_focus_change_triggers_auto_scroll() {
+        use super::TaskbarViewport;
+        let mut vp = TaskbarViewport::new();
+        // Initially window 101 at index 0
+        vp.update(Some(101), Some(0), 10, 5, 1);
+        assert_eq!(vp.start, 0);
+
+        // Focus changes to window 105 (at index 4). Threshold with safety 1 is 0 + 5 - 1 - 1 = 3.
+        // Index 4 > 3 -> shifts start to 1.
+        vp.update(Some(105), Some(4), 10, 5, 1);
+        assert_eq!(vp.start, 1);
+
+        // Focus changes to window 109 (at index 8).
+        // Upper threshold for start S: S + 3. Index 8 -> start becomes 8 - 3 = 5.
+        vp.update(Some(109), Some(8), 10, 5, 1);
+        assert_eq!(vp.start, 5);
+    }
+
+    #[test]
+    fn test_taskbar_viewport_clamping_on_window_shrink() {
+        use super::TaskbarViewport;
+        let mut vp = TaskbarViewport::new();
+        vp.start = 5;
+        // Total shrinks from 10 to 4 windows, capacity 5 -> max_start is 0
+        vp.update(Some(101), Some(0), 4, 5, 1);
+        assert_eq!(vp.start, 0);
+    }
+
+    #[test]
+    fn test_taskbar_viewport_visible_range() {
+        use super::TaskbarViewport;
+        let mut vp = TaskbarViewport::new();
+        vp.update(None, None, 0, 5, 1);
+        assert_eq!(vp.visible_range(), (0, 0));
+
+        vp.update(None, None, 4, 5, 1);
+        assert_eq!(vp.visible_range(), (0, 4));
+
+        vp.update(None, None, 5, 5, 1);
+        assert_eq!(vp.visible_range(), (0, 5));
+
+        // 10 windows, capacity 5: renders start..start+capacity+1 (peeking icon)
+        vp.update(None, None, 10, 5, 1);
+        vp.start = 2;
+        assert_eq!(vp.visible_range(), (2, 8));
+
+        // At end: 10 windows, start = 5
+        vp.start = 5;
+        assert_eq!(vp.visible_range(), (5, 10));
     }
 }

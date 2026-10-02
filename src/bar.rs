@@ -19,6 +19,8 @@ pub struct BarWindow {
     pub taskbar: TaskbarWidget,
     pub detected_output: Option<String>,
     pub error_badge: ErrorBadge,
+    start_box: GtkBox,
+    end_box: GtkBox,
     last_output_refresh: Option<std::time::Instant>,
 }
 
@@ -60,8 +62,54 @@ pub fn copy_to_clipboard(text: &str) {
 /// instead of trusting another `OutputsChanged` to arrive.
 const UNRESOLVED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Computes how many taskbar icons fit in the available bar length, rounded down.
+pub fn calculate_taskbar_capacity(
+    monitor_len: i32,
+    end_box_len: i32,
+    start_non_taskbar_len: i32,
+    item_stride: i32,
+) -> usize {
+    let occupied = end_box_len + start_non_taskbar_len;
+    let avail = (monitor_len - occupied).max(0);
+    let stride = item_stride.max(1);
+    (avail / stride).max(1) as usize
+}
+
+/// Computes taskbar capacity from live widget geometries and configuration.
+pub fn compute_taskbar_capacity(
+    monitor: &gdk::Monitor,
+    config: &AppConfig,
+    start_box: &GtkBox,
+    end_box: &GtkBox,
+    taskbar_container: &GtkBox,
+) -> usize {
+    let is_vertical = config.position.is_vertical();
+    let mon_geom = monitor.geometry();
+    let mon_len = if is_vertical {
+        mon_geom.height()
+    } else {
+        mon_geom.width()
+    };
+    let (_, end_req) = end_box.preferred_size();
+    let end_len = if is_vertical { end_req.height } else { end_req.width };
+    let start_non_taskbar_len: i32 = start_box
+        .children()
+        .iter()
+        .filter(|c| *c != taskbar_container)
+        .map(|c| {
+            let (_, req) = c.preferred_size();
+            if is_vertical {
+                req.height
+            } else {
+                req.width
+            }
+        })
+        .sum();
+    let item_stride = (config.size + config.spacing).max(1);
+    calculate_taskbar_capacity(mon_len, end_len, start_non_taskbar_len, item_stride)
+}
+
 /// Pure module placement for tests: which container a name belongs to.
-/// Unknown names return `None` (caller logs a warning and skips).
 pub fn resolve_module_placement(name: &str) -> Option<ModulePlacement> {
     match name {
         "taskbar" => Some(ModulePlacement::Taskbar),
@@ -282,11 +330,6 @@ impl BarWindow {
         }
 
         let overlay = gtk::Overlay::new();
-        if is_vertical {
-            overlay.set_size_request(config.size, -1);
-        } else {
-            overlay.set_size_request(-1, config.size);
-        }
         window.add(&overlay);
 
         // 1. Section 1: Modules at start (base layer)
@@ -295,15 +338,19 @@ impl BarWindow {
         start_ctx.add_class("taskbar-section");
         start_ctx.add_class("start-section");
         if is_vertical {
-            start_box.set_size_request(config.size, -1);
             start_box.set_valign(gtk::Align::Start);
             start_box.set_halign(gtk::Align::Fill);
         } else {
-            start_box.set_size_request(-1, config.size);
             start_box.set_halign(gtk::Align::Start);
             start_box.set_valign(gtk::Align::Fill);
         }
-        let taskbar = TaskbarWidget::new(box_orient, config.spacing, config.position, config.size);
+        let taskbar = TaskbarWidget::new(
+            box_orient,
+            config.spacing,
+            config.position,
+            config.size,
+            niri.update_tx.clone(),
+        );
         overlay.add(&start_box);
 
         // 2. Section 2: Modules at end (overlay layer)
@@ -313,11 +360,9 @@ impl BarWindow {
         end_ctx.add_class("modules-section");
         end_ctx.add_class("end-section");
         if is_vertical {
-            end_box.set_size_request(config.size, -1);
             end_box.set_valign(gtk::Align::End);
             end_box.set_halign(gtk::Align::Fill);
         } else {
-            end_box.set_size_request(-1, config.size);
             end_box.set_halign(gtk::Align::End);
             end_box.set_valign(gtk::Align::Fill);
         }
@@ -396,7 +441,10 @@ impl BarWindow {
             detected_output
         );
 
-        taskbar.reconcile(&detected_output, &niri.state, &config.taskbar, niri);
+        let capacity = compute_taskbar_capacity(&monitor, config, &start_box, &end_box, &taskbar.container);
+        log_debug!("bar", "Bar capacity computed: {}", capacity);
+
+        taskbar.reconcile(&detected_output, &niri.state, &config.taskbar, niri, capacity);
 
         Self {
             window,
@@ -404,6 +452,8 @@ impl BarWindow {
             taskbar,
             detected_output,
             error_badge,
+            start_box,
+            end_box,
             last_output_refresh: None,
         }
     }
@@ -416,6 +466,16 @@ impl BarWindow {
     /// Clear the error badge when configuration or CSS is valid again.
     pub fn clear_error(&self) {
         self.error_badge.clear_error();
+    }
+
+    fn compute_capacity(&self, config: &AppConfig) -> usize {
+        compute_taskbar_capacity(
+            &self.monitor,
+            config,
+            &self.start_box,
+            &self.end_box,
+            &self.taskbar.container,
+        )
     }
 
     /// Re-resolve the Niri output for this monitor and reconcile the taskbar.
@@ -457,8 +517,9 @@ impl BarWindow {
                 niri.refresh_outputs_async();
             }
         }
+        let capacity = self.compute_capacity(config);
         self.taskbar
-            .reconcile(&self.detected_output, &niri.state, &config.taskbar, niri);
+            .reconcile(&self.detected_output, &niri.state, &config.taskbar, niri, capacity);
     }
 }
 
@@ -474,6 +535,16 @@ mod tests {
         assert_eq!(resolve_module_placement("spacer"), Some(ModulePlacement::Simple));
         assert_eq!(resolve_module_placement("volumne"), None);
         assert_eq!(resolve_module_placement(""), None);
+    }
+
+    #[test]
+    fn test_calculate_taskbar_capacity_rounds_down() {
+        // 5.5 icons fit (275 / 50) -> rounds down to 5
+        assert_eq!(calculate_taskbar_capacity(800, 500, 25, 50), 5);
+        // Zero or negative available space -> returns 1
+        assert_eq!(calculate_taskbar_capacity(500, 500, 10, 50), 1);
+        // Exact fit: 300 / 50 -> 6
+        assert_eq!(calculate_taskbar_capacity(800, 480, 20, 50), 6);
     }
 
     #[test]
@@ -602,5 +673,31 @@ mod tests {
         let provider = gtk::CssProvider::new();
         let res = provider.load_from_data(ERROR_BADGE_CSS);
         assert!(res.is_ok(), "ERROR_BADGE_CSS failed to parse: {:?}", res.err());
+    }
+
+    #[test]
+    fn test_overlay_layout() {
+        if !gtk::is_initialized() && gtk::init().is_err() {
+            return;
+        }
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_size_request(50, -1);
+        let overlay = gtk::Overlay::new();
+        window.add(&overlay);
+
+        let start_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        start_box.set_valign(gtk::Align::Start);
+        start_box.set_halign(gtk::Align::Fill);
+        overlay.add(&start_box);
+
+        let end_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        end_box.set_valign(gtk::Align::End);
+        end_box.set_halign(gtk::Align::Fill);
+        overlay.add_overlay(&end_box);
+
+        window.show_all();
+        assert!(overlay.is_visible());
+        assert!(start_box.is_visible());
+        assert!(end_box.is_visible());
     }
 }

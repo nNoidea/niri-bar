@@ -115,6 +115,10 @@ impl ClickActions {
     }
 }
 
+fn default_scroll_safety_margin() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskbarConfig {
     #[serde(default = "default_true")]
@@ -125,6 +129,8 @@ pub struct TaskbarConfig {
     pub only_current_workspace: bool,
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
+    #[serde(default = "default_scroll_safety_margin")]
+    pub scroll_safety_margin: usize,
 }
 
 impl Default for TaskbarConfig {
@@ -134,6 +140,7 @@ impl Default for TaskbarConfig {
             icon_size: 32,
             only_current_workspace: true,
             show_tooltips: true,
+            scroll_safety_margin: 1,
         }
     }
 }
@@ -814,6 +821,8 @@ mod tests {
         assert_eq!(cfg.size, 50);
         assert!(cfg.taskbar.enabled);
         assert_eq!(cfg.taskbar.icon_size, 32);
+        assert_eq!(cfg.taskbar.scroll_safety_margin, 1);
+        assert!(DEFAULT_CONFIG_TOML.contains("scroll_safety_margin"));
         assert_eq!(cfg.battery.warning_threshold, 30);
         assert_eq!(cfg.battery.critical_threshold, 15);
         assert_eq!(cfg.spacer.size, 5);
@@ -1169,5 +1178,29 @@ mod tests {
         // First launch writes defaults into the isolated dir only.
         assert!(dir.join("config.toml").exists());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_taskbar_config_scroll_safety_margin() {
+        // User specifies custom margin
+        let toml_str = r#"
+            [taskbar]
+            scroll_safety_margin = 2
+        "#;
+        let cfg = reload_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.taskbar.scroll_safety_margin, 2);
+
+        // Existing user upgrade: taskbar table exists but lacks scroll_safety_margin
+        let legacy_user_toml = r#"
+            [taskbar]
+            icon_size = 28
+        "#;
+        let legacy_cfg = reload_config_from_str(legacy_user_toml).unwrap();
+        assert_eq!(legacy_cfg.taskbar.scroll_safety_margin, 1);
+        assert_eq!(legacy_cfg.taskbar.icon_size, 28);
+
+        // Fresh install / default
+        let default_cfg = AppConfig::default();
+        assert_eq!(default_cfg.taskbar.scroll_safety_margin, 1);
     }
 }

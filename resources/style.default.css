@@ -55,17 +55,13 @@ button.tray-item:backdrop,
 /* Hover effect for interactive elements */
 button.clickable:hover,
 button.module-item.clickable:hover,
-button.app-button:hover,
 button.tray-item:hover,
-.taskbar button:hover,
 .tray button:hover {
-    background: rgba(255, 255, 255, 0.1);
     background-color: rgba(255, 255, 255, 0.1);
 }
 
 .taskbar button:hover,
 .taskbar button.app-button:hover {
-    background: rgba(88, 91, 112, 0.45);
     background-color: rgba(88, 91, 112, 0.45);
 }
 
@@ -74,7 +70,6 @@ button.non-clickable:hover,
 button.module-item.non-clickable:hover,
 button.no-hover:hover,
 .no-hover:hover {
-    background: transparent;
     background-color: transparent;
 }
 
@@ -108,7 +103,7 @@ window.niri-bar.horizontal button.module-item {
     border-radius: 0;
 }
 
-/* Taskbar specific buttons - Perfect Square Boxes */
+/* Taskbar specific buttons */
 .taskbar {
     padding: 0;
     margin: 0;
@@ -116,11 +111,10 @@ window.niri-bar.horizontal button.module-item {
 
 .taskbar button,
 .taskbar button.app-button {
-    padding: 0;
+    padding: 8px;
     margin: 0;
-    min-width: 50px;
-    min-height: 50px;
     border-radius: 8px;
+    transition: none;
 }
 
 .taskbar button image,
@@ -131,8 +125,8 @@ window.niri-bar.horizontal button.module-item {
 
 .taskbar button.focused,
 .taskbar button.app-button.focused {
-    background: #585b70;
     background-color: #585b70;
+    transition: none;
 }
 
 
@@ -217,12 +211,12 @@ window.niri-bar.horizontal button.module-item {
 /* Spacer Module */
 button.module-spacer,
 button.module-spacer:backdrop,
+button.module-spacer:hover,
 button.module-spacer label {
-    min-height: 0;
-    min-width: 0;
     padding: 0;
     margin: 0;
     border: none;
+    background-color: transparent;
 }
 
 window.niri-bar.vertical button.module-spacer {
@@ -237,14 +231,6 @@ window.niri-bar.horizontal button.module-spacer {
     min-width: 0;
     padding: 0;
     margin: 0;
-}
-
-button.module-spacer,
-button.module-spacer:hover,
-.module-spacer,
-.module-spacer:hover {
-    background: transparent;
-    background-color: transparent;
 }
 
 
