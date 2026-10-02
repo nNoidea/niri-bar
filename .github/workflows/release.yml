@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check version against existing releases
+        id: release_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not extract version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          echo "Cargo.toml version: $VERSION ($TAG)"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on GitHub. Skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release $TAG does not exist yet. Proceeding with release."
+          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          echo "Previous release tag: ${PREV_TAG:-none}"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        if: steps.release_check.outputs.should_release == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+
+      - name: Install Rust
+        if: steps.release_check.outputs.should_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        if: steps.release_check.outputs.should_release == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate release notes
+        if: steps.release_check.outputs.should_release == 'true'
+        env:
+          PREV_TAG: ${{ steps.release_check.outputs.prev_tag }}
+        run: |
+          mkdir -p dist
+          python3 scripts/generate_changelog.py "$PREV_TAG" "HEAD" > dist/release_notes.md
+          cat dist/release_notes.md
+
+      - name: Build release binary and package
+        if: steps.release_check.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ steps.release_check.outputs.version }}
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/package
+          cp target/release/niri-bar dist/package/
+          cp resources/config.default.toml resources/style.default.css dist/package/
+          tar -czvf "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
+          cp target/release/niri-bar dist/niri-bar
+
+      - name: Publish GitHub Release
+        if: steps.release_check.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release_check.outputs.tag }}
+          VERSION: ${{ steps.release_check.outputs.version }}
+        run: |
+          echo "Creating GitHub Release $TAG with categorized changelog..."
+          gh release create "$TAG" \
+            dist/niri-bar \
+            "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            --title "Release $TAG" \
+            --notes-file dist/release_notes.md

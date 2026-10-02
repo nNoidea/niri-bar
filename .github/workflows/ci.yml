@@ -2,8 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
   pull_request:
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -79,75 +79,3 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 7
-
-  release:
-    name: Publish Release
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Check version against existing releases
-        id: release_check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Extract version from Cargo.toml (e.g. 0.1.1)
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '[:space:]')
-          if [ -z "$VERSION" ]; then
-            echo "Error: Could not extract version from Cargo.toml" >&2
-            exit 1
-          fi
-
-          TAG="v$VERSION"
-          echo "Cargo.toml version: $VERSION ($TAG)"
-
-          # Check if this release tag already exists on GitHub
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists on GitHub. Skipping release."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Release $TAG does not exist yet. Proceeding with release."
-          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
-          echo "Previous release tag: ${PREV_TAG:-none}"
-          echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Download binary artifacts
-        if: steps.release_check.outputs.should_release == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: niri-bar-binaries
-          path: dist/
-
-      - name: Generate release notes
-        if: steps.release_check.outputs.should_release == 'true'
-        env:
-          PREV_TAG: ${{ steps.release_check.outputs.prev_tag }}
-        run: |
-          chmod +x dist/niri-bar || true
-          python3 scripts/generate_changelog.py "$PREV_TAG" "HEAD" > dist/release_notes.md
-          cat dist/release_notes.md
-
-      - name: Publish GitHub Release
-        if: steps.release_check.outputs.should_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release_check.outputs.tag }}
-          VERSION: ${{ steps.release_check.outputs.version }}
-        run: |
-          echo "Creating GitHub Release $TAG with categorized changelog..."
-          gh release create "$TAG" \
-            dist/niri-bar \
-            "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            --title "Release $TAG" \
-            --notes-file dist/release_notes.md
