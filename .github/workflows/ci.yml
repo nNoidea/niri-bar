@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: Check & Test
+    name: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -44,7 +44,7 @@ jobs:
           GDK_BACKEND: memory
 
   build:
-    name: Build Release Binary
+    name: build
     needs: test
     runs-on: ubuntu-latest
     steps:
