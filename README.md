@@ -4,7 +4,7 @@ A fast, lightweight Wayland taskbar built in Rust **SPECIFICALLY for the [Niri](
 
 > **Why niri-bar instead of any other bar?**  
 
-niri-bar is built from the ground up, only for Niri. When I started using Niri, I saw that no other taskbar properly took advantage of the Niri IPC, instead resorting to hacks and workarounds that constantly broke. I spent endless time fixing their hacks and piling on my own band-aids only for them to break again. So niri-bar was born: built for Niri, and only for Niri.
+niri-bar is built from the ground up, only for Niri. When I started using Niri, I saw that no other taskbar properly took advantage of the Niri IPC, instead resorting to hacks and workarounds that constantly broke. I spent endless time fixing their hacks and piling on my own band-aids only for them to break again. So niri-bar was born: built for Niri, and only for Niri...
 
 # Screenshots & Video
 ![](images/image.png)
