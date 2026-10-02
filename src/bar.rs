@@ -133,7 +133,7 @@ pub const ERROR_BADGE_CSS: &[u8] = b"#bar-error-badge,
 button#bar-error-badge,
 #bar-error-badge:backdrop,
 button#bar-error-badge:backdrop {
-    background-color: #000001;
+    background-color: #000000;
     background-image: none;
     border-color: #ff3333;
     border-style: solid;
