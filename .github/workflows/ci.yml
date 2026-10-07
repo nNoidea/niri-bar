@@ -73,7 +73,7 @@ jobs:
           cp target/release/niri-bar dist/niri-bar
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: niri-bar-binaries
           path: dist/
