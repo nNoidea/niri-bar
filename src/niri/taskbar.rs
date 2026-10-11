@@ -690,12 +690,14 @@ impl TaskbarWidget {
                                     b.style_context().add_class("is-dragging");
                                     b.style_context().add_class("drag-placeholder");
 
-                                    let current_key = shared_icon_key_motion.borrow().clone();
-                                    apply_drag_cursor_globally(&current_key, config_icon_sz, Some(b));
-
                                     // Fullscreen transparent overlays so the
                                     // drag tracks across monitors (see drag.rs).
+                                    // Spawn BEFORE applying the cursor so the
+                                    // overlay windows get the icon cursor too.
                                     spawn_monitor_overlays(&state_clone_motion, &niri_tx_motion, window_id, b);
+
+                                    let current_key = shared_icon_key_motion.borrow().clone();
+                                    apply_drag_cursor_globally(&current_key, config_icon_sz, Some(b));
                                 }
 
                                 let source_out_snapshot = drag.source_output.clone();

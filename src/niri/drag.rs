@@ -440,6 +440,26 @@ pub fn spawn_monitor_overlays(
     }
 }
 
+thread_local! {
+    /// True while a drag holds a GDK seat grab to force its icon cursor.
+    pub static DRAG_CURSOR_GRAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a drag currently holds the cursor seat grab (main thread).
+#[cfg(test)]
+pub fn drag_cursor_grab_active() -> bool {
+    DRAG_CURSOR_GRAB.with(|g| g.get())
+}
+
+/// Release the drag cursor grab if we hold one. Idempotent.
+fn release_drag_cursor_grab() {
+    if DRAG_CURSOR_GRAB.with(|g| g.replace(false)) {
+        if let Some(seat) = gdk::Display::default().and_then(|d| d.default_seat()) {
+            seat.ungrab();
+        }
+    }
+}
+
 pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Option<&Button>) {
     let size = if size <= 0 { 20 } else { size };
     if let Some(pixbuf) = crate::icon::load_pixbuf_at_size(icon_key, size) {
@@ -454,6 +474,28 @@ pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Opti
                 if let Some(w) = b.window() {
                     w.set_cursor(Some(&cursor));
                 }
+                // `set_cursor` above is silently ignored by GDK when it thinks
+                // the pointer is not over one of our windows (e.g. the drag
+                // started only after the pointer left the bar from an edge
+                // grab). A seat grab with a cursor sets it unconditionally.
+                // Grab the button's own event window with owner_events=false
+                // so motion/release keep going to the button exactly like the
+                // implicit press grab did.
+                if let (Some(ev_win), Some(seat)) = (b.event_window().or_else(|| b.window()), display.default_seat()) {
+                    let status = seat.grab(
+                        &ev_win,
+                        gdk::SeatCapabilities::POINTER,
+                        false,
+                        Some(&cursor),
+                        None,
+                        None,
+                    );
+                    if status == gdk::GrabStatus::Success {
+                        DRAG_CURSOR_GRAB.with(|g| g.set(true));
+                    } else {
+                        log_debug!("drag", "Drag cursor seat grab failed: {:?}", status);
+                    }
+                }
             }
             display.flush();
         }
@@ -461,6 +503,9 @@ pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Opti
 }
 
 pub fn reset_all_cursors_and_overlay(source_button: Option<&Button>) {
+    // Release first so the restored cursors below actually take effect.
+    release_drag_cursor_grab();
+
     if let Some(display) = gdk::Display::default() {
         if let Some(screen) = gdk::Screen::default() {
             for win in screen.toplevel_windows() {
@@ -856,5 +901,31 @@ mod tests {
 
         let img = gtk::Image::from_surface(Some(&surf));
         assert_eq!(img.storage_type(), gtk::ImageType::Surface);
+    }
+
+    #[test]
+    fn test_drag_cursor_grab_released_on_reset() {
+        if gtk::is_initialized() {
+            if !gtk::is_initialized_main_thread() {
+                eprintln!("Skipping GTK test: running on non-main GTK thread");
+                return;
+            }
+        } else if gtk::init().is_err() {
+            eprintln!("Skipping GTK test: display not available");
+            return;
+        }
+
+        // Pretend a drag grabbed the pointer for its cursor.
+        DRAG_CURSOR_GRAB.with(|g| g.set(true));
+        assert!(drag_cursor_grab_active());
+
+        // Every drag end path goes through reset: it must release the grab,
+        // otherwise the bar keeps swallowing pointer events after the drop.
+        reset_all_cursors_and_overlay(None);
+        assert!(!drag_cursor_grab_active());
+
+        // Idempotent: resetting with no grab is a no-op.
+        reset_all_cursors_and_overlay(None);
+        assert!(!drag_cursor_grab_active());
     }
 }
