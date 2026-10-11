@@ -60,7 +60,7 @@
     <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2" />
 
     <!-- Slot 2: Volume Square -->
-    <g transform="translate(18, 144)">
+    <g transform="translate(50, 176) scale(1.2) translate(-32, -32)">
       <rect x="0" y="0" width="64" height="64" rx="18" ry="18" fill="url(#volGrad)" />
       <g transform="translate(29, 32) scale(1.22)">
         <path d="M -11 -6 L -5.5 -6 L 5 -12.5 C 6.8 -13.8 8.5 -12.8 8.5 -10.5 L 8.5 10.5 C 8.5 12.8 6.8 13.8 5 12.5 L -5.5 6 L -11 6 C -12.5 6 -13.5 4.8 -13.5 3.2 L -13.5 -3.2 C -13.5 -4.8 -12.5 -6 -11 -6 Z" fill="#ffffff" stroke="#ffffff" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round" />
@@ -69,7 +69,7 @@
     </g>
 
     <!-- Slot 3: Date Square -->
-    <g transform="translate(18, 245)">
+    <g transform="translate(50, 277) scale(1.2) translate(-32, -32)">
       <rect x="0" y="0" width="64" height="64" rx="18" ry="18" fill="#f2f2f7" />
       <path d="M 0 18 C 0 8 8 0 18 0 L 46 0 C 56 0 64 8 64 18 L 64 21 C 64 22 63 23 62 23 L 2 23 C 1 23 0 22 0 21 Z" fill="url(#calGrad)" />
       <circle cx="16" cy="11" r="3.5" fill="#1c1c1e" />
@@ -87,13 +87,13 @@
     <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2" />
 
     <!-- Slot 1: Video App -->
-    <g transform="translate(18, 43)">
+    <g transform="translate(50, 75) scale(1.2) translate(-32, -32)">
       <rect x="0" y="0" width="64" height="64" rx="18" ry="18" fill="url(#videoGrad)" />
-      <polygon points="23,15 50,32 23,49" fill="#ffffff" stroke="#ffffff" stroke-width="9" stroke-linejoin="round" stroke-linecap="round" />
+      <polygon points="18.5,15 45.5,32 18.5,49" fill="#ffffff" stroke="#ffffff" stroke-width="9" stroke-linejoin="round" stroke-linecap="round" />
     </g>
 
     <!-- Slot 2: Terminal App -->
-    <g transform="translate(18, 144)">
+    <g transform="translate(50, 176) scale(1.2) translate(-32, -32)">
       <rect x="0" y="0" width="64" height="64" rx="18" ry="18" fill="url(#termGrad)" />
       <path d="M 15 18 L 30 32 L 15 46" fill="none" stroke="#ffffff" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round" />
       <line x1="36" y1="46" x2="50" y2="46" stroke="#ffffff" stroke-width="7.5" stroke-linecap="round" />
@@ -103,7 +103,7 @@
   <!-- 3. DIAGONAL RIBBON & DRAGGED TILE -->
   <g filter="url(#topBarShadow)">
     <path d="M 156 155 L 356 357" stroke="url(#ribbonGrad)" stroke-width="72" stroke-linecap="round" />
-    <g transform="translate(256, 256) rotate(-14)">
+    <g transform="translate(256, 256) rotate(-14) scale(1.5)">
       <g transform="translate(-53, -53)">
         <rect x="0" y="0" width="106" height="106" rx="29" ry="29" fill="url(#tileGrad)" />
         <rect x="1.5" y="1.5" width="103" height="103" rx="27.5" ry="27.5" fill="none" stroke="rgba(255,255,255,0.38)" stroke-width="2.5" />
