@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/da22fb12-8062-4617-a743-598555fd0e36
 ![](images/image.png)
 ![](images/image2.png)
 
-[![CI](https://github.com/nNoidea/niri-bar/actions/workflows/ci.yml/badge.svg)](https://github.com/nNoidea/niri-bar/actions/workflows/ci.yml)
+[![CI](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml/badge.svg)](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml)
 [![Release](https://img.shields.io/github/v/release/nNoidea/niri-bar)](https://github.com/nNoidea/niri-bar/releases)
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 

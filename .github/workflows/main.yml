@@ -1,20 +1,90 @@
-name: Release
+name: main
 
 on:
   push:
     branches: [ main ]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets --locked -- --test-threads=1
+        env:
+          GDK_BACKEND: memory
+
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary and package
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '[:space:]')
+          echo "Building niri-bar v${VERSION}..."
+          cargo build --release --locked
+          mkdir -p dist/package
+          cp target/release/niri-bar dist/package/
+          cp resources/config.default.toml resources/style.default.css dist/package/
+          tar -czvf "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
+          cp target/release/niri-bar dist/niri-bar
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: niri-bar-binaries
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: release
+    needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,40 +118,21 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Install system dependencies
+      - name: Download binary artifacts
         if: steps.release_check.outputs.should_release == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
-
-      - name: Install Rust
-        if: steps.release_check.outputs.should_release == 'true'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        if: steps.release_check.outputs.should_release == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: actions/download-artifact@v6
+        with:
+          name: niri-bar-binaries
+          path: dist
 
       - name: Generate release notes
         if: steps.release_check.outputs.should_release == 'true'
         env:
           PREV_TAG: ${{ steps.release_check.outputs.prev_tag }}
         run: |
-          mkdir -p dist
+          chmod +x dist/niri-bar || true
           python3 scripts/generate_changelog.py "$PREV_TAG" "HEAD" > dist/release_notes.md
           cat dist/release_notes.md
-
-      - name: Build release binary and package
-        if: steps.release_check.outputs.should_release == 'true'
-        env:
-          VERSION: ${{ steps.release_check.outputs.version }}
-        run: |
-          cargo build --release --locked
-          mkdir -p dist/package
-          cp target/release/niri-bar dist/package/
-          cp resources/config.default.toml resources/style.default.css dist/package/
-          tar -czvf "dist/niri-bar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C dist/package .
-          cp target/release/niri-bar dist/niri-bar
 
       - name: Publish GitHub Release
         if: steps.release_check.outputs.should_release == 'true'
@@ -90,6 +141,7 @@ jobs:
           TAG: ${{ steps.release_check.outputs.tag }}
           VERSION: ${{ steps.release_check.outputs.version }}
         run: |
+          chmod +x dist/niri-bar || true
           echo "Creating GitHub Release $TAG with categorized changelog..."
           gh release create "$TAG" \
             dist/niri-bar \

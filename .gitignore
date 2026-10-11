@@ -41,3 +41,6 @@ pkgconfig/
 # Python
 __pycache__/
 *.pyc
+
+AGENTS.md
+agents.md
