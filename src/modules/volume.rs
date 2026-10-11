@@ -430,7 +430,7 @@ impl VolumeModule {
         }
     }
 
-    pub fn adapt_icon_for_sink(formatted: &str, _volume: u32, _is_muted: bool, sink_type: &SinkType) -> String {
+    pub fn adapt_icon_for_sink(formatted: &str, _volume: u32, _is_muted: bool, sink_type: SinkType) -> String {
         let speaker_icons = ["", "", ""];
         let target_icon = match sink_type {
             SinkType::Bluetooth | SinkType::Headphones | SinkType::Headset => "󰋋",
@@ -468,7 +468,7 @@ impl VolumeModule {
 
         // If no custom level map was provided for this output type, adapt standard speaker icons
         if custom_levels.is_none() {
-            formatted = Self::adapt_icon_for_sink(&formatted, volume, is_muted, &sink.sink_type);
+            formatted = Self::adapt_icon_for_sink(&formatted, volume, is_muted, sink.sink_type);
         }
 
         if is_muted || volume == 0 {
@@ -895,31 +895,31 @@ mod tests {
     fn test_adapt_icon_for_all_sink_types() {
         // Speaker keeps original icons
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, &SinkType::Speaker),
+            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, SinkType::Speaker),
             "\n50%"
         );
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\nM", 50, true, &SinkType::Speaker),
+            VolumeModule::adapt_icon_for_sink("\nM", 50, true, SinkType::Speaker),
             "\nM"
         );
 
         // Headset / Bluetooth / Headphones adapt to 󰋋
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, &SinkType::Headset),
+            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, SinkType::Headset),
             "󰋋\n50%"
         );
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\n100%", 100, false, &SinkType::Bluetooth),
+            VolumeModule::adapt_icon_for_sink("\n100%", 100, false, SinkType::Bluetooth),
             "󰋋\n100%"
         );
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\nM", 50, true, &SinkType::Headphones),
+            VolumeModule::adapt_icon_for_sink("\nM", 50, true, SinkType::Headphones),
             "󰋋\nM"
         );
 
         // HDMI adapts to 󰍹
         assert_eq!(
-            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, &SinkType::Hdmi),
+            VolumeModule::adapt_icon_for_sink("\n50%", 50, false, SinkType::Hdmi),
             "󰍹\n50%"
         );
     }

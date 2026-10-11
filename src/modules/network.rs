@@ -146,7 +146,7 @@ impl NetworkModule {
         // Unhealthy backends back off (3s→30s idle); triggers stay immediate.
         // Subscriptions are worker-owned and renewed so a bus restart cannot
         // silently drop them.
-        let tx_sub = trigger_tx.clone();
+        let tx_sub = trigger_tx;
         thread::spawn(move || {
             let (mut last_type, mut last_ssid) = initial;
             let mut fail_streak: u32 = 0;
@@ -176,7 +176,7 @@ impl NetworkModule {
 
                 if net_type != last_type || ssid != last_ssid {
                     last_type = net_type.clone();
-                    last_ssid = ssid.clone();
+                    last_ssid.clone_from(&ssid);
 
                     {
                         let mut guard = crate::util::lock(&last_worker);
@@ -318,7 +318,7 @@ impl NetworkModule {
 
     fn update_best_route(best: &mut Option<(String, u32)>, iface: &str, flags: u32, metric: u32) {
         const RTF_UP: u32 = 0x1;
-        if flags & RTF_UP != 0 && best.as_ref().map_or(true, |(_, m)| metric < *m) {
+        if flags & RTF_UP != 0 && best.as_ref().is_none_or(|(_, m)| metric < *m) {
             *best = Some((iface.to_string(), metric));
         }
     }

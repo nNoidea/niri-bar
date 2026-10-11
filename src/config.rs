@@ -19,7 +19,7 @@ pub enum BarPosition {
 
 impl BarPosition {
     /// True for `Left`/`Right` (vertical layout).
-    pub fn is_vertical(&self) -> bool {
+    pub fn is_vertical(self) -> bool {
         matches!(self, Self::Left | Self::Right)
     }
 }
@@ -887,7 +887,7 @@ mod tests {
         assert_eq!(res_150, "\n150%");
         assert_eq!(t_150, Some(100));
 
-        let mut boost_levels = default_levels.clone();
+        let mut boost_levels = default_levels;
         boost_levels.insert("150".to_string(), "🔊\n%v%".to_string());
         let (res_boost, t_boost) = resolve_level(&boost_levels, 150, None);
         assert_eq!(res_boost, "🔊\n150%");

@@ -36,7 +36,7 @@ impl BatteryModule {
         // Unhealthy backends back off (10s→60s idle); triggers stay immediate.
         // Subscriptions are worker-owned and renewed so a bus restart cannot
         // silently drop them.
-        let tx_sub = trigger_tx.clone();
+        let tx_sub = trigger_tx;
         thread::spawn(move || {
             let mut last_cached = initial;
             let mut fail_streak: u32 = 0;
@@ -63,10 +63,10 @@ impl BatteryModule {
                     }
                 }
                 if bat_opt != last_cached {
-                    last_cached = bat_opt.clone();
+                    last_cached.clone_from(&bat_opt);
                     {
                         let mut guard = crate::util::lock(&last_worker);
-                        *guard = bat_opt.clone();
+                        guard.clone_from(&bat_opt);
                     }
                     let had_battery = bat_opt.is_some();
                     // No fake 100%: desktops without a battery keep an empty state.
