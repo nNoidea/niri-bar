@@ -1,7 +1,8 @@
-name: CI
+name: other
 
 on:
   push:
+    branches-ignore: [ main ]
   pull_request:
     branches: [ main ]
 
