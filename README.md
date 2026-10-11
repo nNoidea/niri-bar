@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="images/icon.svg" width="128" height="128" alt="niri-bar icon" />
+  <img src="images/icon.svg" width="256" height="256" alt="niri-bar icon" />
 </div>
 
 # niri-bar
