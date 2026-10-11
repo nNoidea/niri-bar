@@ -23,13 +23,14 @@ https://github.com/user-attachments/assets/da22fb12-8062-4617-a743-598555fd0e36
 
 ## Features
 
-- **Spatial Taskbar**: Real-time window tracking via Niri IPC with drag-and-drop reordering and app icons for within and across monitors.
-- **System Tray**: StatusNotifierItem (SNI) implementation with DBusMenu and GTK popup support.
+- **Spatial Taskbar**: Real-time window order tracking and drag and drop support within and across monitors.
+- **System Tray**: StatusNotifierItem (SNI) supported.
 - **Built-in Modules**: Volume, Brightness, Bluetooth, Network, Battery, Memory, Clock, Spacer, ...
-- **Display Awareness**: Automatic multi-monitor reconciliation and layer-shell integration.
+- **Display Awareness**: Automatic multi-monitor adaptability. Plugging in/out a monitor? It got you covered!
 - **Customizable**: TOML configuration and GTK CSS styling with horizontal and vertical layout support.
 - **Lightweight**: Deliberately built with GTK3 and pure Rust to keep resource usage as low as possible.
 - **Hot Reloading**: Instantly applies configuration and CSS changes on save without restarting.
+- **Maintainer included**: I use `niri-bar` myself, so I will keep maintaining it :P
 
 ## Installation
 
