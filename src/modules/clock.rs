@@ -24,10 +24,8 @@ impl ClockModule {
     pub fn new(config: ClockConfig) -> Self {
         let core = ModuleCore::new();
         let core_worker = core.clone();
-        let cfg = config.clone();
-
-        let fmt_vert = cfg.format_vertical.clone();
-        let fmt_horiz = cfg.format_horizontal.clone();
+        let fmt_vert = config.format_vertical.clone();
+        let fmt_horiz = config.format_horizontal.clone();
         let has_seconds = needs_per_second_tick(&fmt_vert, &fmt_horiz);
 
         thread::spawn(move || {

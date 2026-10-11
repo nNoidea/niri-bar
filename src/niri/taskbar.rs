@@ -512,14 +512,14 @@ impl TaskbarWidget {
                 // Tooltip
                 if config.show_tooltips && widget.tooltip != title {
                     widget.button.set_tooltip_text(Some(&title));
-                    widget.tooltip = title.clone();
+                    widget.tooltip.clone_from(&title);
                 }
 
                 // Icon image
                 if *widget.icon_key.borrow() != icon_key || widget.icon_scale != scale_factor {
                     let img = crate::icon::create_app_image(&icon_key, config.icon_size, scale_factor);
                     widget.button.set_image(Some(&img));
-                    *widget.icon_key.borrow_mut() = icon_key.clone();
+                    (*widget.icon_key.borrow_mut()).clone_from(&icon_key);
                     widget.icon_scale = scale_factor;
                 }
 

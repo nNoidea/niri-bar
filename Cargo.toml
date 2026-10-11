@@ -1,8 +1,8 @@
 [package]
 name = "niri-bar"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 authors = ["nNoidea"]
 description = "A fast, lightweight, standalone Wayland status bar and spatial window taskbar for Niri"
 license = "GPL-3.0-or-later"
@@ -39,16 +39,46 @@ tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }
 opt-level = 3
 lto = true
 codegen-units = 1
-# "unwind" (not "abort") so the panic hook in src/logger.rs can log
-# location + payload to stderr / log file / journald.
 panic = "unwind"
 strip = true
 
 [lints.rust]
-# Zero `unsafe` in this codebase; deny so any future use is explicit.
-unsafe_code = "deny"
+unsafe_code = "forbid"
 missing_debug_implementations = "allow"
 
 [lints.clippy]
-pedantic = "allow"
-nursery = "allow"
+pedantic = { level = "allow", priority = -1 }
+
+# --- 1. Crash & Panic Prevention (Resident Daemon) ---
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+
+# --- 2. Concurrency & Async Traps ---
+await_holding_lock = "warn"
+let_underscore_lock = "deny"
+let_underscore_future = "warn"
+
+# --- 3. Memory & Performance Traps ---
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+assigning_clones = "warn"
+mem_forget = "warn"
+trivially_copy_pass_by_ref = "warn"
+needless_collect = "warn"
+unnecessary_to_owned = "warn"
+box_collection = "warn"
+vec_box = "warn"
+zero_sized_map_values = "warn"
+iter_overeager_cloned = "warn"
+large_types_passed_by_value = "warn"
+inefficient_to_string = "warn"
+fallible_impl_from = "warn"
+
+# --- 4. Logic & Error Hygiene ---
+match_wild_err_arm = "warn"
+lossy_float_literal = "warn"
+exit = "warn"

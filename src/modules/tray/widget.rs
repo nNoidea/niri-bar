@@ -162,7 +162,7 @@ impl TrayWidget {
                 1 => {
                     // Left Click:
                     if item.item_is_menu {
-                        if let (Some(menu_path), Some(tray_menu)) = (item.menu_path.clone(), tray_menu_opt.clone()) {
+                        if let (Some(menu_path), Some(tray_menu)) = (item.menu_path.clone(), tray_menu_opt) {
                             if !tray_menu.submenus.is_empty() {
                                 if let Some(btn) = btn_weak.upgrade() {
                                     svc.send_activate(ActivateRequest::AboutToShow {
@@ -182,7 +182,7 @@ impl TrayWidget {
                     // Otherwise, send primary Activation
                     svc.send_activate(ActivateRequest::Default {
                         bus_name: item.bus_name.clone(),
-                        object_path: item.object_path.clone(),
+                        object_path: item.object_path,
                         x: rx as i32,
                         y: ry as i32,
                     });
@@ -192,7 +192,7 @@ impl TrayWidget {
                     // Middle Click: Secondary Action
                     svc.send_activate(ActivateRequest::Secondary {
                         bus_name: item.bus_name.clone(),
-                        object_path: item.object_path.clone(),
+                        object_path: item.object_path,
                         x: rx as i32,
                         y: ry as i32,
                     });
@@ -220,7 +220,7 @@ impl TrayWidget {
                     if !showed_popup {
                         svc.send_activate(ActivateRequest::ContextMenu {
                             bus_name: item.bus_name.clone(),
-                            object_path: item.object_path.clone(),
+                            object_path: item.object_path,
                             x: rx as i32,
                             y: ry as i32,
                         });

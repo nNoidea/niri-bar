@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::expect_used,
+        clippy::let_underscore_must_use
+    )
+)]
+
 #[macro_use]
 mod logger;
 mod bar;
@@ -639,7 +649,7 @@ fn main() {
         schedule_reconcile();
 
         // File monitor for config.toml and style.css live reloading
-        _file_monitor = setup_file_watcher(ctx.clone(), Rc::clone(&schedule_reconcile));
+        _file_monitor = setup_file_watcher(ctx, Rc::clone(&schedule_reconcile));
 
         // Freshness trigger: GDK hotplug signals and Niri's `OutputsChanged`
         // race each other. A bar built from a pre-hotplug snapshot resolves
