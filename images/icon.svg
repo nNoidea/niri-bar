@@ -6,16 +6,17 @@
       <stop offset="100%" stop-color="#242426" />
     </linearGradient>
 
-    <!-- Blue Bar & Diagonal Ribbon -->
+    <!-- Niri Sunset Gradient: Diagonal Ribbon -->
     <linearGradient id="ribbonGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0a84ff" />
-      <stop offset="100%" stop-color="#0066cc" />
+      <stop offset="0%" stop-color="#e84858" />
+      <stop offset="50%" stop-color="#eb6e4a" />
+      <stop offset="100%" stop-color="#f2903c" />
     </linearGradient>
 
-    <!-- Active Dragged App Tile -->
-    <linearGradient id="tileGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#0a84ff" />
-      <stop offset="100%" stop-color="#0071e3" />
+    <!-- Active Dragged App Tile (Niri Sunset Palette) -->
+    <linearGradient id="tileGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e84c5a" />
+      <stop offset="100%" stop-color="#f08c3e" />
     </linearGradient>
 
     <!-- Widgets -->

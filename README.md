@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/da22fb12-8062-4617-a743-598555fd0e36
 
 ## Features
 
-- **Spatial Taskbar**: Real-time window tracking via Niri IPC with drag-and-drop reordering and app icons.
+- **Spatial Taskbar**: Real-time window tracking via Niri IPC with drag-and-drop reordering and app icons for within and across monitors.
 - **System Tray**: StatusNotifierItem (SNI) implementation with DBusMenu and GTK popup support.
 - **Built-in Modules**: Volume, Brightness, Bluetooth, Network, Battery, Memory, Clock, Spacer, ...
 - **Display Awareness**: Automatic multi-monitor reconciliation and layer-shell integration.
@@ -65,6 +65,7 @@ wpctl / pw-mon (volume module)
 bluetoothctl (bluetooth module)
 brightnessctl (brightness module)
 ```
+
 #### Build (Extra needs)
 
 ```
@@ -73,7 +74,6 @@ gcc / clang
 pkg-config
 make
 ```
-
 
 ## Usage
 
