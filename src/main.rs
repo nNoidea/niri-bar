@@ -39,7 +39,7 @@ enum EarlyAction {
 fn parse_early_args(args: &[String]) -> EarlyAction {
     for a in &args[1..] {
         match a.as_str() {
-            "--version" | "-V" => return EarlyAction::Version,
+            "--version" | "-V" | "-v" => return EarlyAction::Version,
             "--help" | "-h" => return EarlyAction::Help,
             "--check" => return EarlyAction::Check,
             _ => {}
@@ -50,7 +50,7 @@ fn parse_early_args(args: &[String]) -> EarlyAction {
 
 fn print_help() {
     println!(
-        "niri-bar v{}\n\nUSAGE:\n    niri-bar [OPTIONS]\n\nOPTIONS:\n    -h, --help       Print this help\n    -V, --version    Print version\n        --check      Validate config + CSS and exit (0 ok, 1 error)\n\nENV:\n    NIRI_SOCKET      Niri IPC socket (set by Niri)\n    NIRI_BAR_DEBUG=1 Verbose debug logs\n    RUST_LOG=debug   Verbose debug logs\n\nCONFIG:\n    ~/.config/niri-bar/config.toml (see resources/config.default.toml)\n    ~/.config/niri-bar/style.css",
+        "niri-bar v{}\n\nUSAGE:\n    niri-bar [OPTIONS]\n\nOPTIONS:\n    -h, --help       Print this help\n    -v, -V, --version Print version\n        --check      Validate config + CSS and exit (0 ok, 1 error)\n\nENV:\n    NIRI_SOCKET      Niri IPC socket (set by Niri)\n    NIRI_BAR_DEBUG=1 Verbose debug logs\n    RUST_LOG=debug   Verbose debug logs\n\nCONFIG:\n    ~/.config/niri-bar/config.toml (see resources/config.default.toml)\n    ~/.config/niri-bar/style.css",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -813,6 +813,7 @@ mod tests {
             EarlyAction::Version
         );
         assert_eq!(parse_early_args(&args(&["niri-bar", "-V"])), EarlyAction::Version);
+        assert_eq!(parse_early_args(&args(&["niri-bar", "-v"])), EarlyAction::Version);
         assert_eq!(parse_early_args(&args(&["niri-bar", "--help"])), EarlyAction::Help);
         assert_eq!(parse_early_args(&args(&["niri-bar", "--check"])), EarlyAction::Check);
     }

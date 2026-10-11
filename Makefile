@@ -1,8 +1,3 @@
-PREFIX ?= $(HOME)/.cargo
-BINDIR ?= $(PREFIX)/bin
-DATADIR ?= $(PREFIX)/share
-TARGET = target/release/niri-bar
-
 .PHONY: all build install uninstall test check clean boxtest
 
 all: build
@@ -10,15 +5,11 @@ all: build
 build:
 	cargo build --release
 
-install: build
-	install -d "$(DESTDIR)$(BINDIR)"
-	install -m 755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/niri-bar"
-	install -d "$(DESTDIR)$(DATADIR)/niri-bar"
-	install -m 644 resources/config.default.toml "$(DESTDIR)$(DATADIR)/niri-bar/config.default.toml" || true
-	install -m 644 resources/style.default.css "$(DESTDIR)$(DATADIR)/niri-bar/style.default.css" || true
+install:
+	cargo install --path . --locked
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/niri-bar"
+	cargo uninstall niri-bar
 
 test:
 	cargo fmt --all -- --check
