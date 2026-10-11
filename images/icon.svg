@@ -1,11 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <!-- Base Background -->
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#1c1c1e" />
-      <stop offset="100%" stop-color="#121214" />
-    </linearGradient>
-
     <!-- Bar Chassis -->
     <linearGradient id="chassisGrad" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" stop-color="#323236" />
@@ -25,49 +19,42 @@
     </linearGradient>
 
     <!-- Widgets -->
-    <linearGradient id="volGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+    <linearGradient id="volGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#ff9f0a" />
       <stop offset="100%" stop-color="#e08500" />
     </linearGradient>
 
-    <linearGradient id="termGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+    <linearGradient id="termGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#30d158" />
       <stop offset="100%" stop-color="#24a143" />
     </linearGradient>
 
-    <linearGradient id="videoGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+    <linearGradient id="videoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#bf5af2" />
       <stop offset="100%" stop-color="#9a35d1" />
     </linearGradient>
 
-    <linearGradient id="calGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+    <linearGradient id="calGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#ff453a" />
       <stop offset="100%" stop-color="#d7281e" />
     </linearGradient>
 
     <!-- Shadows -->
-    <filter id="barShadow" x="-15%" y="-15%" width="130%" height="130%">
-      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity="0.4" />
+    <filter id="barShadow" x="-25%" y="-20%" width="150%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.40" />
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.25" />
     </filter>
 
-    <filter id="topBarShadow" x="-25%" y="-25%" width="150%" height="150%">
-      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#000000" flood-opacity="0.6" />
-      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000000" flood-opacity="0.3" />
-    </filter>
-
-    <filter id="squircleShadow" x="-10%" y="-10%" width="120%" height="125%">
-      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#000000" flood-opacity="0.5" />
+    <filter id="topBarShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#000000" flood-opacity="0.55" />
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000000" flood-opacity="0.30" />
     </filter>
   </defs>
 
-  <!-- 1. BASE SQUIRCLE (rounded 100px) -->
-  <rect x="40" y="40" width="432" height="432" rx="100" ry="100" fill="url(#bgGrad)" filter="url(#squircleShadow)" />
-  <rect x="41" y="41" width="430" height="430" rx="99" ry="99" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2.5" />
-
-  <!-- 2. LEFT VERTICAL BAR (width=100, rx=50) -->
+  <!-- 1. LEFT VERTICAL BAR (width=100, rx=50) -->
   <g transform="translate(106, 80)" filter="url(#barShadow)">
     <rect x="0" y="0" width="100" height="352" rx="50" ry="50" fill="url(#chassisGrad)" />
-    <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2" />
+    <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.14)" stroke-width="2" />
 
     <!-- Slot 1: Pure Empty Space -->
 
@@ -95,10 +82,10 @@
     </g>
   </g>
 
-  <!-- 3. RIGHT VERTICAL BAR (width=100, rx=50) -->
+  <!-- 2. RIGHT VERTICAL BAR (width=100, rx=50) -->
   <g transform="translate(306, 80)" filter="url(#barShadow)">
     <rect x="0" y="0" width="100" height="352" rx="50" ry="50" fill="url(#chassisGrad)" />
-    <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2" />
+    <rect x="1" y="1" width="98" height="350" rx="49" ry="49" fill="none" stroke="rgba(255,255,255,0.14)" stroke-width="2" />
 
     <!-- Slot 1: Video App (64x64, rx=18) -->
     <g transform="translate(18, 43)">
@@ -116,7 +103,7 @@
     <!-- Slot 3: Pure Empty Space -->
   </g>
 
-  <!-- 4. BLUE BAR & DRAGGED TILE ON TOP LAYER -->
+  <!-- 3. BLUE BAR & DRAGGED TILE ON TOP LAYER -->
   <g filter="url(#topBarShadow)">
     <path d="M 156 155 L 356 357" stroke="url(#ribbonGrad)" stroke-width="72" stroke-linecap="round" />
 
