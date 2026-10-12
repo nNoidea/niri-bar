@@ -1,8 +1,9 @@
 name: other
 
+# All pull requests: always run test -> build (never release).
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 permissions:
   contents: read
