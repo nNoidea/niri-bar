@@ -10,6 +10,7 @@ use crate::modules::{spawn_command, BarModule, ModuleCore, ModuleState, MouseBut
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothState {
+    Absent,
     Off,
     Loading,
     On,
@@ -80,7 +81,7 @@ impl BluetoothModule {
                     fail_streak = fail_streak.saturating_add(1);
                     if !degraded_warned {
                         degraded_warned = true;
-                        log_warn!("bluetooth", "No usable adapter (BlueZ down or absent); backing off");
+                        log_info!("bluetooth", "No Bluetooth adapter found; hiding module");
                     }
                 }
 
@@ -356,7 +357,13 @@ impl BluetoothModule {
 
         match Self::read_bluetooth_state_dbus() {
             Some(state) => (state, true),
-            None => (BluetoothState::Off, rfkill_ok),
+            None => {
+                if rfkill_ok {
+                    (BluetoothState::Off, true)
+                } else {
+                    (BluetoothState::Absent, false)
+                }
+            }
         }
     }
 
@@ -365,7 +372,7 @@ impl BluetoothModule {
         // timeout); never run it on the GTK main thread. Decide off-thread.
         std::thread::spawn(|| {
             let (state, healthy) = Self::read_bluetooth_state_full();
-            if !healthy {
+            if !healthy || state == BluetoothState::Absent {
                 log_warn!("bluetooth", "Toggle ignored: no bluetooth adapter found");
                 return;
             }
@@ -376,6 +383,7 @@ impl BluetoothModule {
                 BluetoothState::Off | BluetoothState::Loading => {
                     spawn_command("rfkill unblock bluetooth && bluetoothctl power on");
                 }
+                BluetoothState::Absent => {}
             }
         });
     }
@@ -388,6 +396,14 @@ impl BluetoothModule {
         let mut css_classes = Vec::new();
 
         let (mode_key, tooltip, placeholders) = match state {
+            BluetoothState::Absent => {
+                return ModuleState {
+                    icon: None,
+                    text: None,
+                    tooltip: Some("No Bluetooth adapter".to_string()),
+                    css_classes: vec!["disabled".to_string(), "no-adapter".to_string()],
+                };
+            }
             BluetoothState::Off => {
                 css_classes.push("disabled".to_string());
                 css_classes.push("off".to_string());
@@ -611,5 +627,17 @@ mod tests {
         let got = m.current_state(Orientation::Vertical);
         assert_eq!(got.text, expected.text);
         assert_eq!(got.tooltip, expected.tooltip);
+    }
+
+    #[test]
+    fn test_bluetooth_absent_state_formatting_hides() {
+        let config = BluetoothConfig::default();
+
+        // Absent state always formats with None text and icon, hiding the widget completely
+        let state_hidden =
+            BluetoothModule::format_state_with_config(&config, &BluetoothState::Absent, Orientation::Vertical);
+        assert_eq!(state_hidden.text, None);
+        assert_eq!(state_hidden.icon, None);
+        assert!(state_hidden.css_classes.contains(&"no-adapter".to_string()));
     }
 }
