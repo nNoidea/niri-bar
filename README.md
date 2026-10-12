@@ -34,15 +34,14 @@ https://github.com/user-attachments/assets/da22fb12-8062-4617-a743-598555fd0e36
 
 ## Installation
 
-### Fedora (COPR / RPM)
+### Fedora
 
-Enable the COPR repository:
 ```bash
 sudo dnf copr enable nnoidea/niri-bar
 sudo dnf install niri-bar
 ```
 
-### Debian / Ubuntu (.deb)
+### Debian
 
 Download the `.deb` package from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and install:
 ```bash
@@ -53,7 +52,7 @@ sudo dpkg -i niri-bar_*_amd64.deb
 
 Download the compiled binary from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and place it in your `PATH` (e.g. `~/.local/bin/` or `/usr/local/bin/`).
 
-### Build from Source
+## Build from Source
 
 ```bash
 git clone https://github.com/nNoidea/niri-bar.git

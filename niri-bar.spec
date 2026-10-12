@@ -1,10 +1,7 @@
-Name:           niri-bar-dev
+Name:           niri-bar
 Version:        {{{ git_dir_version }}}
 Release:        1%{?dist}
-Summary:        Fast, lightweight Wayland status bar and spatial window taskbar for Niri (Development Build)
-
-Provides:       niri-bar = %{version}-%{release}
-Conflicts:      niri-bar
+Summary:        Fast, lightweight Wayland status bar and spatial window taskbar for Niri
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/nNoidea/niri-bar
