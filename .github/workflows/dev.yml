@@ -178,7 +178,7 @@ jobs:
         run: |
           if [ -n "$COPR_WEBHOOK" ]; then
             echo "Triggering Fedora COPR dev build..."
-            curl -s -X POST "$COPR_WEBHOOK" || echo "COPR webhook returned non-zero, continuing."
+            curl -i -X POST "$COPR_WEBHOOK" || echo "COPR webhook returned non-zero, continuing."
           else
             echo "No COPR_DEV_WEBHOOK_URL secret set. Skipping COPR trigger."
           fi
