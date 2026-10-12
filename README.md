@@ -41,7 +41,6 @@ Enable the COPR repository:
 sudo dnf copr enable nnoidea/niri-bar
 sudo dnf install niri-bar
 ```
-Or download the `.rpm` directly from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and install via `sudo dnf install ./niri-bar-*.rpm`.
 
 ### Debian / Ubuntu (.deb)
 
@@ -52,7 +51,7 @@ sudo dpkg -i niri-bar_*_amd64.deb
 
 ### Standalone Binary
 
-Download the compiled binary from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and place it in your `PATH` (e.g. `~/.local/bin` or `/usr/local/bin`).
+Download the compiled binary from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and place it in your `PATH` (e.g. `~/.local/bin/` or `/usr/local/bin/`).
 
 ### Build from Source
 

@@ -192,6 +192,7 @@ jobs:
           chmod +x dist/niri-bar || true
           echo "Creating GitHub Pre-Release $TAG..."
           gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
             dist/niri-bar \
             "dist/niri-bar-dev-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             dist/*.deb \
