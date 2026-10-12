@@ -120,7 +120,7 @@ jobs:
             exit 1
           fi
 
-          TAG="v${VERSION}~dev"
+          TAG="v${VERSION}dev"
           echo "Cargo.toml version: $VERSION ($TAG)"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
