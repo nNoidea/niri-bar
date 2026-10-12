@@ -1,6 +1,6 @@
 [package]
 name = "niri-bar"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["nNoidea"]
@@ -41,6 +41,42 @@ lto = true
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+[package.metadata.deb]
+name = "niri-bar"
+maintainer = "nNoidea <https://github.com/nNoidea/niri-bar>"
+copyright = "2026 nNoidea"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+A fast, lightweight Wayland status bar and spatial window taskbar built \
+specifically for the Niri scrollable-tiling compositor."""
+depends = "$auto, libgtk-3-0, libgtk-layer-shell0"
+recommends = "wireplumber | pipewire-utils, bluez"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/niri-bar", "usr/bin/niri-bar", "755"],
+    ["resources/config.default.toml", "usr/share/niri-bar/config.default.toml", "644"],
+    ["resources/style.default.css", "usr/share/niri-bar/style.default.css", "644"],
+    ["resources/NerdFont-Regular.ttf", "usr/share/fonts/truetype/niri-bar/NerdFont-Regular.ttf", "644"],
+    ["images/icon2.svg", "usr/share/icons/hicolor/scalable/apps/niri-bar.svg", "644"],
+    ["README.md", "usr/share/doc/niri-bar/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/niri-bar", dest = "/usr/bin/niri-bar", mode = "755" },
+    { source = "resources/config.default.toml", dest = "/usr/share/niri-bar/config.default.toml", mode = "644" },
+    { source = "resources/style.default.css", dest = "/usr/share/niri-bar/style.default.css", mode = "644" },
+    { source = "resources/NerdFont-Regular.ttf", dest = "/usr/share/fonts/niri-bar/NerdFont-Regular.ttf", mode = "644" },
+    { source = "images/icon2.svg", dest = "/usr/share/icons/hicolor/scalable/apps/niri-bar.svg", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/niri-bar/README.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/niri-bar/LICENSE", mode = "644" },
+]
+auto-req = "yes"
+requires = { "gtk3" = "*", "gtk-layer-shell" = "*" }
+recommends = { "pipewire-utils" = "*", "bluez" = "*" }
+
 
 [lints.rust]
 unsafe_code = "forbid"
