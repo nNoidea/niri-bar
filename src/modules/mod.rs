@@ -533,6 +533,16 @@ impl ModuleWidget {
             label.show();
         }
 
+        if module_name != "spacer" {
+            if combined.is_empty() {
+                button.set_no_show_all(true);
+                button.hide();
+            } else {
+                button.set_no_show_all(false);
+                button.show();
+            }
+        }
+
         if let Some(ref tip) = state.tooltip {
             button.set_tooltip_text(Some(tip));
         } else {
@@ -598,6 +608,52 @@ mod tests {
 
         let empty_strs = ModuleWidget::format_combined_label(Some(""), Some(""), Orientation::Horizontal);
         assert_eq!(empty_strs, "");
+    }
+
+    #[test]
+    fn test_module_widget_apply_state_empty_hides_button() {
+        if gtk::is_initialized() {
+            if !gtk::is_initialized_main_thread() {
+                eprintln!("Skipping GTK test: running on non-main GTK thread");
+                return;
+            }
+        } else if gtk::init().is_err() {
+            eprintln!("Skipping GTK test: display not available");
+            return;
+        }
+
+        let button = Button::new();
+        let label = Label::new(None);
+        button.add(&label);
+
+        let empty_state = ModuleState {
+            icon: None,
+            text: None,
+            tooltip: None,
+            css_classes: Vec::new(),
+        };
+
+        // Non-spacer module with empty state should hide button and set no_show_all
+        ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
+        assert!(
+            button.is_no_show_all(),
+            "Empty module button must have no_show_all true"
+        );
+        assert!(!button.is_visible(), "Empty module button must be hidden");
+
+        // When populated with state, button should become visible and clear no_show_all
+        let populated_state = ModuleState {
+            icon: Some("󰃠".to_string()),
+            text: Some("50%".to_string()),
+            tooltip: None,
+            css_classes: Vec::new(),
+        };
+        ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
+        assert!(
+            !button.is_no_show_all(),
+            "Populated module button must not have no_show_all"
+        );
+        assert!(button.is_visible(), "Populated module button must be visible");
     }
 
     #[test]

@@ -138,6 +138,11 @@ impl BatteryModule {
         }
     }
 
+    pub fn is_valid_upower_battery(is_present: bool, device_type: u32) -> bool {
+        // UPower device types: 2 = Battery, 3 = UPS
+        is_present && (device_type == 2 || device_type == 3)
+    }
+
     fn read_battery_upower() -> Option<(u8, String)> {
         let conn = match gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
             Ok(c) => c,
@@ -146,6 +151,54 @@ impl BatteryModule {
                 return None;
             }
         };
+
+        // Check IsPresent: desktops and VMs without physical batteries have IsPresent = false
+        let is_present_res = match conn.call_sync(
+            Some("org.freedesktop.UPower"),
+            "/org/freedesktop/UPower/devices/DisplayDevice",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&("org.freedesktop.UPower.Device", "IsPresent").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            500,
+            gio::Cancellable::NONE,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log_debug!("battery", "UPower IsPresent Get failed: {e}");
+                return None;
+            }
+        };
+        let is_present_child = is_present_res.child_value(0);
+        let is_present_inner = is_present_child.as_variant()?;
+        let is_present = is_present_inner.get::<bool>()?;
+
+        // Check Type: 2 = Battery, 3 = UPS (1 = Line Power, 0 = Unknown)
+        let type_res = match conn.call_sync(
+            Some("org.freedesktop.UPower"),
+            "/org/freedesktop/UPower/devices/DisplayDevice",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&("org.freedesktop.UPower.Device", "Type").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            500,
+            gio::Cancellable::NONE,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log_debug!("battery", "UPower Type Get failed: {e}");
+                return None;
+            }
+        };
+        let type_child = type_res.child_value(0);
+        let type_inner = type_child.as_variant()?;
+        let dev_type = type_inner.get::<u32>()?;
+
+        if !Self::is_valid_upower_battery(is_present, dev_type) {
+            return None;
+        }
 
         let pct_res = match conn.call_sync(
             Some("org.freedesktop.UPower"),
@@ -421,5 +474,21 @@ mod tests {
         let got = m.current_state(Orientation::Vertical);
         assert_eq!(got.text, expected.text);
         assert_eq!(got.tooltip, expected.tooltip);
+    }
+
+    #[test]
+    fn test_validate_upower_battery_device() {
+        // Only present devices of type 2 (Battery) or 3 (UPS) are valid batteries
+        assert!(BatteryModule::is_valid_upower_battery(true, 2));
+        assert!(BatteryModule::is_valid_upower_battery(true, 3));
+
+        // Not present (e.g. desktop DisplayDevice or disconnected battery)
+        assert!(!BatteryModule::is_valid_upower_battery(false, 2));
+        assert!(!BatteryModule::is_valid_upower_battery(false, 3));
+
+        // Line Power / AC (type 1) or Unknown (type 0)
+        assert!(!BatteryModule::is_valid_upower_battery(true, 1));
+        assert!(!BatteryModule::is_valid_upower_battery(true, 0));
+        assert!(!BatteryModule::is_valid_upower_battery(false, 0));
     }
 }
