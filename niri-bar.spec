@@ -1,5 +1,5 @@
 Name:           niri-bar
-Version:        %(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml 2>/dev/null || echo "0.2.1")
+Version:        {{{ git_dir_version }}}
 Release:        1%{?dist}
 Summary:        Fast, lightweight Wayland status bar and spatial window taskbar for Niri
 
