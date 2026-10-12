@@ -74,6 +74,8 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/licenses/niri-bar/LICENSE", mode = "644" },
 ]
 auto-req = "yes"
+requires = { "gtk3" = "*", "gtk-layer-shell" = "*" }
+recommends = { "pipewire-utils" = "*", "brightnessctl" = "*", "bluez" = "*" }
 
 
 [lints.rust]
