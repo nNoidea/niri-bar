@@ -41,7 +41,6 @@ install -D -p -m 0644 resources/config.default.toml %{buildroot}%{_datadir}/niri
 install -D -p -m 0644 resources/style.default.css %{buildroot}%{_datadir}/niri-bar/style.default.css
 install -D -p -m 0644 resources/NerdFont-Regular.ttf %{buildroot}%{_datadir}/fonts/niri-bar/NerdFont-Regular.ttf
 install -D -p -m 0644 images/icon2.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/niri-bar.svg
-install -D -p -m 0644 README.md %{buildroot}%{_docdir}/niri-bar/README.md
 
 %files
 %license LICENSE
