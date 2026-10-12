@@ -1,12 +1,11 @@
 name: dev
 
+# Push-only: runs test -> build -> pre-release only when the Cargo.toml version
+# has no dev release yet. Pull requests are handled by other.yml.
 on:
   push:
     branches-ignore:
       - main
-  pull_request:
-    branches:
-      - dev
 
 permissions:
   contents: read
@@ -16,8 +15,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check whether Cargo.toml version is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not extract version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          TAG="v${VERSION}dev"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Skipping test/build/release."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG does not exist yet. Running test/build/release."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
     name: test
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
