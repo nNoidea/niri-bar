@@ -1,7 +1,10 @@
-Name:           niri-bar
-Version:        {{{ git_dir_version }}}
+Name:           niri-bar-dev
+Version:        %(git show HEAD:Cargo.toml 2>/dev/null | grep '^version = ' | head -n 1 | cut -d '"' -f 2 || echo "0.2.5")
 Release:        1%{?dist}
-Summary:        Fast, lightweight Wayland status bar and spatial window taskbar for Niri
+Summary:        Fast, lightweight Wayland status bar and spatial window taskbar for Niri (Development Build)
+
+Provides:       niri-bar = %{version}-%{release}
+Conflicts:      niri-bar
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/nNoidea/niri-bar
