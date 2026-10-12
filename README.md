@@ -53,7 +53,7 @@ sudo dpkg -i niri-bar_*_amd64.deb
 
 Download the compiled binary from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and place it in your `PATH` (e.g. `~/.local/bin/` or `/usr/local/bin/`).
 
-### Build from Source
+## Build from Source
 
 ```bash
 git clone https://github.com/nNoidea/niri-bar.git
