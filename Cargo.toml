@@ -1,6 +1,6 @@
 [package]
 name = "niri-bar"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 rust-version = "1.85"
 authors = ["nNoidea"]
@@ -51,7 +51,7 @@ extended-description = """\
 A fast, lightweight Wayland status bar and spatial window taskbar built \
 specifically for the Niri scrollable-tiling compositor."""
 depends = "$auto, libgtk-3-0, libgtk-layer-shell0"
-recommends = "wireplumber | pipewire-utils, brightnessctl, bluez"
+recommends = "wireplumber | pipewire-utils, bluez"
 section = "utils"
 priority = "optional"
 assets = [
@@ -75,7 +75,7 @@ assets = [
 ]
 auto-req = "yes"
 requires = { "gtk3" = "*", "gtk-layer-shell" = "*" }
-recommends = { "pipewire-utils" = "*", "brightnessctl" = "*", "bluez" = "*" }
+recommends = { "pipewire-utils" = "*", "bluez" = "*" }
 
 
 [lints.rust]

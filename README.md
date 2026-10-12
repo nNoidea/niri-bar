@@ -73,7 +73,6 @@ gtk3
 gtk-layer-shell
 wpctl / pw-mon (volume module)
 bluetoothctl (bluetooth module)
-brightnessctl (brightness module)
 ```
 
 #### Build (Extra needs)

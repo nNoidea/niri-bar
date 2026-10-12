@@ -21,7 +21,6 @@ Requires:       gtk3
 Requires:       gtk-layer-shell
 
 # Optional modules (gracefully hidden when hardware is not present)
-Recommends:     brightnessctl
 Recommends:     pipewire-utils
 Recommends:     bluez
 
