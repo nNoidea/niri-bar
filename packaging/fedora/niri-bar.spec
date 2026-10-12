@@ -5,7 +5,7 @@ Summary:        Fast, lightweight Wayland status bar and spatial window taskbar 
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/nNoidea/niri-bar
-Source0:        %{name}-%{version}.tar.gz
+Source0:        {{{ git_dir_pack }}}
 
 BuildRequires:  cargo
 BuildRequires:  rust >= 1.85
@@ -27,7 +27,7 @@ A fast, lightweight Wayland status bar and spatial window taskbar built
 specifically for the Niri scrollable-tiling compositor.
 
 %prep
-%autosetup -p1
+{{{ git_dir_setup_macro }}}
 
 %build
 cargo build --release --locked
