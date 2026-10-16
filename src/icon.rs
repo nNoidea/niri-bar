@@ -344,34 +344,28 @@ pub fn sanitize_icon_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Load a pixbuf directly at a target size from desktop entries, theme, or path.
-pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
+/// Load an unnormalized pixbuf at a target size from desktop entries, theme, or path.
+fn load_raw_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
     let size = if target_size <= 0 { 32 } else { target_size }.min(512);
 
     // 1. Direct absolute path (only from trusted taskbar app_ids; tray
     // callers must sanitize first — absolute tray paths are rejected).
     if Path::new(icon_key).is_absolute() {
-        if let Ok(pb) = Pixbuf::from_file_at_scale(icon_key, size, size, true) {
-            return Some(normalize_pixbuf_to_size(pb, size));
-        }
-        return None;
+        return Pixbuf::from_file_at_scale(icon_key, size, size, true).ok();
     }
     let safe_key = sanitize_icon_name(icon_key)?;
+    let flags = gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK;
 
     // 2. Resolve via desktop entries
     if let Some(resolved) = find_app_icon(&safe_key) {
         if Path::new(&resolved).is_absolute() {
             if let Ok(pb) = Pixbuf::from_file_at_scale(&resolved, size, size, true) {
-                return Some(normalize_pixbuf_to_size(pb, size));
+                return Some(pb);
             }
         } else if let Some(safe_resolved) = sanitize_icon_name(&resolved) {
             if let Some(theme) = gtk::IconTheme::default() {
-                if let Ok(Some(pb)) = theme.load_icon(
-                    &safe_resolved,
-                    size,
-                    gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK,
-                ) {
-                    return Some(normalize_pixbuf_to_size(pb, size));
+                if let Ok(Some(pb)) = theme.load_icon(&safe_resolved, size, flags) {
+                    return Some(pb);
                 }
             }
         }
@@ -379,33 +373,32 @@ pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
 
     // 3. Look up in GTK icon theme directly
     if let Some(theme) = gtk::IconTheme::default() {
-        if let Ok(Some(pb)) = theme.load_icon(
-            &safe_key,
-            size,
-            gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK,
-        ) {
-            return Some(normalize_pixbuf_to_size(pb, size));
-        }
         let lower = safe_key.to_lowercase();
-        if sanitize_icon_name(&lower).is_some() {
-            if let Ok(Some(pb)) = theme.load_icon(
-                &lower,
-                size,
-                gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK,
-            ) {
-                return Some(normalize_pixbuf_to_size(pb, size));
+        for candidate in [safe_key.as_str(), lower.as_str(), "application-x-executable"] {
+            if sanitize_icon_name(candidate).is_some() {
+                if let Ok(Some(pb)) = theme.load_icon(candidate, size, flags) {
+                    return Some(pb);
+                }
             }
-        }
-        if let Ok(Some(pb)) = theme.load_icon(
-            "application-x-executable",
-            size,
-            gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK,
-        ) {
-            return Some(normalize_pixbuf_to_size(pb, size));
         }
     }
 
     None
+}
+
+/// Load a normalized square pixbuf directly at a target size from desktop entries, theme, or path.
+pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
+    let size = if target_size <= 0 { 32 } else { target_size }.min(512);
+    load_raw_pixbuf_at_size(icon_key, size).map(|pb| normalize_pixbuf_to_size(pb, size))
+}
+
+fn apply_pixbuf_to_image(img: &Image, pixbuf: &Pixbuf, logical_size: i32, scale: i32) {
+    if let Some(surface) = pixbuf.create_surface(scale, Option::<&gdk::Window>::None) {
+        img.set_from_surface(Some(&surface));
+    } else {
+        img.set_from_pixbuf(Some(pixbuf));
+    }
+    img.set_pixel_size(logical_size);
 }
 
 /// Create a new `gtk::Image` representing an application, properly scaled for HiDPI.
@@ -422,69 +415,48 @@ pub fn create_app_image(app_id: &str, logical_size: i32, scale_factor: i32) -> I
 pub fn update_app_image(img: &Image, app_id: &str, logical_size: i32, scale_factor: i32) {
     let size = if logical_size <= 0 { 32 } else { logical_size };
     let scale = scale_factor.max(1);
+    let load_size = size * scale;
 
-    fn set_pixbuf(img: &Image, path: &str, size: i32, scale: i32) -> bool {
-        let load_size = size * scale;
+    let set_pixbuf_from_file = |path: &str| -> bool {
         if let Ok(pixbuf) = Pixbuf::from_file_at_scale(path, load_size, load_size, true) {
             let square = normalize_pixbuf_to_size(pixbuf, load_size);
-            if let Some(surface) = square.create_surface(scale, Option::<&gdk::Window>::None) {
-                img.set_from_surface(Some(&surface));
-            } else {
-                img.set_from_pixbuf(Some(&square));
-            }
-            img.set_pixel_size(size);
+            apply_pixbuf_to_image(img, &square, size, scale);
             return true;
         }
         false
-    }
+    };
 
     // 1. Direct absolute file path
-    if Path::new(app_id).is_absolute() && Path::new(app_id).exists() && set_pixbuf(img, app_id, size, scale) {
+    if Path::new(app_id).is_absolute() && Path::new(app_id).exists() && set_pixbuf_from_file(app_id) {
         return;
     }
 
     // 2. Resolve via desktop entry cache
     let resolved_opt = find_app_icon(app_id);
     if let Some(ref resolved) = resolved_opt {
-        if Path::new(resolved).is_absolute() && Path::new(resolved).exists() && set_pixbuf(img, resolved, size, scale) {
+        if Path::new(resolved).is_absolute() && Path::new(resolved).exists() && set_pixbuf_from_file(resolved) {
             return;
         }
     }
 
     // 3. Named theme icon (GTK dynamically renders vectors at monitor scale)
     if let Some(theme) = gtk::IconTheme::default() {
-        if let Some(ref resolved) = resolved_opt {
-            if theme.has_icon(resolved) {
-                img.set_from_icon_name(Some(resolved), gtk::IconSize::Button);
+        let lower = app_id.to_lowercase();
+        for candidate in [resolved_opt.as_deref(), Some(app_id), Some(lower.as_str())]
+            .into_iter()
+            .flatten()
+        {
+            if theme.has_icon(candidate) {
+                img.set_from_icon_name(Some(candidate), gtk::IconSize::Button);
                 img.set_pixel_size(size);
                 return;
             }
         }
-
-        if theme.has_icon(app_id) {
-            img.set_from_icon_name(Some(app_id), gtk::IconSize::Button);
-            img.set_pixel_size(size);
-            return;
-        }
-
-        let lower = app_id.to_lowercase();
-        if theme.has_icon(&lower) {
-            img.set_from_icon_name(Some(&lower), gtk::IconSize::Button);
-            img.set_pixel_size(size);
-            return;
-        }
     }
 
-    // 4. Fallback to pixbuf loader
-    let load_size = size * scale;
-    if let Some(pixbuf) = load_pixbuf_at_size(app_id, load_size) {
-        let square = normalize_pixbuf_to_size(pixbuf, load_size);
-        if let Some(surface) = square.create_surface(scale, Option::<&gdk::Window>::None) {
-            img.set_from_surface(Some(&surface));
-        } else {
-            img.set_from_pixbuf(Some(&square));
-        }
-        img.set_pixel_size(size);
+    // 4. Fallback to pixbuf loader (already normalized to `load_size`)
+    if let Some(square) = load_pixbuf_at_size(app_id, load_size) {
+        apply_pixbuf_to_image(img, &square, size, scale);
         return;
     }
 
@@ -510,62 +482,56 @@ pub fn resolve_tray_pixbuf_scaled(
         }
 
         // 2. Named icon lookup
-        if let Some(name) = icon_name {
-            if !name.trim().is_empty() {
-                // 2a. Check icon_theme_path directory directly
-                if let Some(theme_path) = icon_theme_path {
-                    if !theme_path.trim().is_empty() {
-                        let dir = Path::new(theme_path);
-                        for ext in &["", ".png", ".svg", ".ico", ".xpm", ".tga"] {
-                            let filename = format!("{}{}", name, ext);
-                            let candidates = [
-                                dir.join(&filename),
-                                dir.join("hicolor").join("scalable").join("apps").join(&filename),
-                                dir.join("hicolor").join("48x48").join("apps").join(&filename),
-                                dir.join("hicolor").join("32x32").join("apps").join(&filename),
-                                dir.join("hicolor").join("24x24").join("apps").join(&filename),
-                                dir.join("hicolor").join("22x22").join("apps").join(&filename),
-                                dir.join("hicolor").join("16x16").join("apps").join(&filename),
-                            ];
-                            for candidate in &candidates {
-                                if candidate.exists() {
-                                    if let Ok(pb) =
-                                        Pixbuf::from_file_at_scale(candidate, target_size, target_size, true)
-                                    {
-                                        return Some(pb);
-                                    } else if let Ok(pb) = Pixbuf::from_file(candidate) {
-                                        return Some(pb);
-                                    }
+        if let Some(name) = icon_name.map(str::trim).filter(|n| !n.is_empty()) {
+            // 2a. Check icon_theme_path directory directly (must be a safe basename)
+            if let Some(safe_name) = sanitize_icon_name(name) {
+                if let Some(theme_path) = icon_theme_path.map(str::trim).filter(|p| !p.is_empty()) {
+                    let dir = Path::new(theme_path);
+                    for ext in &["", ".png", ".svg", ".ico", ".xpm", ".tga"] {
+                        let filename = format!("{safe_name}{ext}");
+                        let candidates = [
+                            dir.join(&filename),
+                            dir.join("hicolor").join("scalable").join("apps").join(&filename),
+                            dir.join("hicolor").join("48x48").join("apps").join(&filename),
+                            dir.join("hicolor").join("32x32").join("apps").join(&filename),
+                            dir.join("hicolor").join("24x24").join("apps").join(&filename),
+                            dir.join("hicolor").join("22x22").join("apps").join(&filename),
+                            dir.join("hicolor").join("16x16").join("apps").join(&filename),
+                        ];
+                        for candidate in &candidates {
+                            if candidate.exists() {
+                                if let Ok(pb) = Pixbuf::from_file_at_scale(candidate, target_size, target_size, true) {
+                                    return Some(pb);
+                                } else if let Ok(pb) = Pixbuf::from_file(candidate) {
+                                    return Some(pb);
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                // 2b. Check if icon_name itself is an absolute path
-                let path = Path::new(name);
-                if path.is_absolute() && path.exists() {
-                    if let Ok(pb) = Pixbuf::from_file_at_scale(path, target_size, target_size, true) {
-                        return Some(pb);
-                    } else if let Ok(pb) = Pixbuf::from_file(path) {
-                        return Some(pb);
-                    }
+            // 2b. Check if icon_name itself is an absolute path (without traversal)
+            let path = Path::new(name);
+            if path.is_absolute() && !name.contains("..") && !name.contains('\0') && path.exists() {
+                if let Ok(pb) = Pixbuf::from_file_at_scale(path, target_size, target_size, true) {
+                    return Some(pb);
+                } else if let Ok(pb) = Pixbuf::from_file(path) {
+                    return Some(pb);
                 }
+            }
 
-                // 2c. Standard GTK icon theme & search paths
-                if let Some(pb) = load_pixbuf_at_size(name, target_size) {
+            // 2c. Standard GTK icon theme & search paths
+            if let Some(safe_name) = sanitize_icon_name(name) {
+                if let Some(pb) = load_raw_pixbuf_at_size(&safe_name, target_size) {
                     return Some(pb);
                 }
             }
         }
 
         // 3. Fallback: Check item.id as icon name
-        if !id.trim().is_empty() {
-            if let Some(pb) = load_pixbuf_at_size(id, target_size) {
-                return Some(pb);
-            }
-            let lower_id = id.to_lowercase();
-            if let Some(pb) = load_pixbuf_at_size(&lower_id, target_size) {
+        if let Some(safe_id) = sanitize_icon_name(id.trim()) {
+            if let Some(pb) = load_raw_pixbuf_at_size(&safe_id, target_size) {
                 return Some(pb);
             }
         }
@@ -610,12 +576,7 @@ pub fn update_tray_image(
 
     let target_size = size * scale;
     if let Some(pb) = resolve_tray_pixbuf_scaled(icon_name, icon_pixmap, icon_theme_path, id, target_size) {
-        if let Some(surface) = pb.create_surface(scale, Option::<&gdk::Window>::None) {
-            image.set_from_surface(Some(&surface));
-        } else {
-            image.set_from_pixbuf(Some(&pb));
-        }
-        image.set_pixel_size(size);
+        apply_pixbuf_to_image(image, &pb, size, scale);
     } else {
         image.set_from_icon_name(Some("application-x-executable"), gtk::IconSize::Button);
         image.set_pixel_size(size);
@@ -634,6 +595,28 @@ mod tests {
         assert_eq!(sanitize_icon_name("../x"), None);
         assert_eq!(sanitize_icon_name("a/b"), None);
         assert_eq!(sanitize_icon_name(&"x".repeat(200)), None);
+    }
+
+    #[test]
+    fn test_resolve_tray_pixbuf_rejects_path_traversal_in_theme_path() {
+        let parent_dir = std::env::temp_dir().join("niri_bar_traversal_test");
+        let sub_dir = parent_dir.join("theme_subdir");
+        let _ = std::fs::create_dir_all(&sub_dir);
+        let outside_icon = parent_dir.join("outside_secret.png");
+
+        let pb = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 22, 22).unwrap();
+        pb.fill(0xff0000ff);
+        pb.savev(&outside_icon, "png", &[]).unwrap();
+
+        let res = resolve_tray_pixbuf_scaled(Some("../outside_secret"), None, Some(sub_dir.to_str().unwrap()), "", 22);
+
+        let _ = std::fs::remove_file(&outside_icon);
+        let _ = std::fs::remove_dir_all(&parent_dir);
+
+        assert!(
+            res.is_none(),
+            "resolve_tray_pixbuf_scaled must reject '../' path traversal in icon_name"
+        );
     }
 
     #[test]
@@ -679,19 +662,11 @@ mod tests {
 
     #[test]
     fn test_create_app_image_theme_icon() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-
-        let img = create_app_image("application-x-executable", 32, 2);
-        assert_eq!(img.storage_type(), gtk::ImageType::IconName);
-        assert_eq!(img.pixel_size(), 32);
+        crate::util::run_gtk_test(|| {
+            let img = create_app_image("application-x-executable", 32, 2);
+            assert_eq!(img.storage_type(), gtk::ImageType::IconName);
+            assert_eq!(img.pixel_size(), 32);
+        });
     }
 
     #[test]
@@ -718,45 +693,37 @@ mod tests {
 
     #[test]
     fn test_update_tray_image_with_icon_theme_path() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let temp_dir = std::env::temp_dir().join("niri_bar_tray_test");
+            let _ = std::fs::create_dir_all(&temp_dir);
+            let test_icon_path = temp_dir.join("toolbox-tray-color.png");
 
-        let temp_dir = std::env::temp_dir().join("niri_bar_tray_test");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let test_icon_path = temp_dir.join("toolbox-tray-color.png");
+            let pb = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 22, 22).unwrap();
+            pb.fill(0xff0000ff);
+            pb.savev(&test_icon_path, "png", &[]).unwrap();
 
-        let pb = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 22, 22).unwrap();
-        pb.fill(0xff0000ff);
-        pb.savev(&test_icon_path, "png", &[]).unwrap();
+            let img = Image::new();
+            update_tray_image(
+                &img,
+                Some("toolbox-tray-color"),
+                None,
+                Some(temp_dir.to_str().unwrap()),
+                "toolbox",
+                22,
+                1,
+            );
 
-        let img = Image::new();
-        update_tray_image(
-            &img,
-            Some("toolbox-tray-color"),
-            None,
-            Some(temp_dir.to_str().unwrap()),
-            "toolbox",
-            22,
-            1,
-        );
+            let _ = std::fs::remove_file(&test_icon_path);
+            let _ = std::fs::remove_dir(&temp_dir);
 
-        let _ = std::fs::remove_file(&test_icon_path);
-        let _ = std::fs::remove_dir(&temp_dir);
-
-        // Before fix: image storage type was IconName (holding "toolbox-tray-color" which GTK fails to render)
-        // With fix: image storage type should be Surface or Pixbuf (loaded from icon_theme_path)
-        assert!(
-            img.storage_type() == gtk::ImageType::Surface || img.storage_type() == gtk::ImageType::Pixbuf,
-            "Expected Surface or Pixbuf from icon_theme_path, but got {:?}",
-            img.storage_type()
-        );
+            // Before fix: image storage type was IconName (holding "toolbox-tray-color" which GTK fails to render)
+            // With fix: image storage type should be Surface or Pixbuf (loaded from icon_theme_path)
+            assert!(
+                img.storage_type() == gtk::ImageType::Surface || img.storage_type() == gtk::ImageType::Pixbuf,
+                "Expected Surface or Pixbuf from icon_theme_path, but got {:?}",
+                img.storage_type()
+            );
+        });
     }
 
     #[test]

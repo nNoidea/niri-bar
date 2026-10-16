@@ -168,6 +168,28 @@ impl<'de> Deserialize<'de> for Event {
     {
         struct EventVisitor;
 
+        macro_rules! decode_event_map {
+            ($map:expr, $( $variant:ident { $( $field:ident : $ty:ty ),+ $(,)? } ),+ $(,)?) => {{
+                let mut result = Event::Other;
+                while let Some(key) = $map.next_key::<&str>()? {
+                    match key {
+                        $(
+                            stringify!($variant) => {
+                                #[derive(Deserialize)]
+                                struct Payload { $( $field: $ty ),+ }
+                                let p: Payload = $map.next_value()?;
+                                result = Event::$variant { $( $field: p.$field ),+ };
+                            }
+                        )+
+                        _ => {
+                            let _ = $map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(result)
+            }};
+        }
+
         impl<'de> serde::de::Visitor<'de> for EventVisitor {
             type Value = Event;
 
@@ -179,100 +201,18 @@ impl<'de> Deserialize<'de> for Event {
             where
                 A: serde::de::MapAccess<'de>,
             {
-                #[derive(Deserialize)]
-                struct WorkspacesPayload {
-                    workspaces: Vec<WorkspaceInfo>,
-                }
-                #[derive(Deserialize)]
-                struct WorkspaceActivatedPayload {
-                    id: u64,
-                    focused: bool,
-                }
-                #[derive(Deserialize)]
-                struct OutputsPayload {
-                    outputs: Option<HashMap<String, OutputInfo>>,
-                }
-                #[derive(Deserialize)]
-                struct WindowsPayload {
-                    windows: Vec<WindowInfo>,
-                }
-                #[derive(Deserialize)]
-                struct WindowOpenedOrChangedPayload {
-                    window: WindowInfo,
-                }
-                #[derive(Deserialize)]
-                struct WindowClosedPayload {
-                    id: u64,
-                }
-                #[derive(Deserialize)]
-                struct WindowFocusChangedPayload {
-                    id: Option<u64>,
-                }
-                #[derive(Deserialize)]
-                struct WorkspaceActiveWindowChangedPayload {
-                    workspace_id: u64,
-                    active_window_id: Option<u64>,
-                }
-                #[derive(Deserialize)]
-                struct WindowLayoutsChangedPayload {
-                    changes: Vec<(u64, WindowLayout)>,
-                }
-
-                let mut result = Event::Other;
-
-                while let Some(key) = map.next_key::<&str>()? {
-                    match key {
-                        "WorkspacesChanged" => {
-                            let p: WorkspacesPayload = map.next_value()?;
-                            result = Event::WorkspacesChanged {
-                                workspaces: p.workspaces,
-                            };
-                        }
-                        "WorkspaceActivated" => {
-                            let p: WorkspaceActivatedPayload = map.next_value()?;
-                            result = Event::WorkspaceActivated {
-                                id: p.id,
-                                focused: p.focused,
-                            };
-                        }
-                        "OutputsChanged" => {
-                            let p: OutputsPayload = map.next_value()?;
-                            result = Event::OutputsChanged { outputs: p.outputs };
-                        }
-                        "WindowsChanged" => {
-                            let p: WindowsPayload = map.next_value()?;
-                            result = Event::WindowsChanged { windows: p.windows };
-                        }
-                        "WindowOpenedOrChanged" => {
-                            let p: WindowOpenedOrChangedPayload = map.next_value()?;
-                            result = Event::WindowOpenedOrChanged { window: p.window };
-                        }
-                        "WindowClosed" => {
-                            let p: WindowClosedPayload = map.next_value()?;
-                            result = Event::WindowClosed { id: p.id };
-                        }
-                        "WindowFocusChanged" => {
-                            let p: WindowFocusChangedPayload = map.next_value()?;
-                            result = Event::WindowFocusChanged { id: p.id };
-                        }
-                        "WorkspaceActiveWindowChanged" => {
-                            let p: WorkspaceActiveWindowChangedPayload = map.next_value()?;
-                            result = Event::WorkspaceActiveWindowChanged {
-                                workspace_id: p.workspace_id,
-                                active_window_id: p.active_window_id,
-                            };
-                        }
-                        "WindowLayoutsChanged" => {
-                            let p: WindowLayoutsChangedPayload = map.next_value()?;
-                            result = Event::WindowLayoutsChanged { changes: p.changes };
-                        }
-                        _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                Ok(result)
+                decode_event_map!(
+                    map,
+                    WorkspacesChanged { workspaces: Vec<WorkspaceInfo> },
+                    WorkspaceActivated { id: u64, focused: bool },
+                    OutputsChanged { outputs: Option<HashMap<String, OutputInfo>> },
+                    WindowsChanged { windows: Vec<WindowInfo> },
+                    WindowOpenedOrChanged { window: WindowInfo },
+                    WindowClosed { id: u64 },
+                    WindowFocusChanged { id: Option<u64> },
+                    WorkspaceActiveWindowChanged { workspace_id: u64, active_window_id: Option<u64> },
+                    WindowLayoutsChanged { changes: Vec<(u64, WindowLayout)> },
+                )
             }
         }
 

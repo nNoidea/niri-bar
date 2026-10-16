@@ -1,13 +1,11 @@
-use glib::prelude::*;
 use gtk::Orientation;
 use std::fs;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_mode, NetworkConfig};
-use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{dbus_get_variant, BarModule, DbusSubscriptions, ModuleCore, ModuleState, ScrollDirection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkType {
@@ -40,35 +38,6 @@ fn variant_to_string(v: &glib::Variant) -> Option<String> {
     }
 }
 
-fn get_dbus_variant(
-    conn: &gio::DBusConnection,
-    dest: &str,
-    path: &str,
-    interface: &str,
-    prop: &str,
-) -> Option<glib::Variant> {
-    let params = (interface, prop).to_variant();
-    let res = match conn.call_sync(
-        Some(dest),
-        path,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        Some(&params),
-        None,
-        gio::DBusCallFlags::NONE,
-        500,
-        gio::Cancellable::NONE,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            log_debug!("network", "D-Bus Get failed {dest} {path} {interface}.{prop}: {e}");
-            return None;
-        }
-    };
-    let child = res.child_value(0);
-    child.as_variant()
-}
-
 fn get_dbus_property_string(
     conn: &gio::DBusConnection,
     dest: &str,
@@ -76,7 +45,7 @@ fn get_dbus_property_string(
     interface: &str,
     prop: &str,
 ) -> Option<String> {
-    let inner = get_dbus_variant(conn, dest, path, interface, prop)?;
+    let inner = dbus_get_variant(conn, dest, path, interface, prop)?;
     variant_to_string(&inner)
 }
 
@@ -98,7 +67,7 @@ fn get_dbus_property_objpath_list(
     interface: &str,
     prop: &str,
 ) -> Option<Vec<String>> {
-    let inner = get_dbus_variant(conn, dest, path, interface, prop)?;
+    let inner = dbus_get_variant(conn, dest, path, interface, prop)?;
     let mut list = Vec::new();
     for i in 0..inner.n_children() {
         let item = inner.child_value(i);
@@ -131,33 +100,32 @@ impl NetworkModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
-        let (trigger_tx, trigger_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
-        let tx_shutdown = trigger_tx.clone();
-        core.on_shutdown(move || {
-            let _ = tx_shutdown.send(());
-        });
-        // Single blocking read at construction (pre-main-loop); afterwards the
-        // worker owns freshness and `current_state` is lock-only.
-        let initial = Self::read_network_state();
+        // Single read at construction so `current_state` has real data immediately;
+        // afterwards the worker owns freshness and `current_state` is lock-only.
+        let (initial, initial_healthy) = Self::read_network_state_full();
         let last: Arc<Mutex<(NetworkType, Option<String>)>> = Arc::new(Mutex::new(initial.clone()));
         let last_worker = Arc::clone(&last);
 
         // Background worker loop driven by NetworkManager D-Bus events and periodic timeout.
         // Unhealthy backends back off (3s→30s idle); triggers stay immediate.
-        // Subscriptions are worker-owned and renewed so a bus restart cannot
-        // silently drop them.
-        let tx_sub = trigger_tx;
+        // Subscriptions are worker-owned via `DbusSubscriptions` so they are
+        // renewed periodically and unsubscribed automatically on drop.
         thread::spawn(move || {
-            let (mut last_type, mut last_ssid) = initial;
-            let mut fail_streak: u32 = 0;
+            if core_worker.is_stopped() {
+                return;
+            }
+            let mut last_cached = initial;
+            let mut fail_streak: u32 = u32::from(!initial_healthy);
             let mut degraded_warned = false;
-            let mut live_subs = Self::subscribe_triggers(&tx_sub);
+            let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
             let mut last_renew = std::time::Instant::now();
 
             loop {
-                if core_worker.is_stopped() {
+                let wait = crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
+                if core_worker.wait_timeout(wait) {
                     break;
                 }
+
                 let ((net_type, ssid), healthy) = NetworkModule::read_network_state_full();
 
                 if healthy {
@@ -174,38 +142,19 @@ impl NetworkModule {
                     }
                 }
 
-                if net_type != last_type || ssid != last_ssid {
-                    last_type = net_type.clone();
-                    last_ssid.clone_from(&ssid);
-
-                    {
-                        let mut guard = crate::util::lock(&last_worker);
-                        *guard = (net_type.clone(), ssid.clone());
-                    }
+                let current = (net_type, ssid);
+                if current != last_cached {
+                    last_cached.clone_from(&current);
+                    (*crate::util::lock(&last_worker)).clone_from(&current);
                     core_worker.broadcast(|orient| {
-                        NetworkModule::format_state_with_config(&cfg, &net_type, ssid.as_deref(), orient)
+                        NetworkModule::format_state_with_config(&cfg, &current.0, current.1.as_deref(), orient)
                     });
                 }
 
-                let renew_due = last_renew.elapsed() >= std::time::Duration::from_secs(300) || fail_streak >= 3;
+                let renew_due = last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3;
                 if renew_due {
-                    if let Some((old_conn, old_ids)) = live_subs.take() {
-                        for id in old_ids {
-                            old_conn.signal_unsubscribe(id);
-                        }
-                    }
-                    live_subs = Self::subscribe_triggers(&tx_sub);
+                    _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
                     last_renew = std::time::Instant::now();
-                }
-
-                if core_worker.is_stopped() {
-                    break;
-                }
-                // Wait for D-Bus signal trigger, else idle check with backoff.
-                let wait = crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
-                let _ = trigger_rx.recv_timeout(wait);
-                if core_worker.is_stopped() {
-                    break;
                 }
             }
         });
@@ -213,12 +162,12 @@ impl NetworkModule {
         Self { config, last, core }
     }
 
-    /// Subscribe to NetworkManager signals. Worker-owned (see bluetooth):
-    /// renewed periodically and on failure streaks.
-    fn subscribe_triggers(tx: &Sender<()>) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
+    /// Subscribe to NetworkManager signals. Worker-owned: renewed periodically
+    /// and unsubscribed automatically when `DbusSubscriptions` is dropped.
+    fn subscribe_triggers(core: &ModuleCore) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
         let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
         let mut ids = Vec::new();
-        let tx_nm = tx.clone();
+        let core_nm = core.clone();
         ids.push(conn.signal_subscribe(
             Some("org.freedesktop.NetworkManager"),
             Some("org.freedesktop.DBus.Properties"),
@@ -227,11 +176,11 @@ impl NetworkModule {
             None,
             gio::DBusSignalFlags::NONE,
             move |_conn, _sender, _path, _iface, _signal, _params| {
-                let _ = tx_nm.send(());
+                core_nm.notify();
             },
         ));
 
-        let tx_ac = tx.clone();
+        let core_ac = core.clone();
         ids.push(conn.signal_subscribe(
             Some("org.freedesktop.NetworkManager"),
             Some("org.freedesktop.NetworkManager.Connection.Active"),
@@ -240,7 +189,7 @@ impl NetworkModule {
             None,
             gio::DBusSignalFlags::NONE,
             move |_conn, _sender, _path, _iface, _signal, _params| {
-                let _ = tx_ac.send(());
+                core_ac.notify();
             },
         ));
         Some((conn, ids))
@@ -357,10 +306,6 @@ impl NetworkModule {
         }
 
         best_iface.map(|(iface, _)| iface)
-    }
-
-    fn read_network_state() -> (NetworkType, Option<String>) {
-        Self::read_network_state_full().0
     }
 
     /// State plus source health. Healthy when NetworkManager answers *or*

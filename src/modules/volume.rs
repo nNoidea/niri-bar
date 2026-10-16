@@ -65,10 +65,12 @@ impl VolumeModule {
             // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
             // Supervised: pw-mon session → backoff polling → re-exec, forever.
             thread::spawn(move || {
+                if core_worker.is_stopped() {
+                    return;
+                }
                 // Initial truth (off GTK thread): replaces the stale placeholder.
                 {
-                    let (vol, muted) = VolumeModule::read_system_volume();
-                    let new_sink = VolumeModule::read_current_sink();
+                    let (vol, muted, new_sink, _) = VolumeModule::read_audio_state();
                     cur_vol.store(vol, Ordering::Relaxed);
                     cur_muted.store(muted, Ordering::Relaxed);
                     *crate::util::lock(&cur_sink) = new_sink.clone();
@@ -117,27 +119,15 @@ impl VolumeModule {
                         core_worker.set_child(child);
 
                         if let Some(stdout) = stdout {
-                            let reader = BufReader::new(stdout);
-                            for line in reader.lines() {
-                                if core_worker.is_stopped() {
-                                    break;
-                                }
-                                let l = match line {
-                                    Ok(l) => l,
-                                    Err(e) => {
-                                        if core_worker.is_stopped() {
-                                            break;
-                                        }
-                                        log_warn!("volume", "pw-mon read error: {e}");
-                                        continue;
-                                    }
-                                };
-                                if VolumeModule::is_volume_event_line(&l) {
-                                    let (vol, muted) = VolumeModule::read_system_volume();
-                                    let new_sink = VolumeModule::read_current_sink();
+                            let reader = BufReader::with_capacity(64 * 1024, stdout);
+                            VolumeModule::process_pw_mon_stream(
+                                reader,
+                                || core_worker.is_stopped(),
+                                || {
+                                    let (vol, muted, new_sink, _) = VolumeModule::read_audio_state();
                                     apply(vol, muted, &new_sink);
-                                }
-                            }
+                                },
+                            );
                         }
                         // `pw-mon` exited (or was killed on teardown): reap, then polling.
                         if let Some(mut child) = core_worker.take_child() {
@@ -167,11 +157,8 @@ impl VolumeModule {
                         if core_worker.is_stopped() {
                             break;
                         }
-                        let ok_before = VolumeModule::probe_audio_ok();
-                        let (vol, muted) = VolumeModule::read_system_volume();
-                        let new_sink = VolumeModule::read_current_sink();
+                        let (vol, muted, new_sink, healthy) = VolumeModule::read_audio_state();
                         apply(vol, muted, &new_sink);
-                        let healthy = ok_before && new_sink.name != "@DEFAULT_AUDIO_SINK@";
                         let backoff = if healthy {
                             fail_streak = 0;
                             250
@@ -205,21 +192,41 @@ impl VolumeModule {
             .ok()
     }
 
-    /// Cheap health probe: true when `wpctl get-volume` spawns, exits 0,
-    /// and yields a parsable level. Used for backoff decisions.
-    fn probe_audio_ok() -> bool {
-        let Ok(out) = Command::new(resolve_helper("wpctl"))
-            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-            .output()
-        else {
-            return false;
-        };
-        if !out.status.success() {
-            return false;
+    /// Reads `pw-mon -N` lines and coalesces multi-line event bursts already
+    /// sitting in `reader`'s buffer so each PipeWire property block triggers
+    /// a single `on_volume_event` callback instead of dozens.
+    pub fn process_pw_mon_stream<R: std::io::Read, S: Fn() -> bool, F: FnMut()>(
+        mut reader: BufReader<R>,
+        is_stopped: S,
+        mut on_volume_event: F,
+    ) {
+        let mut line = String::new();
+        loop {
+            if is_stopped() {
+                break;
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if Self::is_volume_event_line(&line) {
+                        while reader.buffer().contains(&b'\n') {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                break;
+                            }
+                        }
+                        on_volume_event();
+                    }
+                }
+                Err(e) => {
+                    if is_stopped() {
+                        break;
+                    }
+                    log_warn!("volume", "pw-mon read error: {e}");
+                }
+            }
         }
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .any(|p| p.parse::<f64>().is_ok())
     }
 
     pub fn read_system_volume() -> (u32, bool) {
@@ -259,8 +266,21 @@ impl VolumeModule {
             || line.contains("Audio/Sink")
     }
 
-    pub fn parse_wpctl_sinks(output: &str) -> (Vec<SinkInfo>, Option<usize>) {
+    fn parse_inline_volume(rest: &str) -> Option<(u32, bool)> {
+        let (_, after_vol) = rest.split_once("[vol:")?;
+        let inside = after_vol.split(']').next()?;
+        let is_muted = inside.contains("MUTED");
+        for part in inside.split_whitespace() {
+            if let Ok(val) = part.parse::<f64>() {
+                return Some(((val * 100.0).round() as u32, is_muted));
+            }
+        }
+        None
+    }
+
+    pub fn parse_wpctl_status(output: &str) -> (Vec<SinkInfo>, Option<usize>, Option<(u32, bool)>) {
         let mut sinks = Vec::new();
+        let mut sink_vols = Vec::new();
         let mut default_idx = None;
         let mut in_audio = false;
         let mut in_sinks = false;
@@ -301,6 +321,7 @@ impl VolumeModule {
                             if is_default {
                                 default_idx = Some(sinks.len());
                             }
+                            sink_vols.push(Self::parse_inline_volume(rest));
                             sinks.push(SinkInfo {
                                 name: id_trimmed.to_string(),
                                 description: desc,
@@ -313,6 +334,15 @@ impl VolumeModule {
             }
         }
 
+        let active_vol = default_idx
+            .and_then(|idx| sink_vols.get(idx).copied().flatten())
+            .or_else(|| sink_vols.first().copied().flatten());
+
+        (sinks, default_idx, active_vol)
+    }
+
+    pub fn parse_wpctl_sinks(output: &str) -> (Vec<SinkInfo>, Option<usize>) {
+        let (sinks, default_idx, _) = Self::parse_wpctl_status(output);
         (sinks, default_idx)
     }
 
@@ -373,18 +403,20 @@ impl VolumeModule {
         (sink_type, is_bluetooth)
     }
 
-    pub fn read_current_sink() -> SinkInfo {
+    /// Reads default sink, volume, and mute state from a single `wpctl status`
+    /// call (falling back to `wpctl get-volume` only if inline `[vol: ...]` is
+    /// absent). Returns `(volume, is_muted, sink, healthy)`.
+    pub fn read_audio_state() -> (u32, bool, SinkInfo, bool) {
         match Command::new(resolve_helper("wpctl")).arg("status").output() {
             Ok(out) if out.status.success() => {
-                let s = String::from_utf8_lossy(&out.stdout).to_string();
-                let (sinks, default_idx) = Self::parse_wpctl_sinks(&s);
-                if let Some(idx) = default_idx {
-                    if let Some(sink) = sinks.get(idx) {
-                        return sink.clone();
-                    }
-                }
-                if let Some(first) = sinks.into_iter().next() {
-                    return first;
+                let s = String::from_utf8_lossy(&out.stdout);
+                let (sinks, default_idx, vol_mute) = Self::parse_wpctl_status(&s);
+                let selected_sink = default_idx
+                    .and_then(|idx| sinks.get(idx).cloned())
+                    .or_else(|| sinks.into_iter().next());
+                if let Some(sink) = selected_sink {
+                    let (vol, muted) = vol_mute.unwrap_or_else(Self::read_system_volume);
+                    return (vol, muted, sink, true);
                 }
                 log_debug!("volume", "wpctl status parsed no sinks");
             }
@@ -392,12 +424,23 @@ impl VolumeModule {
             Err(e) => log_debug!("volume", "wpctl not available for sink read: {e}"),
         }
 
-        SinkInfo {
-            name: "@DEFAULT_AUDIO_SINK@".to_string(),
-            description: "Default Output".to_string(),
-            sink_type: SinkType::Speaker,
-            is_bluetooth: false,
-        }
+        let (vol, muted) = Self::read_system_volume();
+        (
+            vol,
+            muted,
+            SinkInfo {
+                name: "@DEFAULT_AUDIO_SINK@".to_string(),
+                description: "Default Output".to_string(),
+                sink_type: SinkType::Speaker,
+                is_bluetooth: false,
+            },
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn read_current_sink() -> SinkInfo {
+        Self::read_audio_state().2
     }
 
     pub fn cycle_audio_output() {
@@ -552,8 +595,7 @@ impl VolumeModule {
         let cfg = self.config.clone();
         thread::spawn(move || {
             Self::cycle_audio_output();
-            let (vol, muted) = Self::read_system_volume();
-            let sink = Self::read_current_sink();
+            let (vol, muted, sink, _) = Self::read_audio_state();
             cur_vol.store(vol, Ordering::Relaxed);
             cur_muted.store(muted, Ordering::Relaxed);
             {
@@ -993,6 +1035,48 @@ Audio
         assert!(VolumeModule::is_volume_event_line("Audio/Sink"));
         assert!(VolumeModule::is_volume_event_line("ParamId:Route"));
         assert!(!VolumeModule::is_volume_event_line("core.name = \"pipewire-0\""));
+    }
+
+    #[test]
+    fn test_parse_wpctl_status_extracts_volume_and_mute() {
+        let wpctl_output = r#"
+Audio
+ ├─ Sinks:
+ │  *   57. Ryzen HD Audio Controller Speaker   [vol: 0.43 MUTED]
+ │      62. WH-1000XM4 Wireless Headphones     [vol: 0.80]
+"#;
+        let (sinks, default_idx, vol_mute) = VolumeModule::parse_wpctl_status(wpctl_output);
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(default_idx, Some(0));
+        assert_eq!(vol_mute, Some((43, true)));
+    }
+
+    #[test]
+    fn test_process_pw_mon_stream_coalesces_event_burst() {
+        let burst = "\
+changed:
+  id: 57
+  ParamId:Route
+  Prop: key Spa:Pod:Object:Param:Props:mute (65540)
+  Prop: key Spa:Pod:Object:Param:Props:channelVolumes (65544)
+  Prop: key Spa:Pod:Object:Param:Props:volume (65539)
+  Audio/Sink
+  core.name = \"pipewire-0\"
+  Prop: key Spa:Pod:Object:Param:Props:channelVolumes (65544)
+";
+        let reader = std::io::BufReader::new(std::io::Cursor::new(burst.as_bytes()));
+        let mut call_count = 0usize;
+        VolumeModule::process_pw_mon_stream(
+            reader,
+            || false,
+            || {
+                call_count += 1;
+            },
+        );
+        assert_eq!(
+            call_count, 1,
+            "A buffered burst of matching pw-mon lines should coalesce into 1 query"
+        );
     }
 
     #[test]

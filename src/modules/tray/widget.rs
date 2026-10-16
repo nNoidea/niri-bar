@@ -303,11 +303,13 @@ impl TrayWidget {
 
 pub fn enable_menu_item_hover_cursor(item: &gtk::MenuItem) {
     item.connect_select(|mi| {
-        if mi.is_sensitive() {
-            if let Some(w) = mi.window() {
+        if let Some(w) = mi.window() {
+            if mi.is_sensitive() {
                 let display = w.display();
                 let pointer = gdk::Cursor::from_name(&display, "pointer");
                 w.set_cursor(pointer.as_ref());
+            } else {
+                w.set_cursor(None);
             }
         }
     });
@@ -477,75 +479,67 @@ mod tests {
 
     #[test]
     fn test_menu_item_hover_cursor_behavior() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
+        crate::util::run_gtk_test(|| {
+            use std::sync::Mutex;
+            let menu = Menu::new();
+            let item1 = gtk::MenuItem::with_label("Item 1");
+            let item2 = gtk::MenuItem::with_label("Item 2");
+            enable_menu_item_hover_cursor(&item1);
+            enable_menu_item_hover_cursor(&item2);
+            menu.append(&item1);
+            menu.append(&item2);
+
+            // Check has_window is false
+            assert!(!gtk::prelude::WidgetExt::has_window(&item1));
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let e1 = Arc::clone(&events);
+            item1.connect_select(move |_| {
+                crate::util::lock(&e1).push("item1_select");
+            });
+            let e2 = Arc::clone(&events);
+            item1.connect_deselect(move |_| {
+                crate::util::lock(&e2).push("item1_deselect");
+            });
+            let e3 = Arc::clone(&events);
+            item2.connect_select(move |_| {
+                crate::util::lock(&e3).push("item2_select");
+            });
+            let e4 = Arc::clone(&events);
+            item2.connect_deselect(move |_| {
+                crate::util::lock(&e4).push("item2_deselect");
+            });
+
+            menu.show_all();
+            menu.realize();
+            item1.realize();
+            item2.realize();
+
+            // Simulate moving from item1 to item2
+            item1.emit_by_name::<()>("select", &[]);
+            if let Some(w) = item1.window() {
+                assert!(w.cursor().is_some());
             }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
 
-        use std::sync::Mutex;
-        let menu = Menu::new();
-        let item1 = gtk::MenuItem::with_label("Item 1");
-        let item2 = gtk::MenuItem::with_label("Item 2");
-        enable_menu_item_hover_cursor(&item1);
-        enable_menu_item_hover_cursor(&item2);
-        menu.append(&item1);
-        menu.append(&item2);
+            item1.emit_by_name::<()>("deselect", &[]);
+            if let Some(w) = item1.window() {
+                assert!(w.cursor().is_none());
+            }
 
-        // Check has_window is false
-        assert!(!gtk::prelude::WidgetExt::has_window(&item1));
+            item2.emit_by_name::<()>("select", &[]);
+            if let Some(w) = item2.window() {
+                assert!(w.cursor().is_some());
+            }
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let e1 = Arc::clone(&events);
-        item1.connect_select(move |_| {
-            crate::util::lock(&e1).push("item1_select");
+            let logged = crate::util::lock(&events).clone();
+            assert_eq!(logged, vec!["item1_select", "item1_deselect", "item2_select"]);
+
+            // Insensitive items should not set pointer cursor
+            item1.set_sensitive(false);
+            item1.emit_by_name::<()>("select", &[]);
+            if let Some(w) = item1.window() {
+                assert!(w.cursor().is_none());
+            }
         });
-        let e2 = Arc::clone(&events);
-        item1.connect_deselect(move |_| {
-            crate::util::lock(&e2).push("item1_deselect");
-        });
-        let e3 = Arc::clone(&events);
-        item2.connect_select(move |_| {
-            crate::util::lock(&e3).push("item2_select");
-        });
-        let e4 = Arc::clone(&events);
-        item2.connect_deselect(move |_| {
-            crate::util::lock(&e4).push("item2_deselect");
-        });
-
-        menu.show_all();
-        menu.realize();
-        item1.realize();
-        item2.realize();
-
-        // Simulate moving from item1 to item2
-        item1.emit_by_name::<()>("select", &[]);
-        if let Some(w) = item1.window() {
-            assert!(w.cursor().is_some());
-        }
-
-        item1.emit_by_name::<()>("deselect", &[]);
-        if let Some(w) = item1.window() {
-            assert!(w.cursor().is_none());
-        }
-
-        item2.emit_by_name::<()>("select", &[]);
-        if let Some(w) = item2.window() {
-            assert!(w.cursor().is_some());
-        }
-
-        let logged = crate::util::lock(&events).clone();
-        assert_eq!(logged, vec!["item1_select", "item1_deselect", "item2_select"]);
-
-        // Insensitive items should not set pointer cursor
-        item1.set_sensitive(false);
-        item1.emit_by_name::<()>("select", &[]);
-        if let Some(w) = item1.window() {
-            assert!(w.cursor().is_none());
-        }
     }
 }

@@ -1,12 +1,13 @@
 use gtk::Orientation;
 use std::fs;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
-use crate::modules::{spawn_command, BarModule, ModuleCore, ModuleState, MouseButton, ScrollDirection};
+use crate::modules::{
+    spawn_command, BarModule, DbusSubscriptions, ModuleCore, ModuleState, MouseButton, ScrollDirection,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothState {
@@ -19,7 +20,6 @@ pub enum BluetoothState {
 
 pub struct BluetoothModule {
     config: BluetoothConfig,
-    trigger_tx: Sender<()>,
     /// Last known state. Updated by the background worker; `current_state`
     /// formats this cache so the GTK thread never does blocking BlueZ D-Bus I/O.
     last: Arc<Mutex<BluetoothState>>,
@@ -31,41 +31,40 @@ impl BluetoothModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
-        let (trigger_tx, trigger_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
-        let tx_shutdown = trigger_tx.clone();
-        core.on_shutdown(move || {
-            let _ = tx_shutdown.send(());
-        });
-        // Single blocking read at construction (pre-main-loop); worker owns freshness after.
-        let initial = Self::read_bluetooth_state();
+        // Single read at construction so `current_state` has real data immediately;
+        // afterwards the worker owns freshness and `current_state` is lock-only.
+        let (initial, initial_healthy) = Self::read_bluetooth_state_full();
         let last: Arc<Mutex<BluetoothState>> = Arc::new(Mutex::new(initial.clone()));
         let last_worker = Arc::clone(&last);
 
         // Background worker loop driven by D-Bus signals and triggers.
         // Unhealthy backends back off (2s→30s idle); triggered reads and
-        // transitional states stay fast. Subscriptions are worker-owned and
-        // renewed periodically so a bus restart cannot silently drop them.
-        let tx_sub = trigger_tx.clone();
+        // transitional states stay fast. Subscriptions are worker-owned via
+        // `DbusSubscriptions` so they renew periodically and unsubscribe on drop.
         thread::spawn(move || {
-            let mut last_state: Option<BluetoothState> = Some(initial);
-            let mut fast_poll_ticks: usize = 0;
-            let mut fail_streak: u32 = 0;
+            if core_worker.is_stopped() {
+                return;
+            }
+            let mut last_state: Option<BluetoothState> = Some(initial.clone());
+            let mut fast_poll_ticks: usize = if initial == BluetoothState::Loading { 20 } else { 0 };
+            let mut fail_streak: u32 = u32::from(!initial_healthy);
             let mut degraded_warned = false;
-            let mut live_subs = Self::subscribe_triggers(&tx_sub);
+            let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
             let mut last_renew = std::time::Instant::now();
 
             loop {
-                if core_worker.is_stopped() {
+                let wait = if fast_poll_ticks > 0 {
+                    fast_poll_ticks -= 1;
+                    Duration::from_millis(100)
+                } else {
+                    crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30))
+                };
+                let (stopped, notified) = core_worker.wait_or_notified(wait);
+                if stopped {
                     break;
                 }
-                // Drain any pending triggers and enable fast polling if triggered
-                let mut triggered = false;
-                while trigger_rx.try_recv().is_ok() {
+                if notified {
                     fast_poll_ticks = 40; // 40 * 100ms = 4.0s of fast-polling
-                    triggered = true;
-                }
-
-                if triggered {
                     last_state = None; // Invalidate cache so live state is immediately broadcast
                 }
 
@@ -85,17 +84,9 @@ impl BluetoothModule {
                     }
                 }
 
-                let state_changed = match &last_state {
-                    Some(prev) => prev != &current_state,
-                    None => true,
-                };
-
-                if state_changed {
+                if last_state.as_ref() != Some(&current_state) {
                     last_state = Some(current_state.clone());
-                    {
-                        let mut guard = crate::util::lock(&last_worker);
-                        *guard = current_state.clone();
-                    }
+                    *crate::util::lock(&last_worker) = current_state.clone();
                     core_worker
                         .broadcast(|orient| BluetoothModule::format_state_with_config(&cfg, &current_state, orient));
                 }
@@ -105,54 +96,23 @@ impl BluetoothModule {
                     fast_poll_ticks = 20; // 2.0s more of fast polling
                 }
 
-                // Renew event subscriptions: they die with the bus connection
-                // that created them, and nothing observable distinguishes a
-                // dead subscription from an idle bus.
-                let renew_due = last_renew.elapsed() >= std::time::Duration::from_secs(300) || fail_streak >= 3;
+                let renew_due = last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3;
                 if renew_due {
-                    if let Some((old_conn, old_ids)) = live_subs.take() {
-                        for id in old_ids {
-                            old_conn.signal_unsubscribe(id);
-                        }
-                    }
-                    live_subs = Self::subscribe_triggers(&tx_sub);
+                    _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
                     last_renew = std::time::Instant::now();
-                }
-
-                if core_worker.is_stopped() {
-                    break;
-                }
-                if fast_poll_ticks > 0 {
-                    fast_poll_ticks -= 1;
-                    let _ = trigger_rx.recv_timeout(Duration::from_millis(100));
-                } else {
-                    // Idle cadence backs off while the backend is unhealthy;
-                    // user-triggered iterations already fast-polled above.
-                    let wait =
-                        crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30));
-                    let _ = trigger_rx.recv_timeout(wait);
-                }
-                if core_worker.is_stopped() {
-                    break;
                 }
             }
         });
 
-        Self {
-            config,
-            trigger_tx,
-            last,
-            core,
-        }
+        Self { config, last, core }
     }
 
-    /// Subscribe to BlueZ signals. Worker-owned: the returned connection and
-    /// subscription IDs die with the bus, so the worker renews them (see
-    /// above) instead of subscribing once in the constructor.
-    fn subscribe_triggers(tx: &Sender<()>) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
+    /// Subscribe to BlueZ signals. Worker-owned: renewed periodically and
+    /// unsubscribed automatically when `DbusSubscriptions` is dropped.
+    fn subscribe_triggers(core: &ModuleCore) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
         let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
         let mut ids = Vec::new();
-        let tx_props = tx.clone();
+        let core_props = core.clone();
         ids.push(conn.signal_subscribe(
             Some("org.bluez"),
             Some("org.freedesktop.DBus.Properties"),
@@ -161,11 +121,11 @@ impl BluetoothModule {
             None,
             gio::DBusSignalFlags::NONE,
             move |_conn, _sender, _path, _iface, _signal, _params| {
-                let _ = tx_props.send(());
+                core_props.notify();
             },
         ));
 
-        let tx_obj = tx.clone();
+        let core_obj = core.clone();
         ids.push(conn.signal_subscribe(
             Some("org.bluez"),
             Some("org.freedesktop.DBus.ObjectManager"),
@@ -174,7 +134,7 @@ impl BluetoothModule {
             None,
             gio::DBusSignalFlags::NONE,
             move |_conn, _sender, _path, _iface, _signal, _params| {
-                let _ = tx_obj.send(());
+                core_obj.notify();
             },
         ));
         Some((conn, ids))
@@ -341,10 +301,6 @@ impl BluetoothModule {
         ))
     }
 
-    pub fn read_bluetooth_state() -> BluetoothState {
-        Self::read_bluetooth_state_full().0
-    }
-
     /// State plus backend health. `healthy` is false when no usable adapter
     /// could be determined (BlueZ down/absent with inconclusive rfkill) —
     /// the worker backs off and the toggle refuses to fire blind commands.
@@ -470,7 +426,7 @@ impl BarModule for BluetoothModule {
 
     fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
         let rx = self.core.subscribe(orientation);
-        let _ = self.trigger_tx.send(());
+        self.core.notify();
         rx
     }
 
@@ -494,19 +450,19 @@ impl BarModule for BluetoothModule {
                     Self::toggle_bluetooth();
                 }
 
-                let _ = self.trigger_tx.send(());
+                self.core.notify();
             }
             MouseButton::Right => {
                 if let Some(ref cmd) = self.config.click.on_click_right {
                     spawn_command(cmd);
                 }
-                let _ = self.trigger_tx.send(());
+                self.core.notify();
             }
             MouseButton::Middle => {
                 if let Some(ref cmd) = self.config.click.on_click_middle {
                     spawn_command(cmd);
                 }
-                let _ = self.trigger_tx.send(());
+                self.core.notify();
             }
         }
     }

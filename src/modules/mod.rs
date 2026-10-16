@@ -26,48 +26,121 @@ use crate::modules::spacer::SpacerModule;
 use crate::modules::volume::VolumeModule;
 
 /// Cancellation and interruptible-sleep primitive for module workers.
+///
+/// Tracks `(stopped, notified)` under a `Mutex` paired with a `Condvar` so
+/// workers can sleep until either a trigger notification (`notify()`) or
+/// shutdown (`stop()`) without needing a separate `mpsc` channel.
 #[derive(Clone, Debug, Default)]
 struct StopSignal {
-    state: Arc<(Mutex<bool>, Condvar)>,
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
 }
 
 impl StopSignal {
     fn new() -> Self {
         Self {
-            state: Arc::new((Mutex::new(false), Condvar::new())),
+            state: Arc::new((Mutex::new((false, false)), Condvar::new())),
         }
     }
 
     fn stop(&self) {
         let (lock, cvar) = &*self.state;
-        if let Ok(mut stopped) = lock.lock() {
-            *stopped = true;
+        if let Ok(mut st) = lock.lock() {
+            st.0 = true;
+        }
+        cvar.notify_all();
+    }
+
+    fn notify(&self) {
+        let (lock, cvar) = &*self.state;
+        if let Ok(mut st) = lock.lock() {
+            st.1 = true;
         }
         cvar.notify_all();
     }
 
     fn is_stopped(&self) -> bool {
         let (lock, _) = &*self.state;
-        lock.lock().map(|s| *s).unwrap_or(true)
+        lock.lock().map(|s| s.0).unwrap_or(true)
     }
 
-    /// Blocks up to `dur`, but returns immediately if `stop()` is called.
-    /// Returns `true` if stopped, `false` if timed out.
-    fn wait_timeout(&self, dur: Duration) -> bool {
+    /// Blocks up to `dur`, returning early if `stop()` or `notify()` is called.
+    /// Returns `(stopped, notified)`.
+    fn wait_or_notified(&self, dur: Duration) -> (bool, bool) {
         let (lock, cvar) = &*self.state;
-        if let Ok(guard) = lock.lock() {
-            if *guard {
-                return true;
+        if let Ok(mut guard) = lock.lock() {
+            if guard.0 || guard.1 {
+                let notified = guard.1;
+                guard.1 = false;
+                return (guard.0, notified);
             }
-            if let Ok((guard, _)) = cvar.wait_timeout(guard, dur) {
-                return *guard;
+            if let Ok((mut guard, _)) = cvar.wait_timeout(guard, dur) {
+                let notified = guard.1;
+                guard.1 = false;
+                return (guard.0, notified);
             }
         }
-        true
+        (true, false)
+    }
+
+    /// Blocks up to `dur`, but returns immediately if `stop()` or `notify()` is called.
+    /// Returns `true` if stopped, `false` otherwise.
+    fn wait_timeout(&self, dur: Duration) -> bool {
+        self.wait_or_notified(dur).0
     }
 }
 
-type WakeupHook = Box<dyn Fn() + Send + Sync>;
+/// RAII guard for `gio::DBusConnection` signal subscriptions.
+///
+/// `gio::bus_get_sync` returns a process-global singleton connection, so dropping
+/// a `SignalSubscriptionId` without calling `signal_unsubscribe` leaks the closure
+/// forever. This guard unsubscribes automatically on both periodic renewal and
+/// worker thread exit.
+pub struct DbusSubscriptions(Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>);
+
+impl DbusSubscriptions {
+    pub fn new(subs: Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>) -> Self {
+        Self(subs)
+    }
+}
+
+impl Drop for DbusSubscriptions {
+    fn drop(&mut self) {
+        if let Some((conn, ids)) = self.0.take() {
+            for id in ids {
+                conn.signal_unsubscribe(id);
+            }
+        }
+    }
+}
+
+/// Fetch a single `org.freedesktop.DBus.Properties.Get` property variant with a 500ms timeout.
+pub fn dbus_get_variant(
+    conn: &gio::DBusConnection,
+    dest: &str,
+    path: &str,
+    interface: &str,
+    prop: &str,
+) -> Option<glib::Variant> {
+    let params = (interface, prop).to_variant();
+    let res = match conn.call_sync(
+        Some(dest),
+        path,
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        Some(&params),
+        None,
+        gio::DBusCallFlags::NONE,
+        500,
+        gio::Cancellable::NONE,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            log_debug!("dbus", "D-Bus Get failed {dest} {path} {interface}.{prop}: {e}");
+            return None;
+        }
+    };
+    res.child_value(0).as_variant()
+}
 
 /// Core subscription and lifecycle helper shared across modules.
 #[derive(Clone, Default)]
@@ -75,7 +148,6 @@ pub struct ModuleCore {
     subscribers: ModuleSubscribers,
     stop_signal: StopSignal,
     child: Arc<Mutex<Option<std::process::Child>>>,
-    wakeup_hooks: Arc<Mutex<Vec<WakeupHook>>>,
 }
 
 impl ModuleCore {
@@ -84,7 +156,6 @@ impl ModuleCore {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             stop_signal: StopSignal::new(),
             child: Arc::new(Mutex::new(None)),
-            wakeup_hooks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -94,13 +165,6 @@ impl ModuleCore {
 
     pub fn take_child(&self) -> Option<std::process::Child> {
         crate::util::lock(&self.child).take()
-    }
-
-    pub fn on_shutdown<F>(&self, hook: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        crate::util::lock(&self.wakeup_hooks).push(Box::new(hook));
     }
 
     pub fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
@@ -123,17 +187,18 @@ impl ModuleCore {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let hooks = {
-            let mut guard = crate::util::lock(&self.wakeup_hooks);
-            std::mem::take(&mut *guard)
-        };
-        for hook in hooks {
-            hook();
-        }
+    }
+
+    pub fn notify(&self) {
+        self.stop_signal.notify();
     }
 
     pub fn is_stopped(&self) -> bool {
         self.stop_signal.is_stopped()
+    }
+
+    pub fn wait_or_notified(&self, dur: Duration) -> (bool, bool) {
+        self.stop_signal.wait_or_notified(dur)
     }
 
     pub fn wait_timeout(&self, dur: Duration) -> bool {
@@ -612,48 +677,40 @@ mod tests {
 
     #[test]
     fn test_module_widget_apply_state_empty_hides_button() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let button = Button::new();
+            let label = Label::new(None);
+            button.add(&label);
 
-        let button = Button::new();
-        let label = Label::new(None);
-        button.add(&label);
+            let empty_state = ModuleState {
+                icon: None,
+                text: None,
+                tooltip: None,
+                css_classes: Vec::new(),
+            };
 
-        let empty_state = ModuleState {
-            icon: None,
-            text: None,
-            tooltip: None,
-            css_classes: Vec::new(),
-        };
+            // Non-spacer module with empty state should hide button and set no_show_all
+            ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
+            assert!(
+                button.is_no_show_all(),
+                "Empty module button must have no_show_all true"
+            );
+            assert!(!button.is_visible(), "Empty module button must be hidden");
 
-        // Non-spacer module with empty state should hide button and set no_show_all
-        ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
-        assert!(
-            button.is_no_show_all(),
-            "Empty module button must have no_show_all true"
-        );
-        assert!(!button.is_visible(), "Empty module button must be hidden");
-
-        // When populated with state, button should become visible and clear no_show_all
-        let populated_state = ModuleState {
-            icon: Some("󰃠".to_string()),
-            text: Some("50%".to_string()),
-            tooltip: None,
-            css_classes: Vec::new(),
-        };
-        ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
-        assert!(
-            !button.is_no_show_all(),
-            "Populated module button must not have no_show_all"
-        );
-        assert!(button.is_visible(), "Populated module button must be visible");
+            // When populated with state, button should become visible and clear no_show_all
+            let populated_state = ModuleState {
+                icon: Some("󰃠".to_string()),
+                text: Some("50%".to_string()),
+                tooltip: None,
+                css_classes: Vec::new(),
+            };
+            ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
+            assert!(
+                !button.is_no_show_all(),
+                "Populated module button must not have no_show_all"
+            );
+            assert!(button.is_visible(), "Populated module button must be visible");
+        });
     }
 
     #[test]
@@ -738,6 +795,22 @@ mod tests {
     }
 
     #[test]
+    fn test_module_core_notify_wakes_wait_immediately() {
+        let core = ModuleCore::new();
+        let core_clone = core.clone();
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || core_clone.wait_or_notified(Duration::from_secs(60)));
+
+        std::thread::sleep(Duration::from_millis(20));
+        core.notify();
+
+        let (stopped, notified) = handle.join().expect("thread must join cleanly");
+        assert!(!stopped, "notify must not mark core as stopped");
+        assert!(notified, "wait_or_notified must report notified=true");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn test_shared_modules_shutdown_signals_all() {
         let cfg = AppConfig::default();
         let shared = SharedModules::new(&cfg);
@@ -795,6 +868,7 @@ mod tests {
         assert_eq!(shared.get("clock").unwrap().name(), "clock");
         assert_eq!(shared.get("spacer").unwrap().name(), "spacer");
         assert!(shared.get("nonexistent").is_none());
+        shared.shutdown();
     }
 
     #[test]
@@ -815,7 +889,8 @@ mod tests {
             (threads, vmrss_kb)
         };
 
-        // Warmup: run 5 cycles so initial runtime buffers / glib allocate once
+        // Warmup: ensure GTK test thread + initial runtime buffers / glib allocate once
+        crate::util::run_gtk_test(|| {});
         for _ in 0..5 {
             let s = SharedModules::new(&cfg);
             s.shutdown();
