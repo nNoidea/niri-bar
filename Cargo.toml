@@ -30,7 +30,7 @@ async-channel = "2.3"
 chrono = "0.4"
 freedesktop-desktop-entry = "0.8"
 libc = "0.2"
-zbus = { version = "5", features = ["tokio"] }
+zbus = { version = "6", features = ["tokio"] }
 zvariant = "5"
 futures-util = "0.3"
 tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }
