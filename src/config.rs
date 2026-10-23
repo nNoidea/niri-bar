@@ -115,21 +115,13 @@ impl ClickActions {
     }
 }
 
-fn default_scroll_safety_margin() -> usize {
-    1
-}
-
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TaskbarConfig {
-    #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_icon_size")]
     pub icon_size: i32,
-    #[serde(default = "default_true")]
     pub only_current_workspace: bool,
-    #[serde(default = "default_true")]
     pub show_tooltips: bool,
-    #[serde(default = "default_scroll_safety_margin")]
     pub scroll_safety_margin: usize,
 }
 
@@ -146,10 +138,9 @@ impl Default for TaskbarConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TrayConfig {
-    #[serde(default = "default_tray_icon_size")]
     pub icon_size: i32,
-    #[serde(default = "default_tray_spacing")]
     pub spacing: i32,
 }
 
@@ -163,12 +154,10 @@ impl Default for TrayConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ModulesConfig {
-    #[serde(default = "default_module_order")]
     pub order: Vec<String>,
-    #[serde(default)]
     pub start: Option<Vec<String>>,
-    #[serde(default)]
     pub end: Option<Vec<String>>,
 }
 
@@ -195,12 +184,10 @@ impl ModulesConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct VolumeConfig {
-    #[serde(default = "default_step")]
     pub step: u32,
-    #[serde(default = "default_max_volume")]
     pub max_volume: u32,
-    #[serde(default = "default_volume_levels")]
     pub levels: HashMap<String, String>,
     pub levels_headphones: Option<HashMap<String, String>>,
     pub levels_bluetooth: Option<HashMap<String, String>>,
@@ -244,8 +231,8 @@ impl Default for VolumeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct BluetoothConfig {
-    #[serde(default = "default_bluetooth_modes")]
     pub modes: HashMap<String, String>,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -261,8 +248,8 @@ impl Default for BluetoothConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct NetworkConfig {
-    #[serde(default = "default_network_modes")]
     pub modes: HashMap<String, String>,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -278,8 +265,8 @@ impl Default for NetworkConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct MemoryConfig {
-    #[serde(default = "default_memory_format")]
     pub format: String,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -288,17 +275,16 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            format: default_memory_format(),
+            format: "󰍛\n%uG".to_string(),
             click: ClickActions::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct BrightnessConfig {
-    #[serde(default = "default_step")]
     pub step: u32,
-    #[serde(default = "default_brightness_levels")]
     pub levels: HashMap<String, String>,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -315,12 +301,10 @@ impl Default for BrightnessConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct BatteryConfig {
-    #[serde(default = "default_warning_threshold")]
     pub warning_threshold: u8,
-    #[serde(default = "default_critical_threshold")]
     pub critical_threshold: u8,
-    #[serde(default = "default_battery_levels")]
     pub levels: HashMap<String, String>,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -338,10 +322,9 @@ impl Default for BatteryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ClockConfig {
-    #[serde(default = "default_clock_vertical")]
     pub format_vertical: String,
-    #[serde(default = "default_clock_horizontal")]
     pub format_horizontal: String,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -350,16 +333,16 @@ pub struct ClockConfig {
 impl Default for ClockConfig {
     fn default() -> Self {
         Self {
-            format_vertical: default_clock_vertical(),
-            format_horizontal: default_clock_horizontal(),
+            format_vertical: "%H:%M\n%a\n%b\n%d/%m".to_string(),
+            format_horizontal: "%H:%M %a %b %d/%m".to_string(),
             click: ClickActions::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SpacerConfig {
-    #[serde(default = "default_spacer_size")]
     pub size: i32,
     #[serde(flatten)]
     pub click: ClickActions,
@@ -368,47 +351,34 @@ pub struct SpacerConfig {
 impl Default for SpacerConfig {
     fn default() -> Self {
         Self {
-            size: default_spacer_size(),
+            size: 5,
             click: ClickActions::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
-    #[serde(default)]
     pub position: BarPosition,
-    #[serde(default = "default_size")]
     pub size: i32,
-    #[serde(default)]
     pub spacing: i32,
-    #[serde(default)]
     pub taskbar: TaskbarConfig,
-    #[serde(default)]
     pub tray: TrayConfig,
-    #[serde(default)]
     pub modules: ModulesConfig,
-    #[serde(default)]
     pub volume: VolumeConfig,
-    #[serde(default)]
     pub bluetooth: BluetoothConfig,
-    #[serde(default)]
     pub network: NetworkConfig,
-    #[serde(default)]
     pub memory: MemoryConfig,
-    #[serde(default)]
     pub brightness: BrightnessConfig,
-    #[serde(default)]
     pub battery: BatteryConfig,
-    #[serde(default)]
     pub clock: ClockConfig,
-    #[serde(default)]
     pub spacer: SpacerConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        toml::from_str(DEFAULT_CONFIG_TOML).unwrap_or_else(|_| AppConfig {
+        Self {
             position: BarPosition::Left,
             size: 50,
             spacing: 0,
@@ -423,7 +393,7 @@ impl Default for AppConfig {
             battery: BatteryConfig::default(),
             clock: ClockConfig::default(),
             spacer: SpacerConfig::default(),
-        })
+        }
     }
 }
 
@@ -502,7 +472,7 @@ pub fn load_config_with_error_in(config_dir: &std::path::Path) -> (AppConfig, Op
 /// Parse a TOML string into an [`AppConfig`], returning an error message with line/details on failure.
 pub fn reload_config_from_str(content: &str) -> Result<AppConfig, String> {
     let table: toml::Table = toml::from_str(content).map_err(|e| format!("Syntax error in config.toml: {e}"))?;
-    Ok(parse_config_table(&table).validated())
+    Ok(parse_config_table(&table))
 }
 
 /// Read and parse the on-disk `config.toml`, returning `Ok(AppConfig)` or `Err(error_details)`.
@@ -640,7 +610,7 @@ impl AppConfig {
             crate::logger::emit("WARN", "config", "Invalid spacer.size, using 5");
             self.spacer.size = 5;
         }
-        if self.battery.warning_threshold <= self.battery.critical_threshold {
+        if self.battery.warning_threshold < self.battery.critical_threshold {
             crate::logger::emit(
                 "WARN",
                 "config",
@@ -653,107 +623,72 @@ impl AppConfig {
                 &mut self.battery.warning_threshold,
                 &mut self.battery.critical_threshold,
             );
+        } else if self.battery.warning_threshold == self.battery.critical_threshold {
+            crate::logger::emit(
+                "WARN",
+                "config",
+                &format!(
+                    "battery.warning_threshold ({}) equals critical; resetting to 30/15",
+                    self.battery.warning_threshold
+                ),
+            );
+            self.battery.warning_threshold = 30;
+            self.battery.critical_threshold = 15;
         }
         self
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-fn default_icon_size() -> i32 {
-    32
-}
-fn default_tray_icon_size() -> i32 {
-    22
-}
-fn default_tray_spacing() -> i32 {
-    4
-}
-fn default_size() -> i32 {
-    50
-}
-fn default_step() -> u32 {
-    10
-}
-fn default_max_volume() -> u32 {
-    150
-}
-fn default_memory_format() -> String {
-    "󰍛\n%uG".to_string()
-}
-fn default_warning_threshold() -> u8 {
-    30
-}
-fn default_critical_threshold() -> u8 {
-    15
-}
-fn default_clock_vertical() -> String {
-    "%H:%M\n%a\n%b\n%d/%m".to_string()
-}
-fn default_clock_horizontal() -> String {
-    "%H:%M %a %b %d/%m".to_string()
-}
-fn default_spacer_size() -> i32 {
-    5
-}
 fn default_module_order() -> Vec<String> {
-    vec![
-        "tray".into(),
-        "volume".into(),
-        "bluetooth".into(),
-        "network".into(),
-        "memory".into(),
-        "brightness".into(),
-        "battery".into(),
-        "clock".into(),
+    [
+        "tray",
+        "volume",
+        "bluetooth",
+        "network",
+        "memory",
+        "brightness",
+        "battery",
+        "clock",
     ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn str_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
 }
 
 fn default_volume_levels() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("0".into(), "\n%v%".into());
-    m.insert("1".into(), "\n%v%".into());
-    m.insert("100".into(), "\n%v%".into());
-    m.insert("muted".into(), "\nM".into());
-    m
+    str_map(&[("0", "\n%v%"), ("1", "\n%v%"), ("100", "\n%v%"), ("muted", "\nM")])
 }
 
 fn default_brightness_levels() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("0".into(), "󰃞\n%v%".into());
-    m.insert("33".into(), "󰃟\n%v%".into());
-    m.insert("66".into(), "󰃠\n%v%".into());
-    m.insert("100".into(), "󰃡\n%v%".into());
-    m
+    str_map(&[("0", "󰃞\n%v%"), ("33", "󰃟\n%v%"), ("66", "󰃠\n%v%"), ("100", "󰃡\n%v%")])
 }
 
 fn default_battery_levels() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("0".into(), "\n%v%".into());
-    m.insert("33".into(), "\n%v%".into());
-    m.insert("66".into(), "\n%v%".into());
-    m.insert("100".into(), "\n%v%".into());
-    m.insert("charging".into(), "\n%v%".into());
-    m.insert("full".into(), "\nFull".into());
-    m
+    str_map(&[
+        ("0", "\n%v%"),
+        ("33", "\n%v%"),
+        ("66", "\n%v%"),
+        ("100", "\n%v%"),
+        ("charging", "\n%v%"),
+        ("full", "\nFull"),
+    ])
 }
 
 fn default_network_modes() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("wifi".into(), "󰤨\nWiFi".into());
-    m.insert("lan".into(), "󰈀\nLAN".into());
-    m.insert("disconnected".into(), "󰤮\nOff".into());
-    m
+    str_map(&[("wifi", "󰤨\nWiFi"), ("lan", "󰈀\nLAN"), ("disconnected", "󰤮\nOff")])
 }
 
 fn default_bluetooth_modes() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("connected".into(), "󰂱\nOn".into());
-    m.insert("on".into(), "\nOn".into());
-    m.insert("off".into(), "󰂲\nOff".into());
-    m.insert("loading".into(), "󰂯\n...".into());
-    m
+    str_map(&[
+        ("connected", "󰂱\nOn"),
+        ("on", "\nOn"),
+        ("off", "󰂲\nOff"),
+        ("loading", "󰂯\n..."),
+    ])
 }
 
 #[cfg(test)]
@@ -1079,6 +1014,15 @@ mod tests {
         assert_eq!(v.taskbar.icon_size, 32);
         assert_eq!(v.tray.icon_size, 22);
         assert!(v.battery.warning_threshold > v.battery.critical_threshold);
+
+        let mut eq_cfg = AppConfig::default();
+        eq_cfg.battery.warning_threshold = 20;
+        eq_cfg.battery.critical_threshold = 20;
+        let eq_v = eq_cfg.validated();
+        assert!(
+            eq_v.battery.warning_threshold > eq_v.battery.critical_threshold,
+            "equal warning and critical thresholds must be corrected so warning > critical"
+        );
     }
 
     #[test]

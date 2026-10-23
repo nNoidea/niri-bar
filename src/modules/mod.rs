@@ -11,8 +11,8 @@ pub mod volume;
 use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Button, Label, Orientation};
-use std::process::Command;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::AppConfig;
@@ -25,49 +25,120 @@ use crate::modules::network::NetworkModule;
 use crate::modules::spacer::SpacerModule;
 use crate::modules::volume::VolumeModule;
 
-/// Cancellation and interruptible-sleep primitive for module workers.
+/// Async cancellation and interruptible-sleep primitive for module workers.
+///
+/// Tracks `(stopped, notified)` atomically paired with a `tokio::sync::Notify`
+/// so async workers can sleep until either a trigger notification (`notify()`)
+/// or shutdown (`stop()`) without needing a separate channel or OS thread.
 #[derive(Clone, Debug, Default)]
 struct StopSignal {
-    state: Arc<(Mutex<bool>, Condvar)>,
+    state: Arc<(AtomicBool, AtomicBool, tokio::sync::Notify)>,
 }
 
 impl StopSignal {
     fn new() -> Self {
         Self {
-            state: Arc::new((Mutex::new(false), Condvar::new())),
+            state: Arc::new((
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                tokio::sync::Notify::new(),
+            )),
         }
     }
 
     fn stop(&self) {
-        let (lock, cvar) = &*self.state;
-        if let Ok(mut stopped) = lock.lock() {
-            *stopped = true;
-        }
-        cvar.notify_all();
+        let (stopped, _, notify) = &*self.state;
+        stopped.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
+    }
+
+    fn notify(&self) {
+        let (_, notified, notify) = &*self.state;
+        notified.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
     }
 
     fn is_stopped(&self) -> bool {
-        let (lock, _) = &*self.state;
-        lock.lock().map(|s| *s).unwrap_or(true)
+        self.state.0.load(Ordering::SeqCst)
     }
 
-    /// Blocks up to `dur`, but returns immediately if `stop()` is called.
-    /// Returns `true` if stopped, `false` if timed out.
-    fn wait_timeout(&self, dur: Duration) -> bool {
-        let (lock, cvar) = &*self.state;
-        if let Ok(guard) = lock.lock() {
-            if *guard {
-                return true;
-            }
-            if let Ok((guard, _)) = cvar.wait_timeout(guard, dur) {
-                return *guard;
-            }
+    /// Awaits up to `dur`, returning early if `stop()` or `notify()` is called.
+    /// Returns `(stopped, notified)`.
+    async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
+        let (stopped, notified, notify) = &*self.state;
+        let notified_fut = notify.notified();
+        tokio::pin!(notified_fut);
+        notified_fut.as_mut().enable();
+
+        let is_stopped = stopped.load(Ordering::SeqCst);
+        let is_notified = notified.swap(false, Ordering::SeqCst);
+        if is_stopped || is_notified {
+            return (is_stopped, is_notified);
         }
-        true
+
+        let _ = tokio::time::timeout(dur, notified_fut).await;
+        let is_stopped = stopped.load(Ordering::SeqCst);
+        let is_notified = notified.swap(false, Ordering::SeqCst);
+        (is_stopped, is_notified)
+    }
+
+    async fn wait_timeout_async(&self, dur: Duration) -> bool {
+        self.wait_or_notified_async(dur).await.0
     }
 }
 
-type WakeupHook = Box<dyn Fn() + Send + Sync>;
+/// RAII guard for `gio::DBusConnection` signal subscriptions.
+///
+/// `gio::bus_get_sync` returns a process-global singleton connection, so dropping
+/// a `SignalSubscriptionId` without calling `signal_unsubscribe` leaks the closure
+/// forever. This guard unsubscribes automatically on both periodic renewal and
+/// worker thread exit.
+pub struct DbusSubscriptions(Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>);
+
+impl DbusSubscriptions {
+    pub fn new(subs: Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>) -> Self {
+        Self(subs)
+    }
+}
+
+impl Drop for DbusSubscriptions {
+    fn drop(&mut self) {
+        if let Some((conn, ids)) = self.0.take() {
+            for id in ids {
+                conn.signal_unsubscribe(id);
+            }
+        }
+    }
+}
+
+/// Fetch a single `org.freedesktop.DBus.Properties.Get` property variant with a 500ms timeout.
+pub fn dbus_get_variant(
+    conn: &gio::DBusConnection,
+    dest: &str,
+    path: &str,
+    interface: &str,
+    prop: &str,
+) -> Option<glib::Variant> {
+    let params = (interface, prop).to_variant();
+    let res = match conn.call_sync(
+        Some(dest),
+        path,
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        Some(&params),
+        None,
+        gio::DBusCallFlags::NONE,
+        500,
+        gio::Cancellable::NONE,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            log_debug!("dbus", "D-Bus Get failed {dest} {path} {interface}.{prop}: {e}");
+            return None;
+        }
+    };
+    res.child_value(0).as_variant()
+}
 
 /// Core subscription and lifecycle helper shared across modules.
 #[derive(Clone, Default)]
@@ -75,7 +146,6 @@ pub struct ModuleCore {
     subscribers: ModuleSubscribers,
     stop_signal: StopSignal,
     child: Arc<Mutex<Option<std::process::Child>>>,
-    wakeup_hooks: Arc<Mutex<Vec<WakeupHook>>>,
 }
 
 impl ModuleCore {
@@ -84,7 +154,6 @@ impl ModuleCore {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             stop_signal: StopSignal::new(),
             child: Arc::new(Mutex::new(None)),
-            wakeup_hooks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -94,13 +163,6 @@ impl ModuleCore {
 
     pub fn take_child(&self) -> Option<std::process::Child> {
         crate::util::lock(&self.child).take()
-    }
-
-    pub fn on_shutdown<F>(&self, hook: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        crate::util::lock(&self.wakeup_hooks).push(Box::new(hook));
     }
 
     pub fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
@@ -123,21 +185,22 @@ impl ModuleCore {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let hooks = {
-            let mut guard = crate::util::lock(&self.wakeup_hooks);
-            std::mem::take(&mut *guard)
-        };
-        for hook in hooks {
-            hook();
-        }
+    }
+
+    pub fn notify(&self) {
+        self.stop_signal.notify();
     }
 
     pub fn is_stopped(&self) -> bool {
         self.stop_signal.is_stopped()
     }
 
-    pub fn wait_timeout(&self, dur: Duration) -> bool {
-        self.stop_signal.wait_timeout(dur)
+    pub async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
+        self.stop_signal.wait_or_notified_async(dur).await
+    }
+
+    pub async fn wait_timeout_async(&self, dur: Duration) -> bool {
+        self.stop_signal.wait_timeout_async(dur).await
     }
 }
 
@@ -315,10 +378,10 @@ pub fn spawn_command(cmd: &str) {
     if trimmed.is_empty() {
         return;
     }
-    match Command::new("sh").args(["-c", trimmed]).spawn() {
-        Ok(mut child) => {
-            let cmd_owned = trimmed.to_string();
-            std::thread::spawn(move || match child.wait() {
+    let cmd_owned = trimmed.to_string();
+    crate::runtime::spawn(async move {
+        match tokio::process::Command::new("sh").args(["-c", &cmd_owned]).spawn() {
+            Ok(mut child) => match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     crate::logger::emit("WARN", "modules", &format!("command exited with {status}: {cmd_owned}"));
@@ -330,12 +393,16 @@ pub fn spawn_command(cmd: &str) {
                         &format!("failed waiting on command '{cmd_owned}': {e}"),
                     );
                 }
-            });
+            },
+            Err(e) => {
+                crate::logger::emit(
+                    "WARN",
+                    "modules",
+                    &format!("failed to spawn command '{cmd_owned}': {e}"),
+                );
+            }
         }
-        Err(e) => {
-            crate::logger::emit("WARN", "modules", &format!("failed to spawn command '{trimmed}': {e}"));
-        }
-    }
+    });
 }
 
 /// Spawn a fixed system binary with argv (no shell) in the background.
@@ -349,9 +416,12 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
     let program_resolved = resolve_helper(program);
     let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let display = format!("{program_resolved} {}", args_owned.join(" "));
-    match Command::new(&program_resolved).args(&args_owned).spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || match child.wait() {
+    crate::runtime::spawn(async move {
+        match tokio::process::Command::new(&program_resolved)
+            .args(&args_owned)
+            .spawn()
+        {
+            Ok(mut child) => match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     crate::logger::emit("WARN", &tag_owned, &format!("command exited with {status}: {display}"));
@@ -359,12 +429,12 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
                 Err(e) => {
                     crate::logger::emit("WARN", &tag_owned, &format!("failed waiting on '{display}': {e}"));
                 }
-            });
+            },
+            Err(e) => {
+                crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
+            }
         }
-        Err(e) => {
-            crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
-        }
-    }
+    });
 }
 
 pub fn enable_hover_cursor(button: &Button) {
@@ -612,48 +682,40 @@ mod tests {
 
     #[test]
     fn test_module_widget_apply_state_empty_hides_button() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let button = Button::new();
+            let label = Label::new(None);
+            button.add(&label);
 
-        let button = Button::new();
-        let label = Label::new(None);
-        button.add(&label);
+            let empty_state = ModuleState {
+                icon: None,
+                text: None,
+                tooltip: None,
+                css_classes: Vec::new(),
+            };
 
-        let empty_state = ModuleState {
-            icon: None,
-            text: None,
-            tooltip: None,
-            css_classes: Vec::new(),
-        };
+            // Non-spacer module with empty state should hide button and set no_show_all
+            ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
+            assert!(
+                button.is_no_show_all(),
+                "Empty module button must have no_show_all true"
+            );
+            assert!(!button.is_visible(), "Empty module button must be hidden");
 
-        // Non-spacer module with empty state should hide button and set no_show_all
-        ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
-        assert!(
-            button.is_no_show_all(),
-            "Empty module button must have no_show_all true"
-        );
-        assert!(!button.is_visible(), "Empty module button must be hidden");
-
-        // When populated with state, button should become visible and clear no_show_all
-        let populated_state = ModuleState {
-            icon: Some("󰃠".to_string()),
-            text: Some("50%".to_string()),
-            tooltip: None,
-            css_classes: Vec::new(),
-        };
-        ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
-        assert!(
-            !button.is_no_show_all(),
-            "Populated module button must not have no_show_all"
-        );
-        assert!(button.is_visible(), "Populated module button must be visible");
+            // When populated with state, button should become visible and clear no_show_all
+            let populated_state = ModuleState {
+                icon: Some("󰃠".to_string()),
+                text: Some("50%".to_string()),
+                tooltip: None,
+                css_classes: Vec::new(),
+            };
+            ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
+            assert!(
+                !button.is_no_show_all(),
+                "Populated module button must not have no_show_all"
+            );
+            assert!(button.is_visible(), "Populated module button must be visible");
+        });
     }
 
     #[test]
@@ -718,9 +780,9 @@ mod tests {
 
         let stop_clone = stop.clone();
         let start = std::time::Instant::now();
-        let handle = std::thread::spawn(move || {
+        let handle = crate::runtime::spawn(async move {
             // Sleep for 60 seconds unless stopped
-            stop_clone.wait_timeout(Duration::from_secs(60))
+            stop_clone.wait_timeout_async(Duration::from_secs(60)).await
         });
 
         // Trigger stop after a short delay
@@ -728,12 +790,80 @@ mod tests {
         stop.stop();
         assert!(stop.is_stopped());
 
-        let stopped = handle.join().expect("thread must join cleanly");
-        assert!(stopped, "wait_timeout must return true when stopped");
+        let stopped = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(stopped, "wait_timeout_async must return true when stopped");
         assert!(
             start.elapsed() < Duration::from_secs(2),
-            "wait_timeout must wake up immediately on stop, elapsed: {:?}",
+            "wait_timeout_async must wake up immediately on stop, elapsed: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_module_core_notify_wakes_wait_immediately() {
+        let core = ModuleCore::new();
+        let core_clone = core.clone();
+        let start = std::time::Instant::now();
+        let handle =
+            crate::runtime::spawn(async move { core_clone.wait_or_notified_async(Duration::from_secs(60)).await });
+
+        std::thread::sleep(Duration::from_millis(20));
+        core.notify();
+
+        let (stopped, notified) = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(!stopped, "notify must not mark core as stopped");
+        assert!(notified, "wait_or_notified_async must report notified=true");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_stop_signal_and_notify_async_wake() {
+        let core = ModuleCore::new();
+        let core_clone = core.clone();
+        let start = std::time::Instant::now();
+        let handle =
+            crate::runtime::spawn(async move { core_clone.wait_or_notified_async(Duration::from_secs(60)).await });
+
+        std::thread::sleep(Duration::from_millis(20));
+        core.notify();
+
+        let (stopped, notified) = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(!stopped);
+        assert!(notified);
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let core_clone2 = core.clone();
+        let handle2 =
+            crate::runtime::spawn(async move { core_clone2.wait_timeout_async(Duration::from_secs(60)).await });
+        std::thread::sleep(Duration::from_millis(20));
+        core.shutdown();
+
+        let stopped2 = crate::runtime::handle().block_on(handle2).expect("task must complete");
+        assert!(stopped2);
+    }
+
+    #[test]
+    fn test_shared_modules_all_run_on_tokio_without_os_thread_explosion() {
+        let cfg = AppConfig::default();
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        // Warmup one cycle
+        let warm = SharedModules::new(&cfg);
+        std::thread::sleep(Duration::from_millis(30));
+        warm.shutdown();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let before = crate::runtime::min_thread_count();
+        // Hold 5 live SharedModules instances concurrently (35 active module workers)
+        let active: Vec<SharedModules> = (0..5).map(|_| SharedModules::new(&cfg)).collect();
+        let during = crate::runtime::min_thread_count();
+        for s in &active {
+            s.shutdown();
+        }
+        // 35 module workers on thread::spawn would add >= 20 OS threads; on Tokio tasks it adds a handful at most.
+        assert!(
+            during <= before + 4,
+            "35 active module workers should run as Tokio tasks, not OS threads (before: {before}, during: {during})"
         );
     }
 
@@ -779,7 +909,7 @@ mod tests {
 
         core.shutdown();
         assert!(core.is_stopped());
-        assert!(core.wait_timeout(Duration::from_millis(50)));
+        assert!(crate::runtime::handle().block_on(core.wait_timeout_async(Duration::from_millis(50))));
     }
 
     #[test]
@@ -795,6 +925,7 @@ mod tests {
         assert_eq!(shared.get("clock").unwrap().name(), "clock");
         assert_eq!(shared.get("spacer").unwrap().name(), "spacer");
         assert!(shared.get("nonexistent").is_none());
+        shared.shutdown();
     }
 
     #[test]
@@ -815,7 +946,8 @@ mod tests {
             (threads, vmrss_kb)
         };
 
-        // Warmup: run 5 cycles so initial runtime buffers / glib allocate once
+        // Warmup: ensure GTK test thread + initial runtime buffers / glib allocate once
+        crate::util::run_gtk_test(|| {});
         for _ in 0..5 {
             let s = SharedModules::new(&cfg);
             s.shutdown();

@@ -1,11 +1,13 @@
-//! System tray (StatusNotifierItem): D-Bus watcher/service, pure protocol
-//! parsing, and GTK widgets. Split from a single 2082-line file with no
-//! behavior change. Only the service/widget entry points are re-exported;
-//! internal items live in their submodules (`types`, `protocol`).
+//! System tray (StatusNotifierItem): D-Bus watcher/service, proactive discovery,
+//! per-item client/menu tracking, pure protocol parsing, and GTK widgets.
+//! Only the service/widget entry points are re-exported.
 
+mod discovery;
+mod item_client;
 mod protocol;
 mod service;
 mod types;
+mod watcher;
 mod widget;
 
 pub use service::TrayService;

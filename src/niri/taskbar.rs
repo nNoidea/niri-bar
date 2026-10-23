@@ -517,7 +517,8 @@ impl TaskbarWidget {
 
                 // Icon image
                 if *widget.icon_key.borrow() != icon_key || widget.icon_scale != scale_factor {
-                    let img = crate::icon::create_app_image(&icon_key, config.icon_size, scale_factor);
+                    let img =
+                        crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
                     widget.button.set_image(Some(&img));
                     (*widget.icon_key.borrow_mut()).clone_from(&icon_key);
                     widget.icon_scale = scale_factor;
@@ -586,7 +587,7 @@ impl TaskbarWidget {
                     button.style_context().add_class("cross-monitor-preview");
                 }
 
-                let img = crate::icon::create_app_image(&icon_key, config.icon_size, scale_factor);
+                let img = crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
                 button.set_image(Some(&img));
                 button.set_always_show_image(true);
 
@@ -835,6 +836,7 @@ mod tests {
                 id: 1,
                 title: Some("Col 2 Tile 0".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -845,6 +847,7 @@ mod tests {
                 id: 2,
                 title: Some("Col 0 Tile 1".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -855,6 +858,7 @@ mod tests {
                 id: 3,
                 title: Some("Col 0 Tile 0".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -865,6 +869,7 @@ mod tests {
                 id: 4,
                 title: Some("Col 1 Tile 0".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -912,6 +917,7 @@ mod tests {
                 id: 10,
                 title: Some("eDP-1 active ws".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: true,
                 layout: None,
@@ -920,6 +926,7 @@ mod tests {
                 id: 20,
                 title: Some("eDP-1 inactive ws".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(2),
                 is_focused: false,
                 layout: None,
@@ -928,6 +935,7 @@ mod tests {
                 id: 30,
                 title: Some("DP-1 active ws".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(3),
                 is_focused: false,
                 layout: None,
@@ -975,6 +983,7 @@ mod tests {
                 id: 10,
                 title: Some("WS 2 Col 0".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(2),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -986,6 +995,7 @@ mod tests {
                 id: 20,
                 title: Some("WS 1 Col 1".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -997,6 +1007,7 @@ mod tests {
                 id: 30,
                 title: Some("WS 1 Col 0".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(1),
                 is_focused: true,
                 layout: Some(WindowLayout {
@@ -1008,6 +1019,7 @@ mod tests {
                 id: 40,
                 title: Some("WS 2 Col 1".to_string()),
                 app_id: None,
+                pid: None,
                 workspace_id: Some(2),
                 is_focused: false,
                 layout: Some(WindowLayout {
@@ -1038,6 +1050,7 @@ mod tests {
             id: 10,
             title: Some("win".to_string()),
             app_id: None,
+            pid: None,
             workspace_id: Some(1),
             is_focused: true,
             layout: None,

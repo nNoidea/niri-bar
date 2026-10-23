@@ -54,7 +54,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config
+          sudo apt-get install -y libgtk-3-dev libgtk-layer-shell-dev pkg-config xvfb
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,9 +71,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Unit tests
-        run: cargo test --all-targets --locked -- --test-threads=1
-        env:
-          GDK_BACKEND: memory
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" cargo test --all-targets --locked -- --test-threads=1
 
   build:
     name: build

@@ -14,7 +14,7 @@ uninstall:
 test:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features --locked -- -D warnings
-	GDK_BACKEND=memory cargo test --all-targets --all-features --locked -- --test-threads=1
+	cargo test --all-targets --all-features --locked
 boxtest:
 	./scripts/boxtest.sh
 

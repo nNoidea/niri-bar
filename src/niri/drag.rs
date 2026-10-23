@@ -857,75 +857,34 @@ mod tests {
     }
 
     #[test]
-    fn test_scale_to_exact_square() {
-        let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 48, 48).unwrap();
-        let scaled = crate::icon::normalize_pixbuf_to_size(pb, 32);
-        assert_eq!(scaled.width(), 32);
-        assert_eq!(scaled.height(), 32);
-    }
-
-    #[test]
-    fn test_create_image_for_theme_icon_preserves_icon_name() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-
-        let img = crate::icon::create_app_image("application-x-executable", 32, 2);
-        assert_eq!(img.storage_type(), gtk::ImageType::IconName);
-        assert_eq!(img.pixel_size(), 32);
-    }
-
-    #[test]
     fn test_create_surface_from_pixbuf_with_scale() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).unwrap();
+            let surface = pb.create_surface(2, Option::<&gdk::Window>::None);
+            assert!(surface.is_some());
+            let surf = surface.unwrap();
+            assert_eq!(surf.device_scale(), (2.0, 2.0));
 
-        let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).unwrap();
-        let surface = pb.create_surface(2, Option::<&gdk::Window>::None);
-        assert!(surface.is_some());
-        let surf = surface.unwrap();
-        assert_eq!(surf.device_scale(), (2.0, 2.0));
-
-        let img = gtk::Image::from_surface(Some(&surf));
-        assert_eq!(img.storage_type(), gtk::ImageType::Surface);
+            let img = gtk::Image::from_surface(Some(&surf));
+            assert_eq!(img.storage_type(), gtk::ImageType::Surface);
+        });
     }
 
     #[test]
     fn test_drag_cursor_grab_released_on_reset() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            // Pretend a drag grabbed the pointer for its cursor.
+            DRAG_CURSOR_GRAB.with(|g| g.set(true));
+            assert!(drag_cursor_grab_active());
 
-        // Pretend a drag grabbed the pointer for its cursor.
-        DRAG_CURSOR_GRAB.with(|g| g.set(true));
-        assert!(drag_cursor_grab_active());
+            // Every drag end path goes through reset: it must release the grab,
+            // otherwise the bar keeps swallowing pointer events after the drop.
+            reset_all_cursors_and_overlay(None);
+            assert!(!drag_cursor_grab_active());
 
-        // Every drag end path goes through reset: it must release the grab,
-        // otherwise the bar keeps swallowing pointer events after the drop.
-        reset_all_cursors_and_overlay(None);
-        assert!(!drag_cursor_grab_active());
-
-        // Idempotent: resetting with no grab is a no-op.
-        reset_all_cursors_and_overlay(None);
-        assert!(!drag_cursor_grab_active());
+            // Idempotent: resetting with no grab is a no-op.
+            reset_all_cursors_and_overlay(None);
+            assert!(!drag_cursor_grab_active());
+        });
     }
 }

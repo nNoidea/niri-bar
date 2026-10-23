@@ -1,6 +1,5 @@
 use chrono::{Local, Timelike};
 use gtk::Orientation;
-use std::thread;
 use std::time::Duration;
 
 use crate::config::ClockConfig;
@@ -28,7 +27,7 @@ impl ClockModule {
         let fmt_horiz = config.format_horizontal.clone();
         let has_seconds = needs_per_second_tick(&fmt_vert, &fmt_horiz);
 
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             let mut last_tick = 999;
 
             loop {
@@ -60,7 +59,10 @@ impl ClockModule {
                     });
                 }
 
-                if core_worker.wait_timeout(Duration::from_millis(if has_seconds { 250 } else { 1000 })) {
+                if core_worker
+                    .wait_timeout_async(Duration::from_millis(if has_seconds { 250 } else { 1000 }))
+                    .await
+                {
                     break;
                 }
             }
@@ -152,5 +154,21 @@ mod tests {
         assert!(needs_per_second_tick("%c", "%H:%M"));
         assert!(needs_per_second_tick("%H:%M", "%+"));
         assert!(needs_per_second_tick("%r", "%X"));
+    }
+
+    #[test]
+    fn test_clock_runs_on_tokio_without_new_os_threads() {
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        let before = crate::runtime::min_thread_count();
+        let modules: Vec<_> = (0..10).map(|_| ClockModule::new(ClockConfig::default())).collect();
+        let during = crate::runtime::min_thread_count();
+        for m in &modules {
+            m.shutdown();
+        }
+        assert!(
+            during <= before + 4,
+            "ClockModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
+        );
     }
 }
