@@ -42,9 +42,58 @@ fn get_data_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Extracts `(icon, startup_wm_class, name)` from the `[Desktop Entry]` group
+/// without allocating maps for localized `Name[xx]`/`Comment[xx]` keys or actions.
+pub fn parse_desktop_entry_fields(content: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let mut in_desktop_entry = false;
+    let mut icon: Option<String> = None;
+    let mut wm_class: Option<String> = None;
+    let mut name: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if in_desktop_entry {
+                break;
+            }
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("Icon=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && icon.is_none() {
+                icon = Some(trimmed.to_string());
+            }
+        } else if let Some(val) = line.strip_prefix("StartupWMClass=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && wm_class.is_none() {
+                wm_class = Some(trimmed.to_string());
+            }
+        } else if let Some(val) = line.strip_prefix("Name=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && name.is_none() {
+                name = Some(trimmed.to_string());
+            }
+        }
+        if icon.is_some() && wm_class.is_some() && name.is_some() {
+            break;
+        }
+    }
+
+    icon.map(|ic| (ic, wm_class, name))
+}
+
 fn load_desktop_entries() -> HashMap<String, String> {
+    use std::io::Read;
     let mut map = HashMap::new();
     let data_dirs = get_data_dirs();
+    let mut buf = String::with_capacity(16 * 1024);
 
     for data_dir in data_dirs {
         let app_dir = data_dir.join("applications");
@@ -56,19 +105,19 @@ fn load_desktop_entries() -> HashMap<String, String> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("desktop") {
-                    if let Ok(entry_parsed) = freedesktop_desktop_entry::DesktopEntry::from_path(&path, None::<&[&str]>)
-                    {
-                        if let Some(icon) = entry_parsed.icon() {
-                            let icon_str = icon.to_string();
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                map.entry(stem.to_lowercase()).or_insert_with(|| icon_str.clone());
-                            }
-                            if let Some(startup_wm_class) = entry_parsed.startup_wm_class() {
-                                map.entry(startup_wm_class.to_lowercase())
-                                    .or_insert_with(|| icon_str.clone());
-                            }
-                            if let Some(name) = entry_parsed.name::<&str>(&[]) {
-                                map.entry(name.to_lowercase()).or_insert_with(|| icon_str.clone());
+                    buf.clear();
+                    if let Ok(mut file) = fs::File::open(&path) {
+                        if file.read_to_string(&mut buf).is_ok() {
+                            if let Some((icon_str, startup_wm_class, name)) = parse_desktop_entry_fields(&buf) {
+                                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                    map.entry(stem.to_lowercase()).or_insert_with(|| icon_str.clone());
+                                }
+                                if let Some(wm_class) = startup_wm_class {
+                                    map.entry(wm_class.to_lowercase()).or_insert_with(|| icon_str.clone());
+                                }
+                                if let Some(app_name) = name {
+                                    map.entry(app_name.to_lowercase()).or_insert(icon_str);
+                                }
                             }
                         }
                     }
@@ -127,7 +176,7 @@ pub fn find_app_icon(app_id: &str) -> Option<String> {
 
 /// Preload desktop entries off the GTK thread at startup.
 pub fn preload_desktop_entries_async() {
-    std::thread::spawn(|| {
+    crate::runtime::spawn(async {
         let mut entries_lock = crate::util::lock(desktop_entries());
         entries_lock.get_or_insert_with(load_desktop_entries);
     });
@@ -763,5 +812,26 @@ mod tests {
     fn test_resolve_icon_path_or_name() {
         let named = resolve_icon_path_or_name("utilities-terminal");
         assert_eq!(named, Some("utilities-terminal".to_string()));
+    }
+
+    #[test]
+    fn test_parse_desktop_entry_fields() {
+        let sample = "\
+# Comment
+[Desktop Entry]
+Name=Firefox Web Browser
+Name[de]=Firefox Webbrowser
+StartupWMClass=firefox-aurora
+Icon=firefox
+Exec=firefox %u
+
+[Desktop Action new-window]
+Name=New Window
+Icon=list-add
+";
+        let (icon, wm_class, name) = parse_desktop_entry_fields(sample).expect("must parse Desktop Entry");
+        assert_eq!(icon, "firefox");
+        assert_eq!(wm_class.as_deref(), Some("firefox-aurora"));
+        assert_eq!(name.as_deref(), Some("Firefox Web Browser"));
     }
 }

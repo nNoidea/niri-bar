@@ -29,11 +29,15 @@ pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap
     const MAX_DIM: i32 = 512;
     const MAX_PIXELS: u64 = 512 * 512;
     const MAX_PIXMAPS: usize = 8;
+    const MAX_STORED_DIM: i32 = 64;
+
     let arr = match val {
         zvariant::Value::Array(a) => a,
+        zvariant::Value::Value(inner) => return parse_icon_pixmap(inner),
         _ => return None,
     };
-    let mut pixmaps = Vec::new();
+
+    let mut best: Option<(i32, i32, &zvariant::Array<'_>)> = None;
     for elem in arr.iter().take(MAX_PIXMAPS + 1) {
         let structure = match elem {
             zvariant::Value::Structure(s) => s,
@@ -65,44 +69,177 @@ pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap
             Some(n) if n <= MAX_PIXELS * 4 && n <= (isize::MAX as u64) => n as usize,
             _ => continue,
         };
-        let pixels: Vec<u8> = match &fields[2] {
-            zvariant::Value::Array(data_arr) => {
-                if data_arr.len() != expected {
-                    continue;
-                }
-                let mut bytes = Vec::with_capacity(expected);
-                for b in data_arr.iter() {
-                    if let zvariant::Value::U8(byte) = b {
-                        bytes.push(*byte);
-                    } else {
-                        break;
-                    }
-                }
-                if bytes.len() != expected {
-                    continue;
-                }
-                bytes
-            }
+        let data_arr = match &fields[2] {
+            zvariant::Value::Array(a) if a.len() == expected => a,
             _ => continue,
         };
-        if !pixels.is_empty() {
-            pixmaps.push(TrayIconPixmap {
-                width: w,
-                height: h,
-                pixels,
-            });
-        }
-        if pixmaps.len() >= MAX_PIXMAPS {
-            break;
+        let area = (w as u64) * (h as u64);
+        if best
+            .as_ref()
+            .is_none_or(|(bw, bh, _)| area >= (*bw as u64) * (*bh as u64))
+        {
+            best = Some((w, h, data_arr));
         }
     }
-    // Prefer largest area within caps (not just width).
-    pixmaps.sort_by_key(|p| (p.width as u64) * (p.height as u64));
-    if pixmaps.is_empty() {
+
+    let (w, h, data_arr) = best?;
+    let (dst_w, dst_h) = scaled_pixmap_dims(w, h, MAX_STORED_DIM);
+
+    let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
+    let mut pixels = Vec::with_capacity(dst_len);
+
+    if dst_w == w && dst_h == h {
+        for b in data_arr.iter() {
+            if let zvariant::Value::U8(byte) = b {
+                pixels.push(*byte);
+            } else {
+                return None;
+            }
+        }
+    } else {
+        for dy in 0..dst_h {
+            let sy = ((dy as i64 * h as i64) / dst_h as i64) as usize;
+            for dx in 0..dst_w {
+                let sx = ((dx as i64 * w as i64) / dst_w as i64) as usize;
+                let base = (sy * (w as usize) + sx) * 4;
+                for c in 0..4 {
+                    if let Ok(Some(byte)) = data_arr.get::<u8>(base + c) {
+                        pixels.push(byte);
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    if pixels.len() != dst_len || pixels.is_empty() {
         None
     } else {
-        Some(pixmaps)
+        Some(vec![TrayIconPixmap {
+            width: dst_w,
+            height: dst_h,
+            pixels,
+        }])
     }
+}
+
+fn scaled_pixmap_dims(w: i32, h: i32, max_dim: i32) -> (i32, i32) {
+    if w > max_dim || h > max_dim {
+        if w >= h {
+            let dh = ((h as i64 * max_dim as i64) / w as i64).max(1) as i32;
+            (max_dim, dh)
+        } else {
+            let dw = ((w as i64 * max_dim as i64) / h as i64).max(1) as i32;
+            (dw, max_dim)
+        }
+    } else {
+        (w, h)
+    }
+}
+
+/// Zero-copy D-Bus 1.0 wire parser for `Properties.Get(iface, "IconPixmap")`
+/// reply bodies (signature `v` wrapping `a(iiay)`).
+///
+/// Deserializing `a(iiay)` via `zvariant::OwnedValue` unpacks every pixel byte
+/// into a 24-byte `zvariant::Value::U8` enum (~25 MB of heap for a 512x512 icon).
+/// Reading the raw D-Bus body slice directly avoids any intermediate allocation
+/// and downsamples straight into a `<= 64x64` (`<= 16 KB`) buffer.
+pub fn parse_icon_pixmap_dbus_body(data: &[u8], is_le: bool) -> Option<Vec<TrayIconPixmap>> {
+    const MAX_DIM: i32 = 512;
+    const MAX_PIXELS: usize = 512 * 512;
+    const MAX_PIXMAPS: usize = 8;
+    const MAX_STORED_DIM: i32 = 64;
+
+    let read_u32 = |slice: &[u8]| -> u32 {
+        let arr: [u8; 4] = [slice[0], slice[1], slice[2], slice[3]];
+        if is_le {
+            u32::from_le_bytes(arr)
+        } else {
+            u32::from_be_bytes(arr)
+        }
+    };
+    let read_i32 = |slice: &[u8]| -> i32 { read_u32(slice) as i32 };
+
+    // 1. Variant signature `g`: 1-byte length + ASCII signature + NUL
+    let sig_len = *data.first()? as usize;
+    let sig_end = 1usize.checked_add(sig_len)?;
+    if data.len() <= sig_end || data.get(1..sig_end)? != b"a(iiay)" || data[sig_end] != 0 {
+        return None;
+    }
+    let mut pos = sig_end + 1;
+
+    // 2. Array byte length (4-byte aligned)
+    pos = (pos + 3) & !3;
+    let arr_byte_len = read_u32(data.get(pos..pos + 4)?) as usize;
+    pos += 4;
+
+    // 3. Struct elements `(iiay)` are 8-byte aligned in D-Bus 1.0
+    pos = (pos + 7) & !7;
+    let arr_end = pos.checked_add(arr_byte_len)?;
+    if arr_end > data.len() {
+        return None;
+    }
+
+    let mut best: Option<(i32, i32, &[u8])> = None;
+    let mut count = 0usize;
+    while pos < arr_end && count < MAX_PIXMAPS {
+        pos = (pos + 7) & !7;
+        if pos >= arr_end {
+            break;
+        }
+        let w = read_i32(data.get(pos..pos + 4)?);
+        let h = read_i32(data.get(pos + 4..pos + 8)?);
+        let pix_len = read_u32(data.get(pos + 8..pos + 12)?) as usize;
+        pos += 12;
+
+        let pix_end = pos.checked_add(pix_len)?;
+        if pix_end > arr_end {
+            return None;
+        }
+        let pix_slice = &data[pos..pix_end];
+        pos = pix_end;
+        count += 1;
+
+        if w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM {
+            continue;
+        }
+        let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+        if expected > MAX_PIXELS * 4 || pix_len != expected {
+            continue;
+        }
+        let area = (w as u64) * (h as u64);
+        if best
+            .as_ref()
+            .is_none_or(|(bw, bh, _)| area >= (*bw as u64) * (*bh as u64))
+        {
+            best = Some((w, h, pix_slice));
+        }
+    }
+
+    let (w, h, src) = best?;
+    let (dst_w, dst_h) = scaled_pixmap_dims(w, h, MAX_STORED_DIM);
+    let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
+    let mut pixels = Vec::with_capacity(dst_len);
+
+    if dst_w == w && dst_h == h {
+        pixels.extend_from_slice(src);
+    } else {
+        for dy in 0..dst_h {
+            let sy = ((dy as i64 * h as i64) / dst_h as i64) as usize;
+            for dx in 0..dst_w {
+                let sx = ((dx as i64 * w as i64) / dst_w as i64) as usize;
+                let base = (sy * (w as usize) + sx) * 4;
+                pixels.extend_from_slice(src.get(base..base + 4)?);
+            }
+        }
+    }
+
+    Some(vec![TrayIconPixmap {
+        width: dst_w,
+        height: dst_h,
+        pixels,
+    }])
 }
 
 pub fn parse_tooltip(props: &HashMap<String, zvariant::OwnedValue>) -> Option<TrayTooltip> {
@@ -522,5 +659,25 @@ mod tests {
             zvariant::Value::from(vec![0u8; 4]),
         )))]);
         assert!(parse_icon_pixmap(&short).is_none());
+    }
+
+    #[test]
+    fn test_pixmap_downsamples_oversized_and_keeps_single_best() {
+        let val = zvariant::Value::from(vec![
+            (16i32, 16i32, vec![0xAAu8; 16 * 16 * 4]),
+            (512i32, 512i32, vec![0xFFu8; 512 * 512 * 4]),
+        ]);
+        let parsed = parse_icon_pixmap(&val).expect("Should parse valid pixmaps");
+        assert_eq!(parsed.len(), 1, "Should keep only the single best pixmap");
+        assert_eq!(parsed[0].width, 64);
+        assert_eq!(parsed[0].height, 64);
+        assert_eq!(parsed[0].pixels.len(), 64 * 64 * 4);
+        assert!(parsed[0].pixels.iter().all(|&b| b == 0xFF));
+
+        // Verify zero-copy D-Bus wire body parser produces the exact same output
+        let ctxt = zvariant::serialized::Context::new_dbus(zvariant::LE, 0);
+        let bytes = zvariant::to_bytes(ctxt, &val).unwrap();
+        let wire_parsed = parse_icon_pixmap_dbus_body(&bytes, true).expect("Should parse D-Bus wire body");
+        assert_eq!(wire_parsed, parsed);
     }
 }

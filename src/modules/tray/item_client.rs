@@ -184,79 +184,113 @@ pub(super) async fn handle_activate_request(conn: &Connection, req: ActivateRequ
     }
 }
 
-async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> TrayItem {
-    let mut props_map: HashMap<String, zvariant::OwnedValue> = HashMap::new();
-
-    // 1. Try GetAll on org.kde.StatusNotifierItem
-    let get_all_res = conn
+async fn get_sni_prop(
+    conn: &Connection,
+    bus: &str,
+    path: &str,
+    iface: &str,
+    prop: &str,
+) -> Option<zvariant::OwnedValue> {
+    let msg = conn
         .call_method(
             Some(bus),
             path,
             Some("org.freedesktop.DBus.Properties"),
-            "GetAll",
-            &("org.kde.StatusNotifierItem",),
+            "Get",
+            &(iface, prop),
         )
-        .await;
+        .await
+        .ok()?;
+    msg.body().deserialize::<zvariant::OwnedValue>().ok()
+}
 
-    if let Ok(msg) = get_all_res {
-        if let Ok(map) = msg.body().deserialize::<HashMap<String, zvariant::OwnedValue>>() {
-            props_map = map;
-        }
-    }
+async fn fetch_sni_icon_pixmap(
+    conn: &Connection,
+    bus: &str,
+    path: &str,
+    iface: &str,
+) -> Option<Vec<super::types::TrayIconPixmap>> {
+    let msg = conn
+        .call_method(
+            Some(bus),
+            path,
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &(iface, "IconPixmap"),
+        )
+        .await
+        .ok()?;
+    let is_le = zvariant::Endian::from(msg.primary_header().endian_sig()) == zvariant::Endian::Little;
+    let body = msg.body();
+    let raw_bytes: &[u8] = body.data();
+    super::protocol::parse_icon_pixmap_dbus_body(raw_bytes, is_le).or_else(|| {
+        body.deserialize::<zvariant::OwnedValue>()
+            .ok()
+            .and_then(|v| parse_icon_pixmap(v.deref()))
+    })
+}
 
-    // 2. If empty, try GetAll on org.freedesktop.StatusNotifierItem
-    if props_map.is_empty() {
-        if let Ok(msg) = conn
-            .call_method(
-                Some(bus),
-                path,
-                Some("org.freedesktop.DBus.Properties"),
-                "GetAll",
-                &("org.freedesktop.StatusNotifierItem",),
-            )
-            .await
-        {
-            if let Ok(map) = msg.body().deserialize::<HashMap<String, zvariant::OwnedValue>>() {
-                props_map = map;
-            }
-        }
-    }
+async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> TrayItem {
+    let kde_iface = "org.kde.StatusNotifierItem";
+    let fdo_iface = "org.freedesktop.StatusNotifierItem";
 
-    // Tolerant field extraction:
-    let id = props_map
-        .get("Id")
+    let (iface, id_val) = match get_sni_prop(conn, bus, path, kde_iface, "Id").await {
+        Some(v) => (kde_iface, Some(v)),
+        None => match get_sni_prop(conn, bus, path, fdo_iface, "Id").await {
+            Some(v) => (fdo_iface, Some(v)),
+            None => (kde_iface, None),
+        },
+    };
+
+    let (title_val, icon_name_val, theme_val, tooltip_val, is_menu_val, menu_val) = tokio::join!(
+        get_sni_prop(conn, bus, path, iface, "Title"),
+        get_sni_prop(conn, bus, path, iface, "IconName"),
+        get_sni_prop(conn, bus, path, iface, "IconThemePath"),
+        get_sni_prop(conn, bus, path, iface, "ToolTip"),
+        get_sni_prop(conn, bus, path, iface, "ItemIsMenu"),
+        get_sni_prop(conn, bus, path, iface, "Menu"),
+    );
+
+    let id = id_val
+        .as_ref()
         .and_then(|v| match v.deref() {
             zvariant::Value::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .unwrap_or_else(|| bus.to_string());
 
-    let title = props_map.get("Title").and_then(|v| match v.deref() {
+    let title = title_val.as_ref().and_then(|v| match v.deref() {
         zvariant::Value::Str(s) => Some(s.as_str().to_string()),
         _ => None,
     });
 
-    let icon_name = props_map
-        .get("IconName")
+    let icon_name = icon_name_val
+        .as_ref()
         .and_then(|v| match v.deref() {
             zvariant::Value::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .filter(|s| !s.trim().is_empty());
 
-    let icon_theme_path = props_map
-        .get("IconThemePath")
+    let icon_theme_path = theme_val
+        .as_ref()
         .and_then(|v| match v.deref() {
             zvariant::Value::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .filter(|s| !s.trim().is_empty());
 
-    let icon_pixmap = props_map.get("IconPixmap").and_then(|v| parse_icon_pixmap(v.deref()));
+    // Only fetch and parse IconPixmap when no usable IconName is provided, or as fallback
+    let icon_pixmap = fetch_sni_icon_pixmap(conn, bus, path, iface).await;
+
+    let mut props_map = HashMap::new();
+    if let Some(tt) = tooltip_val {
+        props_map.insert("ToolTip".to_string(), tt);
+    }
     let tool_tip = parse_tooltip(&props_map);
 
-    let item_is_menu = props_map
-        .get("ItemIsMenu")
+    let item_is_menu = is_menu_val
+        .as_ref()
         .and_then(|v| match v.deref() {
             zvariant::Value::Bool(b) => Some(*b),
             zvariant::Value::I32(i) => Some(*i != 0),
@@ -265,8 +299,8 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
         })
         .unwrap_or(false);
 
-    let menu_path = props_map
-        .get("Menu")
+    let menu_path = menu_val
+        .as_ref()
         .and_then(|v| match v.deref() {
             zvariant::Value::ObjectPath(p) => Some(p.as_str().to_string()),
             zvariant::Value::Str(s) => Some(s.as_str().to_string()),
@@ -371,29 +405,36 @@ pub(super) async fn process_and_track_item(
 
     TrayService::broadcast(&subs_map, TrayEvent::Add(key.clone(), Box::new(item.clone())));
 
+    async fn build_signal_proxy(
+        conn: &Connection,
+        bus: &str,
+        path: &str,
+        iface: &'static str,
+    ) -> Option<zbus::proxy::Proxy<'static>> {
+        zbus::proxy::Builder::new(conn)
+            .destination(bus.to_string())
+            .ok()?
+            .path(path.to_string())
+            .ok()?
+            .interface(iface)
+            .ok()?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .ok()
+    }
+
     // Create Proxy signal listeners for PropertiesChanged & SNI signals
-    let sni_proxy = zbus::proxy::Proxy::new(
-        &conn,
-        bus_name.as_str(),
-        object_path.as_str(),
-        "org.kde.StatusNotifierItem",
-    )
-    .await
-    .ok();
+    // without property caching (CacheProperties::Yes would call GetAll and
+    // hold multi-megabyte IconPixmap payloads in memory forever).
+    let sni_proxy = build_signal_proxy(&conn, &bus_name, &object_path, "org.kde.StatusNotifierItem").await;
     let mut stream_sni = if let Some(ref p) = sni_proxy {
         p.receive_all_signals().await.ok()
     } else {
         None
     };
 
-    let props_proxy = zbus::proxy::Proxy::new(
-        &conn,
-        bus_name.as_str(),
-        object_path.as_str(),
-        "org.freedesktop.DBus.Properties",
-    )
-    .await
-    .ok();
+    let props_proxy = build_signal_proxy(&conn, &bus_name, &object_path, "org.freedesktop.DBus.Properties").await;
     let mut stream_props = if let Some(ref p) = props_proxy {
         p.receive_all_signals().await.ok()
     } else {
@@ -401,9 +442,7 @@ pub(super) async fn process_and_track_item(
     };
 
     let mut stream_menu = if let Some(ref m_path) = item.menu_path {
-        let menu_proxy = zbus::proxy::Proxy::new(&conn, bus_name.as_str(), m_path.as_str(), "com.canonical.dbusmenu")
-            .await
-            .ok();
+        let menu_proxy = build_signal_proxy(&conn, &bus_name, m_path, "com.canonical.dbusmenu").await;
         if let Some(ref p) = menu_proxy {
             p.receive_all_signals().await.ok()
         } else {

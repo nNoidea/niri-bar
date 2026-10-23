@@ -7,7 +7,6 @@ use gdk::prelude::MonitorExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::niri::model::{Event, OutputInfo, WindowInfo, WorkspaceInfo};
@@ -133,11 +132,13 @@ pub struct NiriService {
     pub update_tx: async_channel::Sender<()>,
     pub update_rx: async_channel::Receiver<()>,
     running: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for NiriService {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
     }
 }
 
@@ -151,12 +152,14 @@ impl NiriService {
     pub fn refresh_outputs_async(&self) {
         let state = Arc::clone(&self.state);
         let tx = self.update_tx.clone();
-        thread::spawn(move || match ipc::fetch_outputs() {
-            Ok(outputs) => {
-                crate::util::lock(&state).outputs = outputs;
-                crate::util::nudge(&tx);
+        crate::runtime::spawn(async move {
+            match ipc::fetch_outputs().await {
+                Ok(outputs) => {
+                    crate::util::lock(&state).outputs = outputs;
+                    crate::util::nudge(&tx);
+                }
+                Err(e) => log_warn!("niri", "On-demand outputs refetch failed: {e}"),
             }
-            Err(e) => log_warn!("niri", "On-demand outputs refetch failed: {e}"),
         });
     }
 
@@ -164,21 +167,29 @@ impl NiriService {
         let (update_tx, update_rx) = async_channel::unbounded::<()>();
         let state = Arc::new(Mutex::new(AppState::default()));
         let running = Arc::new(AtomicBool::new(true));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Initial fetch off-thread: perform blocking socket round-trips BEFORE
-        // acquiring `state` so neither the GTK main thread nor the event-stream
-        // listener is blocked on socket I/O.
+        // Initial fetch as an async task: perform non-blocking socket round-trips
+        // BEFORE acquiring `state` so neither the GTK main thread nor the
+        // event-stream listener is stalled.
         {
             let state_init = Arc::clone(&state);
             let tx_init = update_tx.clone();
-            thread::spawn(move || {
+            let running_init = Arc::clone(&running);
+            crate::runtime::spawn(async move {
+                if !running_init.load(Ordering::SeqCst) {
+                    return;
+                }
                 let outputs = ipc::fetch_outputs()
+                    .await
                     .map_err(|e| log_warn!("niri", "Initial outputs fetch failed ({e}); starting empty"))
                     .ok();
                 let windows = ipc::fetch_windows()
+                    .await
                     .map_err(|e| log_warn!("niri", "Initial windows fetch failed ({e}); starting empty"))
                     .ok();
                 let workspaces = ipc::fetch_workspaces()
+                    .await
                     .map_err(|e| log_warn!("niri", "Initial workspaces fetch failed ({e}); starting empty"))
                     .ok();
 
@@ -203,71 +214,97 @@ impl NiriService {
             });
         }
 
-        // Spawn background event listener thread
+        // Spawn background event listener task on the shared Tokio runtime
         {
             let state_clone = Arc::clone(&state);
             let running_clone = Arc::clone(&running);
+            let stop_clone = Arc::clone(&stop_notify);
             let tx_clone = update_tx.clone();
 
-            thread::spawn(move || {
-                while running_clone.load(Ordering::Relaxed) {
-                    let state_stream = Arc::clone(&state_clone);
-                    let running_stream = Arc::clone(&running_clone);
-                    let tx_stream = tx_clone.clone();
+            crate::runtime::spawn(async move {
+                while running_clone.load(Ordering::SeqCst) {
                     log_info!("niri", "Starting Niri IPC event listener loop");
-                    let running_check = Arc::clone(&running_clone);
-                    let res = ipc::listen_event_stream(
-                        move |event| {
-                            if !running_stream.load(Ordering::Relaxed) {
-                                return;
+                    match ipc::open_event_stream().await {
+                        Ok(mut lines) => loop {
+                            if !running_clone.load(Ordering::SeqCst) {
+                                break;
                             }
-                            log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
-                            // OutputsChanged needs blocking IPC refetches: do them
-                            // WITHOUT holding the state lock so reconcile/taskbar
-                            // updates are not stalled.
-                            if let Event::OutputsChanged { outputs } = &event {
-                                let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
-                                let fetched_outputs = if need_fetch_outputs {
-                                    ipc::fetch_outputs()
-                                        .map_err(|e| {
-                                            log_warn!("niri", "Outputs refetch failed after OutputsChanged: {e}")
-                                        })
-                                        .ok()
-                                } else {
-                                    None
-                                };
-                                let fetched_workspaces = ipc::fetch_workspaces()
-                                    .map_err(|e| {
-                                        log_warn!("niri", "Workspaces refetch failed after OutputsChanged: {e}")
-                                    })
-                                    .ok();
-                                let mut st = crate::util::lock(&state_stream);
-                                if let Some(outs) = outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs) {
-                                    st.outputs = outs;
-                                }
-                                if let Some(wspaces) = fetched_workspaces {
-                                    st.workspaces = wspaces;
-                                }
-                                crate::util::nudge(&tx_stream);
-                                return;
-                            }
+                            let line_res = tokio::select! {
+                                _ = stop_clone.notified() => break,
+                                res = lines.next_line() => res,
+                            };
+                            match line_res {
+                                Ok(Some(line_str)) => {
+                                    let Some(event) = ipc::parse_event_line(&line_str) else {
+                                        continue;
+                                    };
+                                    if !running_clone.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
+                                    if let Event::OutputsChanged { outputs } = &event {
+                                        let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
+                                        let fetched_outputs = if need_fetch_outputs {
+                                            ipc::fetch_outputs()
+                                                .await
+                                                .map_err(|e| {
+                                                    log_warn!(
+                                                        "niri",
+                                                        "Outputs refetch failed after OutputsChanged: {e}"
+                                                    )
+                                                })
+                                                .ok()
+                                        } else {
+                                            None
+                                        };
+                                        let fetched_workspaces = ipc::fetch_workspaces()
+                                            .await
+                                            .map_err(|e| {
+                                                log_warn!("niri", "Workspaces refetch failed after OutputsChanged: {e}")
+                                            })
+                                            .ok();
 
-                            let changed = crate::util::lock(&state_stream).apply_event(event);
-                            if changed {
-                                crate::util::nudge(&tx_stream);
+                                        let mut st = crate::util::lock(&state_clone);
+                                        if let Some(outs) =
+                                            outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs)
+                                        {
+                                            st.outputs = outs;
+                                        }
+                                        if let Some(wspaces) = fetched_workspaces {
+                                            st.workspaces = wspaces;
+                                        }
+                                        drop(st);
+                                        crate::util::nudge(&tx_clone);
+                                        continue;
+                                    }
+
+                                    let changed = crate::util::lock(&state_clone).apply_event(event);
+                                    if changed {
+                                        crate::util::nudge(&tx_clone);
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    log_warn!("niri", "Error reading from Niri socket: {}", e);
+                                    break;
+                                }
                             }
                         },
-                        move || running_check.load(Ordering::Relaxed),
-                    );
+                        Err(e) => {
+                            if !running_clone.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
+                        }
+                    }
 
-                    if !running_clone.load(Ordering::Relaxed) {
+                    if !running_clone.load(Ordering::SeqCst) {
                         break;
                     }
-
-                    if let Err(e) = res {
-                        log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
+                    tokio::select! {
+                        _ = stop_clone.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     }
-                    thread::sleep(Duration::from_secs(1));
                 }
             });
         }
@@ -277,6 +314,7 @@ impl NiriService {
             update_tx,
             update_rx,
             running,
+            stop_notify,
         }
     }
 }
@@ -732,5 +770,24 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(match_output_for_monitor(&fp, &outputs, false), Some("DP-1".to_string()));
         }
+    }
+
+    #[test]
+    fn test_niri_service_runs_on_tokio_without_os_threads() {
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        let warm = NiriService::new();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(warm);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let before = crate::runtime::min_thread_count();
+        let services: Vec<NiriService> = (0..5).map(|_| NiriService::new()).collect();
+        let during = crate::runtime::min_thread_count();
+        drop(services);
+        assert!(
+            during <= before + 4,
+            "5 active NiriService instances should run on shared Tokio runtime, not spawn OS threads (before: {before}, during: {during})"
+        );
     }
 }

@@ -1,7 +1,6 @@
 use gtk::Orientation;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
@@ -41,7 +40,7 @@ impl BluetoothModule {
         // Unhealthy backends back off (2s→30s idle); triggered reads and
         // transitional states stay fast. Subscriptions are worker-owned via
         // `DbusSubscriptions` so they renew periodically and unsubscribe on drop.
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             if core_worker.is_stopped() {
                 return;
             }
@@ -59,7 +58,7 @@ impl BluetoothModule {
                 } else {
                     crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30))
                 };
-                let (stopped, notified) = core_worker.wait_or_notified(wait);
+                let (stopped, notified) = core_worker.wait_or_notified_async(wait).await;
                 if stopped {
                     break;
                 }
@@ -326,7 +325,7 @@ impl BluetoothModule {
     pub fn toggle_bluetooth() {
         // `read_bluetooth_state` does blocking D-Bus `call_sync` (500ms
         // timeout); never run it on the GTK main thread. Decide off-thread.
-        std::thread::spawn(|| {
+        crate::runtime::spawn(async {
             let (state, healthy) = Self::read_bluetooth_state_full();
             if !healthy || state == BluetoothState::Absent {
                 log_warn!("bluetooth", "Toggle ignored: no bluetooth adapter found");

@@ -110,113 +110,112 @@ pub fn move_window_to_monitor(id: u64, output: &str, target_slot: Option<usize>)
     execute_actions(&actions)
 }
 
-fn fetch_niri_resource<T: serde::de::DeserializeOwned>(resource_name: &str) -> Result<T, String> {
-    const MAX_LINE: u64 = 8 * 1024 * 1024;
-    let mut stream = connect_socket()?;
-    let req = format!("\"{resource_name}\"\n");
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| format!("Failed to send {resource_name} request to Niri socket: {e}"))?;
-    stream
-        .flush()
-        .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
+async fn fetch_niri_resource<T: serde::de::DeserializeOwned>(resource_name: &str) -> Result<T, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-    let reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader
-        .take(MAX_LINE)
-        .read_line(&mut line)
-        .map_err(|e| format!("Failed to read {resource_name} response from Niri socket: {e}"))?;
-    if line.len() >= MAX_LINE as usize {
-        return Err(format!("{resource_name} response exceeds 8MB cap"));
-    }
+    const MAX_LINE: u64 = 8 * 1024 * 1024;
+    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
+    let timeout_dur = Duration::from_millis(1000);
+
+    let line = tokio::time::timeout(timeout_dur, async {
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| format!("Failed to connect to Niri socket at {socket_path}: {e}"))?;
+        let req = format!("\"{resource_name}\"\n");
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send {resource_name} request to Niri socket: {e}"))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
+
+        let reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .take(MAX_LINE)
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("Failed to read {resource_name} response from Niri socket: {e}"))?;
+        if line.len() >= MAX_LINE as usize {
+            return Err(format!("{resource_name} response exceeds 8MB cap"));
+        }
+        Ok(line)
+    })
+    .await
+    .map_err(|_| format!("Timed out fetching {resource_name} from Niri socket"))??;
 
     parse_niri_response(&line)
 }
 
-pub fn fetch_outputs() -> Result<HashMap<String, OutputInfo>, String> {
+pub async fn fetch_outputs() -> Result<HashMap<String, OutputInfo>, String> {
     #[derive(serde::Deserialize)]
     struct OkPayload {
         #[serde(rename = "Outputs")]
         outputs: Option<HashMap<String, OutputInfo>>,
     }
 
-    let payload: OkPayload = fetch_niri_resource("Outputs")?;
+    let payload: OkPayload = fetch_niri_resource("Outputs").await?;
     Ok(payload.outputs.unwrap_or_default())
 }
 
-pub fn fetch_windows() -> Result<Vec<WindowInfo>, String> {
+pub async fn fetch_windows() -> Result<Vec<WindowInfo>, String> {
     #[derive(serde::Deserialize)]
     struct OkPayload {
         #[serde(rename = "Windows")]
         windows: Option<Vec<WindowInfo>>,
     }
 
-    let payload: OkPayload = fetch_niri_resource("Windows")?;
+    let payload: OkPayload = fetch_niri_resource("Windows").await?;
     Ok(payload.windows.unwrap_or_default())
 }
 
-pub fn fetch_workspaces() -> Result<Vec<WorkspaceInfo>, String> {
+pub async fn fetch_workspaces() -> Result<Vec<WorkspaceInfo>, String> {
     #[derive(serde::Deserialize)]
     struct OkPayload {
         #[serde(rename = "Workspaces")]
         workspaces: Option<Vec<WorkspaceInfo>>,
     }
 
-    let payload: OkPayload = fetch_niri_resource("Workspaces")?;
+    let payload: OkPayload = fetch_niri_resource("Workspaces").await?;
     Ok(payload.workspaces.unwrap_or_default())
 }
 
-pub fn listen_event_stream<F, C>(mut on_event: F, is_running: C) -> Result<(), String>
-where
-    F: FnMut(Event) + Send + 'static,
-    C: Fn() -> bool,
-{
-    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|e| format!("Failed to connect to Niri socket at {}: {}", socket_path, e))?;
+pub async fn open_event_stream() -> Result<tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>>, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let timeout = Duration::from_millis(500);
-    let _ = stream.set_read_timeout(Some(timeout));
+    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
+    let mut stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .map_err(|e| format!("Failed to connect to Niri socket at {}: {}", socket_path, e))?;
 
     stream
         .write_all(b"\"EventStream\"\n")
+        .await
         .map_err(|e| format!("Failed to send EventStream request to Niri socket: {}", e))?;
     stream
         .flush()
+        .await
         .map_err(|e| format!("Failed to flush Niri socket stream: {}", e))?;
 
-    let reader = BufReader::new(&stream);
-    for line in reader.lines() {
-        if !is_running() {
-            break;
-        }
+    let reader = tokio::io::BufReader::new(stream);
+    Ok(reader.lines())
+}
 
-        match line {
-            Ok(line_str) => {
-                let trimmed = line_str.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Event>(trimmed) {
-                    Ok(event) => on_event(event),
-                    Err(e) => {
-                        let snippet: String = trimmed.chars().take(500).collect();
-                        log_warn!("niri", "Failed to parse IPC event: {}. Payload: {}", e, snippet);
-                    }
-                }
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
-                    continue;
-                }
-                log_warn!("niri", "Error reading from Niri socket: {}", e);
-                break;
-            }
+pub fn parse_event_line(line_str: &str) -> Option<Event> {
+    let trimmed = line_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Event>(trimmed) {
+        Ok(event) => Some(event),
+        Err(e) => {
+            let snippet: String = trimmed.chars().take(500).collect();
+            log_warn!("niri", "Failed to parse IPC event: {}. Payload: {}", e, snippet);
+            None
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -18,8 +18,8 @@ pub struct TrayService {
 }
 
 impl TrayService {
-    /// Single shared instance (see `SharedModules`): spawns one background
-    /// thread with its own tokio runtime for the session bus.
+    /// Single shared instance (see `SharedModules`): spawns its supervisor
+    /// and activation tasks on the shared process-wide Tokio runtime.
     /// Do not construct per-monitor.
     pub fn new() -> Self {
         let (act_tx, mut act_rx) = tokio::sync::mpsc::channel::<ActivateRequest>(128);
@@ -29,20 +29,12 @@ impl TrayService {
         let items_clone = Arc::clone(&items);
         let subs_clone = Arc::clone(&subscribers);
 
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(r) => r,
-                Err(e) => {
-                    log_warn!("tray", "Failed to build tokio runtime for tray: {}", e);
-                    return;
-                }
-            };
-
+        crate::runtime::spawn(async move {
             // Current live connection for activation requests. Updated on
             // every (re)connect so GTK clicks survive bus restarts.
             let current_conn: Arc<tokio::sync::Mutex<Option<Connection>>> = Arc::new(tokio::sync::Mutex::new(None));
             let conn_for_act = Arc::clone(&current_conn);
-            rt.spawn(async move {
+            crate::runtime::spawn(async move {
                 while let Some(req) = act_rx.recv().await {
                     let conn_opt = conn_for_act.lock().await.clone();
                     if let Some(c) = conn_opt {
@@ -62,13 +54,14 @@ impl TrayService {
 
             let mut backoff_secs: u64 = 1;
             loop {
-                let session_result = rt.block_on(run_tray_session(
+                let session_result = run_tray_session(
                     Arc::clone(&items_clone),
                     Arc::clone(&subs_clone),
                     Arc::clone(&current_conn),
                     Arc::clone(&item_tasks),
                     Arc::clone(&probe_sem),
-                ));
+                )
+                .await;
                 // Session ended (bus loss or fatal setup error): drop stale
                 // tasks holding dead proxies, clear live conn, back off.
                 {
@@ -77,7 +70,7 @@ impl TrayService {
                         h.abort();
                     }
                 }
-                *current_conn.blocking_lock() = None;
+                *current_conn.lock().await = None;
                 match session_result {
                     None => {
                         // Clean shutdown path is unreachable today (no stop
@@ -88,7 +81,7 @@ impl TrayService {
                         log_warn!("tray", "Tray session lost ({reason}); reconnecting in {backoff_secs}s");
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(30);
             }
         });

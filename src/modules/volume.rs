@@ -1,10 +1,9 @@
 use gtk::Orientation;
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 
 use crate::config::{resolve_level, VolumeConfig};
 use crate::modules::{
@@ -63,8 +62,8 @@ impl VolumeModule {
             let cfg = config.clone();
 
             // Event-driven listener using native PipeWire `pw-mon` (0% CPU at idle, instant reaction).
-            // Supervised: pw-mon session → backoff polling → re-exec, forever.
-            thread::spawn(move || {
+            // Supervised on the shared Tokio runtime: pw-mon session → backoff polling → re-exec, forever.
+            crate::runtime::spawn(async move {
                 if core_worker.is_stopped() {
                     return;
                 }
@@ -119,15 +118,14 @@ impl VolumeModule {
                         core_worker.set_child(child);
 
                         if let Some(stdout) = stdout {
-                            let reader = BufReader::with_capacity(64 * 1024, stdout);
-                            VolumeModule::process_pw_mon_stream(
-                                reader,
-                                || core_worker.is_stopped(),
-                                || {
+                            if let Ok(async_stdout) = tokio::process::ChildStdout::from_std(stdout) {
+                                let reader = tokio::io::BufReader::with_capacity(64 * 1024, async_stdout);
+                                VolumeModule::process_pw_mon_stream(reader, &core_worker, || async {
                                     let (vol, muted, new_sink, _) = VolumeModule::read_audio_state();
                                     apply(vol, muted, &new_sink);
-                                },
-                            );
+                                })
+                                .await;
+                            }
                         }
                         // `pw-mon` exited (or was killed on teardown): reap, then polling.
                         if let Some(mut child) = core_worker.take_child() {
@@ -166,7 +164,7 @@ impl VolumeModule {
                             fail_streak = fail_streak.saturating_add(1);
                             (250u64.saturating_mul(2u64.saturating_pow(fail_streak.min(5)))).min(5000)
                         };
-                        if core_worker.wait_timeout(Duration::from_millis(backoff)) {
+                        if core_worker.wait_timeout_async(Duration::from_millis(backoff)).await {
                             break;
                         }
                     }
@@ -192,35 +190,43 @@ impl VolumeModule {
             .ok()
     }
 
-    /// Reads `pw-mon -N` lines and coalesces multi-line event bursts already
-    /// sitting in `reader`'s buffer so each PipeWire property block triggers
+    /// Reads `pw-mon -N` lines asynchronously and coalesces multi-line event bursts
+    /// already sitting in `reader`'s buffer so each PipeWire property block triggers
     /// a single `on_volume_event` callback instead of dozens.
-    pub fn process_pw_mon_stream<R: std::io::Read, S: Fn() -> bool, F: FnMut()>(
-        mut reader: BufReader<R>,
-        is_stopped: S,
+    pub async fn process_pw_mon_stream<R, F, Fut>(
+        mut reader: tokio::io::BufReader<R>,
+        core: &ModuleCore,
         mut on_volume_event: F,
-    ) {
+    ) where
+        R: tokio::io::AsyncRead + Unpin,
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let mut line = String::new();
         loop {
-            if is_stopped() {
+            if core.is_stopped() {
                 break;
             }
             line.clear();
-            match reader.read_line(&mut line) {
+            let read_res = tokio::select! {
+                _ = core.wait_timeout_async(Duration::from_secs(86400)) => break,
+                res = reader.read_line(&mut line) => res,
+            };
+            match read_res {
                 Ok(0) => break,
                 Ok(_) => {
                     if Self::is_volume_event_line(&line) {
                         while reader.buffer().contains(&b'\n') {
                             line.clear();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                                 break;
                             }
                         }
-                        on_volume_event();
+                        on_volume_event().await;
                     }
                 }
                 Err(e) => {
-                    if is_stopped() {
+                    if core.is_stopped() {
                         break;
                     }
                     log_warn!("volume", "pw-mon read error: {e}");
@@ -593,7 +599,7 @@ impl VolumeModule {
         let cur_sink = Arc::clone(&self.current_sink);
         let core = self.core.clone();
         let cfg = self.config.clone();
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             Self::cycle_audio_output();
             let (vol, muted, sink, _) = Self::read_audio_state();
             cur_vol.store(vol, Ordering::Relaxed);
@@ -1064,17 +1070,19 @@ changed:
   core.name = \"pipewire-0\"
   Prop: key Spa:Pod:Object:Param:Props:channelVolumes (65544)
 ";
-        let reader = std::io::BufReader::new(std::io::Cursor::new(burst.as_bytes()));
-        let mut call_count = 0usize;
-        VolumeModule::process_pw_mon_stream(
-            reader,
-            || false,
-            || {
-                call_count += 1;
-            },
-        );
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(burst.as_bytes()));
+        let core = ModuleCore::new();
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = std::sync::Arc::clone(&call_count);
+        crate::runtime::handle().block_on(VolumeModule::process_pw_mon_stream(reader, &core, move || {
+            let c = std::sync::Arc::clone(&count_clone);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
         assert_eq!(
-            call_count, 1,
+            call_count.load(Ordering::SeqCst),
+            1,
             "A buffered burst of matching pw-mon lines should coalesce into 1 query"
         );
     }

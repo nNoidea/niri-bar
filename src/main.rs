@@ -18,6 +18,7 @@ mod layer_shell;
 mod modules;
 mod monitor;
 mod niri;
+mod runtime;
 mod style;
 mod util;
 
@@ -38,35 +39,36 @@ use crate::style::init_styles;
 
 const EMBEDDED_FONT: &[u8] = include_bytes!("../resources/NerdFont-Regular.ttf");
 
-/// Early CLI action, parsed before GTK/logger init so `--help` works headless.
-#[derive(Debug, PartialEq, Eq)]
-enum EarlyAction {
-    Run,
-    Version,
-    Help,
-    Check,
-}
-
-fn parse_early_args(args: &[String]) -> EarlyAction {
+/// Handle CLI flags before GTK or logger init so `--help` and `--version` work headless.
+/// Returns `Some(exit_code)` if a CLI flag was handled, or `None` to continue starting the bar.
+fn cli_flags(args: &[String]) -> Option<i32> {
     for a in &args[1..] {
         match a.as_str() {
-            "--version" | "-V" | "-v" => return EarlyAction::Version,
-            "--help" | "-h" => return EarlyAction::Help,
-            "--check" => return EarlyAction::Check,
+            "--version" | "-V" | "-v" => {
+                println!("niri-bar v{}", env!("CARGO_PKG_VERSION"));
+                return Some(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "niri-bar v{}\n\nUSAGE:\n    niri-bar [OPTIONS]\n\nOPTIONS:\n    -h, --help       Print this help\n    -v, -V, --version Print version\n        --check      Validate config + CSS and exit (0 ok, 1 error)\n\nENV:\n    NIRI_SOCKET      Niri IPC socket (set by Niri)\n    NIRI_BAR_DEBUG=1 Verbose debug logs\n    RUST_LOG=debug   Verbose debug logs\n\nCONFIG:\n    ~/.config/niri-bar/config.toml (see resources/config.default.toml)\n    ~/.config/niri-bar/style.css",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Some(0);
+            }
+            "--check" => {
+                if run_check_cli() {
+                    return Some(0);
+                } else {
+                    return Some(1);
+                }
+            }
             _ => {}
         }
     }
-    EarlyAction::Run
+    None
 }
 
-fn print_help() {
-    println!(
-        "niri-bar v{}\n\nUSAGE:\n    niri-bar [OPTIONS]\n\nOPTIONS:\n    -h, --help       Print this help\n    -v, -V, --version Print version\n        --check      Validate config + CSS and exit (0 ok, 1 error)\n\nENV:\n    NIRI_SOCKET      Niri IPC socket (set by Niri)\n    NIRI_BAR_DEBUG=1 Verbose debug logs\n    RUST_LOG=debug   Verbose debug logs\n\nCONFIG:\n    ~/.config/niri-bar/config.toml (see resources/config.default.toml)\n    ~/.config/niri-bar/style.css",
-        env!("CARGO_PKG_VERSION")
-    );
-}
-
-fn run_check_cli() -> i32 {
+fn run_check_cli() -> bool {
     let cfg_path = crate::config::get_config_dir().join("config.toml");
     let css_path = crate::config::get_config_dir().join("style.css");
     let mut ok = true;
@@ -106,11 +108,7 @@ fn run_check_cli() -> i32 {
     } else {
         println!("css: no file yet (embedded default would be used)");
     }
-    if ok {
-        0
-    } else {
-        1
-    }
+    ok
 }
 
 /// Claim the session-bus instance name. Returns false when another niri-bar
@@ -118,18 +116,35 @@ fn run_check_cli() -> i32 {
 /// duplicate fullscreen drag overlays, and split press/release event
 /// delivery between two independent drag states (ghost on the wrong
 /// monitor, stuck drags). No bus available (tests/headless) allows startup.
+static SINGLE_INSTANCE_DBUS: std::sync::OnceLock<gio::DBusConnection> = std::sync::OnceLock::new();
+
 fn ensure_single_instance() -> bool {
     const NAME: &str = "org.nnoidea.niri-bar";
-    let conn = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
+
+    // D-Bus RequestName Input Flags (bitmask):
+    // 0 = default (wait in queue if name is already owned)
+    // 1 = DBUS_NAME_FLAG_ALLOW_REPLACEMENT (allow another process to steal this name)
+    // 2 = DBUS_NAME_FLAG_REPLACE_EXISTING  (attempt to steal name from existing owner)
+    // 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE      (fail immediately if already taken, do not wait)
+    const DBUS_NAME_FLAG_DO_NOT_QUEUE: u32 = 4;
+
+    // D-Bus RequestName Return Reply Codes:
+    // 1 = DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER (granted: we are the primary owner)
+    // 2 = DBUS_REQUEST_NAME_REPLY_IN_QUEUE      (queued: someone owns it, we are waiting)
+    // 3 = DBUS_REQUEST_NAME_REPLY_EXISTS        (rejected: someone owns it, DO_NOT_QUEUE set)
+    // 4 = DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER (already owned by this connection)
+    const DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER: u32 = 1;
+
+    let dbus = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
         Ok(c) => c,
         Err(_) => return true,
     };
-    let reply = conn.call_sync(
+    let reply = dbus.call_sync(
         Some("org.freedesktop.DBus"),
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
         "RequestName",
-        Some(&(NAME, 0u32).to_variant()),
+        Some(&(NAME, DBUS_NAME_FLAG_DO_NOT_QUEUE).to_variant()),
         None,
         gio::DBusCallFlags::NONE,
         5000,
@@ -137,8 +152,22 @@ fn ensure_single_instance() -> bool {
     );
     match reply {
         Ok(v) => {
-            // 1 = primary owner. Anything else: someone got here first.
-            v.child_value(0).get::<u32>() == Some(1)
+            let is_owner = v.child_value(0).get::<u32>() == Some(DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
+            if is_owner {
+                // Keep the connection alive for the entire process lifetime so D-Bus
+                // does not release the name when this function returns.
+                let _ = SINGLE_INSTANCE_DBUS.set(dbus);
+                true
+            } else {
+                log_error!(
+                    "startup",
+                    "Another niri-bar instance already owns the session bus name; exiting to avoid duplicate bars and competing drag overlays."
+                );
+                eprintln!(
+                    "\x1b[1;31merror:\x1b[0m Another niri-bar instance is already running (owns org.nnoidea.niri-bar). Refusing to start a second one."
+                );
+                false
+            }
         }
         Err(_) => true,
     }
@@ -167,9 +196,14 @@ fn register_embedded_font() {
                 log_warn!("startup", "Failed to write embedded font {font_path:?}: {e}");
                 return;
             }
-            std::thread::spawn(move || {
+            crate::runtime::spawn(async move {
                 let fc = crate::modules::resolve_helper("fc-cache");
-                if let Err(e) = std::process::Command::new(&fc).arg("-f").arg(&font_dir).output() {
+                if let Err(e) = tokio::process::Command::new(&fc)
+                    .arg("-f")
+                    .arg(&font_dir)
+                    .output()
+                    .await
+                {
                     // `fc-cache` failure is non-fatal; font still loads via fontconfig fallback.
                     log_warn!("startup", "fc-cache failed for {font_dir:?}: {e}");
                 }
@@ -180,28 +214,13 @@ fn register_embedded_font() {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    match parse_early_args(&argv) {
-        EarlyAction::Version => {
-            println!("niri-bar v{}", env!("CARGO_PKG_VERSION"));
-            return;
-        }
-        EarlyAction::Help => {
-            print_help();
-            return;
-        }
-        EarlyAction::Check => std::process::exit(run_check_cli()),
-        EarlyAction::Run => {}
+    if let Some(code) = cli_flags(&argv) {
+        // disgusting, but its for CLI compliance
+        std::process::exit(code);
     }
 
     init_logger();
     if !ensure_single_instance() {
-        log_error!(
-            "startup",
-            "Another niri-bar instance already owns the session bus name; exiting to avoid duplicate bars and competing drag overlays."
-        );
-        eprintln!(
-            "\x1b[1;31merror:\x1b[0m Another niri-bar instance is already running (owns org.nnoidea.niri-bar). Refusing to start a second one."
-        );
         std::process::exit(1);
     }
     register_embedded_font();
@@ -348,16 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_early_args() {
-        assert_eq!(parse_early_args(&args(&["niri-bar"])), EarlyAction::Run);
-        assert_eq!(
-            parse_early_args(&args(&["niri-bar", "--version"])),
-            EarlyAction::Version
-        );
-        assert_eq!(parse_early_args(&args(&["niri-bar", "-V"])), EarlyAction::Version);
-        assert_eq!(parse_early_args(&args(&["niri-bar", "-v"])), EarlyAction::Version);
-        assert_eq!(parse_early_args(&args(&["niri-bar", "--help"])), EarlyAction::Help);
-        assert_eq!(parse_early_args(&args(&["niri-bar", "--check"])), EarlyAction::Check);
+    fn test_cli_flags() {
+        assert_eq!(cli_flags(&args(&["niri-bar"])), None);
+        assert_eq!(cli_flags(&args(&["niri-bar", "--version"])), Some(0));
+        assert_eq!(cli_flags(&args(&["niri-bar", "-V"])), Some(0));
+        assert_eq!(cli_flags(&args(&["niri-bar", "-v"])), Some(0));
+        assert_eq!(cli_flags(&args(&["niri-bar", "--help"])), Some(0));
+        assert!(cli_flags(&args(&["niri-bar", "--check"])).is_some());
     }
 
     /// Another owner on the session bus → refuse. Holds the name on a

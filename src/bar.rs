@@ -46,16 +46,16 @@ pub fn copy_to_clipboard(text: &str) {
     {
         let text_owned = text.to_string();
         let wl_copy = crate::modules::resolve_helper("wl-copy");
-        std::thread::spawn(move || {
-            if let Ok(mut child) = std::process::Command::new(&wl_copy)
+        crate::runtime::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok(mut child) = tokio::process::Command::new(&wl_copy)
                 .stdin(std::process::Stdio::piped())
                 .spawn()
             {
-                use std::io::Write;
                 if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text_owned.as_bytes());
+                    let _ = stdin.write_all(text_owned.as_bytes()).await;
                 }
-                let _ = child.wait();
+                let _ = child.wait().await;
             }
         });
     }
@@ -654,7 +654,9 @@ mod tests {
     #[test]
     fn test_overlay_layout() {
         crate::util::run_gtk_test(|| {
-            let window = gtk::Window::new(gtk::WindowType::Toplevel);
+            // OffscreenWindow realizes children without mapping a real window,
+            // so running the test suite never flashes a window on screen.
+            let window = gtk::OffscreenWindow::new();
             window.set_size_request(50, -1);
             let overlay = gtk::Overlay::new();
             window.add(&overlay);

@@ -11,8 +11,8 @@ pub mod volume;
 use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Button, Label, Orientation};
-use std::process::Command;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::AppConfig;
@@ -25,67 +25,65 @@ use crate::modules::network::NetworkModule;
 use crate::modules::spacer::SpacerModule;
 use crate::modules::volume::VolumeModule;
 
-/// Cancellation and interruptible-sleep primitive for module workers.
+/// Async cancellation and interruptible-sleep primitive for module workers.
 ///
-/// Tracks `(stopped, notified)` under a `Mutex` paired with a `Condvar` so
-/// workers can sleep until either a trigger notification (`notify()`) or
-/// shutdown (`stop()`) without needing a separate `mpsc` channel.
+/// Tracks `(stopped, notified)` atomically paired with a `tokio::sync::Notify`
+/// so async workers can sleep until either a trigger notification (`notify()`)
+/// or shutdown (`stop()`) without needing a separate channel or OS thread.
 #[derive(Clone, Debug, Default)]
 struct StopSignal {
-    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    state: Arc<(AtomicBool, AtomicBool, tokio::sync::Notify)>,
 }
 
 impl StopSignal {
     fn new() -> Self {
         Self {
-            state: Arc::new((Mutex::new((false, false)), Condvar::new())),
+            state: Arc::new((
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                tokio::sync::Notify::new(),
+            )),
         }
     }
 
     fn stop(&self) {
-        let (lock, cvar) = &*self.state;
-        if let Ok(mut st) = lock.lock() {
-            st.0 = true;
-        }
-        cvar.notify_all();
+        let (stopped, _, notify) = &*self.state;
+        stopped.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
     }
 
     fn notify(&self) {
-        let (lock, cvar) = &*self.state;
-        if let Ok(mut st) = lock.lock() {
-            st.1 = true;
-        }
-        cvar.notify_all();
+        let (_, notified, notify) = &*self.state;
+        notified.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
     }
 
     fn is_stopped(&self) -> bool {
-        let (lock, _) = &*self.state;
-        lock.lock().map(|s| s.0).unwrap_or(true)
+        self.state.0.load(Ordering::SeqCst)
     }
 
-    /// Blocks up to `dur`, returning early if `stop()` or `notify()` is called.
+    /// Awaits up to `dur`, returning early if `stop()` or `notify()` is called.
     /// Returns `(stopped, notified)`.
-    fn wait_or_notified(&self, dur: Duration) -> (bool, bool) {
-        let (lock, cvar) = &*self.state;
-        if let Ok(mut guard) = lock.lock() {
-            if guard.0 || guard.1 {
-                let notified = guard.1;
-                guard.1 = false;
-                return (guard.0, notified);
-            }
-            if let Ok((mut guard, _)) = cvar.wait_timeout(guard, dur) {
-                let notified = guard.1;
-                guard.1 = false;
-                return (guard.0, notified);
-            }
+    async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
+        let (stopped, notified, notify) = &*self.state;
+        let notified_fut = notify.notified();
+        tokio::pin!(notified_fut);
+        notified_fut.as_mut().enable();
+
+        let is_stopped = stopped.load(Ordering::SeqCst);
+        let is_notified = notified.swap(false, Ordering::SeqCst);
+        if is_stopped || is_notified {
+            return (is_stopped, is_notified);
         }
-        (true, false)
+
+        let _ = tokio::time::timeout(dur, notified_fut).await;
+        let is_stopped = stopped.load(Ordering::SeqCst);
+        let is_notified = notified.swap(false, Ordering::SeqCst);
+        (is_stopped, is_notified)
     }
 
-    /// Blocks up to `dur`, but returns immediately if `stop()` or `notify()` is called.
-    /// Returns `true` if stopped, `false` otherwise.
-    fn wait_timeout(&self, dur: Duration) -> bool {
-        self.wait_or_notified(dur).0
+    async fn wait_timeout_async(&self, dur: Duration) -> bool {
+        self.wait_or_notified_async(dur).await.0
     }
 }
 
@@ -197,12 +195,12 @@ impl ModuleCore {
         self.stop_signal.is_stopped()
     }
 
-    pub fn wait_or_notified(&self, dur: Duration) -> (bool, bool) {
-        self.stop_signal.wait_or_notified(dur)
+    pub async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
+        self.stop_signal.wait_or_notified_async(dur).await
     }
 
-    pub fn wait_timeout(&self, dur: Duration) -> bool {
-        self.stop_signal.wait_timeout(dur)
+    pub async fn wait_timeout_async(&self, dur: Duration) -> bool {
+        self.stop_signal.wait_timeout_async(dur).await
     }
 }
 
@@ -380,10 +378,10 @@ pub fn spawn_command(cmd: &str) {
     if trimmed.is_empty() {
         return;
     }
-    match Command::new("sh").args(["-c", trimmed]).spawn() {
-        Ok(mut child) => {
-            let cmd_owned = trimmed.to_string();
-            std::thread::spawn(move || match child.wait() {
+    let cmd_owned = trimmed.to_string();
+    crate::runtime::spawn(async move {
+        match tokio::process::Command::new("sh").args(["-c", &cmd_owned]).spawn() {
+            Ok(mut child) => match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     crate::logger::emit("WARN", "modules", &format!("command exited with {status}: {cmd_owned}"));
@@ -395,12 +393,16 @@ pub fn spawn_command(cmd: &str) {
                         &format!("failed waiting on command '{cmd_owned}': {e}"),
                     );
                 }
-            });
+            },
+            Err(e) => {
+                crate::logger::emit(
+                    "WARN",
+                    "modules",
+                    &format!("failed to spawn command '{cmd_owned}': {e}"),
+                );
+            }
         }
-        Err(e) => {
-            crate::logger::emit("WARN", "modules", &format!("failed to spawn command '{trimmed}': {e}"));
-        }
-    }
+    });
 }
 
 /// Spawn a fixed system binary with argv (no shell) in the background.
@@ -414,9 +416,12 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
     let program_resolved = resolve_helper(program);
     let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let display = format!("{program_resolved} {}", args_owned.join(" "));
-    match Command::new(&program_resolved).args(&args_owned).spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || match child.wait() {
+    crate::runtime::spawn(async move {
+        match tokio::process::Command::new(&program_resolved)
+            .args(&args_owned)
+            .spawn()
+        {
+            Ok(mut child) => match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     crate::logger::emit("WARN", &tag_owned, &format!("command exited with {status}: {display}"));
@@ -424,12 +429,12 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
                 Err(e) => {
                     crate::logger::emit("WARN", &tag_owned, &format!("failed waiting on '{display}': {e}"));
                 }
-            });
+            },
+            Err(e) => {
+                crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
+            }
         }
-        Err(e) => {
-            crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
-        }
-    }
+    });
 }
 
 pub fn enable_hover_cursor(button: &Button) {
@@ -775,9 +780,9 @@ mod tests {
 
         let stop_clone = stop.clone();
         let start = std::time::Instant::now();
-        let handle = std::thread::spawn(move || {
+        let handle = crate::runtime::spawn(async move {
             // Sleep for 60 seconds unless stopped
-            stop_clone.wait_timeout(Duration::from_secs(60))
+            stop_clone.wait_timeout_async(Duration::from_secs(60)).await
         });
 
         // Trigger stop after a short delay
@@ -785,11 +790,11 @@ mod tests {
         stop.stop();
         assert!(stop.is_stopped());
 
-        let stopped = handle.join().expect("thread must join cleanly");
-        assert!(stopped, "wait_timeout must return true when stopped");
+        let stopped = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(stopped, "wait_timeout_async must return true when stopped");
         assert!(
             start.elapsed() < Duration::from_secs(2),
-            "wait_timeout must wake up immediately on stop, elapsed: {:?}",
+            "wait_timeout_async must wake up immediately on stop, elapsed: {:?}",
             start.elapsed()
         );
     }
@@ -799,15 +804,67 @@ mod tests {
         let core = ModuleCore::new();
         let core_clone = core.clone();
         let start = std::time::Instant::now();
-        let handle = std::thread::spawn(move || core_clone.wait_or_notified(Duration::from_secs(60)));
+        let handle =
+            crate::runtime::spawn(async move { core_clone.wait_or_notified_async(Duration::from_secs(60)).await });
 
         std::thread::sleep(Duration::from_millis(20));
         core.notify();
 
-        let (stopped, notified) = handle.join().expect("thread must join cleanly");
+        let (stopped, notified) = crate::runtime::handle().block_on(handle).expect("task must complete");
         assert!(!stopped, "notify must not mark core as stopped");
-        assert!(notified, "wait_or_notified must report notified=true");
+        assert!(notified, "wait_or_notified_async must report notified=true");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_stop_signal_and_notify_async_wake() {
+        let core = ModuleCore::new();
+        let core_clone = core.clone();
+        let start = std::time::Instant::now();
+        let handle =
+            crate::runtime::spawn(async move { core_clone.wait_or_notified_async(Duration::from_secs(60)).await });
+
+        std::thread::sleep(Duration::from_millis(20));
+        core.notify();
+
+        let (stopped, notified) = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(!stopped);
+        assert!(notified);
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let core_clone2 = core.clone();
+        let handle2 =
+            crate::runtime::spawn(async move { core_clone2.wait_timeout_async(Duration::from_secs(60)).await });
+        std::thread::sleep(Duration::from_millis(20));
+        core.shutdown();
+
+        let stopped2 = crate::runtime::handle().block_on(handle2).expect("task must complete");
+        assert!(stopped2);
+    }
+
+    #[test]
+    fn test_shared_modules_all_run_on_tokio_without_os_thread_explosion() {
+        let cfg = AppConfig::default();
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        // Warmup one cycle
+        let warm = SharedModules::new(&cfg);
+        std::thread::sleep(Duration::from_millis(30));
+        warm.shutdown();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let before = crate::runtime::min_thread_count();
+        // Hold 5 live SharedModules instances concurrently (35 active module workers)
+        let active: Vec<SharedModules> = (0..5).map(|_| SharedModules::new(&cfg)).collect();
+        let during = crate::runtime::min_thread_count();
+        for s in &active {
+            s.shutdown();
+        }
+        // 35 module workers on thread::spawn would add >= 20 OS threads; on Tokio tasks it adds a handful at most.
+        assert!(
+            during <= before + 4,
+            "35 active module workers should run as Tokio tasks, not OS threads (before: {before}, during: {during})"
+        );
     }
 
     #[test]
@@ -852,7 +909,7 @@ mod tests {
 
         core.shutdown();
         assert!(core.is_stopped());
-        assert!(core.wait_timeout(Duration::from_millis(50)));
+        assert!(crate::runtime::handle().block_on(core.wait_timeout_async(Duration::from_millis(50))));
     }
 
     #[test]

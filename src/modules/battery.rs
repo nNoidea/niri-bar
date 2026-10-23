@@ -1,7 +1,6 @@
 use gtk::Orientation;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_level, BatteryConfig};
@@ -34,7 +33,7 @@ impl BatteryModule {
         // Unhealthy backends back off (10s→60s idle); triggers stay immediate.
         // Subscriptions are worker-owned via `DbusSubscriptions` so they are
         // renewed periodically and always unsubscribed on shutdown.
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             if core_worker.is_stopped() {
                 return;
             }
@@ -46,7 +45,7 @@ impl BatteryModule {
 
             loop {
                 let wait = crate::modules::poll_backoff(Duration::from_secs(10), fail_streak, Duration::from_secs(60));
-                if core_worker.wait_timeout(wait) {
+                if core_worker.wait_timeout_async(wait).await {
                     break;
                 }
                 let (bat_opt, healthy) = Self::read_battery_full();

@@ -1,6 +1,5 @@
 use gtk::Orientation;
 use std::fs;
-use std::thread;
 use std::time::Duration;
 
 use crate::config::MemoryConfig;
@@ -17,7 +16,7 @@ impl MemoryModule {
         let core_worker = core.clone();
         let cfg = config.clone();
 
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             let mut last_used_tenth = -1i64;
 
             loop {
@@ -37,7 +36,7 @@ impl MemoryModule {
                     }
                 }
 
-                if core_worker.wait_timeout(Duration::from_secs(2)) {
+                if core_worker.wait_timeout_async(Duration::from_secs(2)).await {
                     break;
                 }
             }
@@ -173,5 +172,21 @@ mod tests {
             ..Default::default()
         });
         assert!(clickable.is_clickable());
+    }
+
+    #[test]
+    fn test_memory_runs_on_tokio_without_new_os_threads() {
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        let before = crate::runtime::min_thread_count();
+        let modules: Vec<_> = (0..10).map(|_| MemoryModule::new(MemoryConfig::default())).collect();
+        let during = crate::runtime::min_thread_count();
+        for m in &modules {
+            m.shutdown();
+        }
+        assert!(
+            during <= before + 4,
+            "MemoryModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
+        );
     }
 }

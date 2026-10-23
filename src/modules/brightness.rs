@@ -2,7 +2,6 @@ use gtk::Orientation;
 use std::fs;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use crate::config::{resolve_level, BrightnessConfig};
@@ -26,7 +25,7 @@ impl BrightnessModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
 
-        thread::spawn(move || {
+        crate::runtime::spawn(async move {
             let mut logged_no_device = false;
             loop {
                 if core_worker.is_stopped() {
@@ -46,7 +45,7 @@ impl BrightnessModule {
                     }
                     None => {}
                 }
-                if core_worker.wait_timeout(Duration::from_millis(500)) {
+                if core_worker.wait_timeout_async(Duration::from_millis(500)).await {
                     break;
                 }
             }
@@ -241,5 +240,23 @@ mod tests {
             ..Default::default()
         });
         assert!(clickable.is_clickable());
+    }
+
+    #[test]
+    fn test_brightness_runs_on_tokio_without_new_os_threads() {
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        let before = crate::runtime::min_thread_count();
+        let modules: Vec<_> = (0..10)
+            .map(|_| BrightnessModule::new(BrightnessConfig::default()))
+            .collect();
+        let during = crate::runtime::min_thread_count();
+        for m in &modules {
+            m.shutdown();
+        }
+        assert!(
+            during <= before + 4,
+            "BrightnessModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
+        );
     }
 }
