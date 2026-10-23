@@ -117,7 +117,7 @@ jobs:
           ls -la dist/
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: niri-bar-dev-binaries
           path: dist/
@@ -166,7 +166,7 @@ jobs:
 
       - name: Download binary artifacts
         if: steps.release_check.outputs.should_release == 'true'
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: niri-bar-dev-binaries
           path: dist
