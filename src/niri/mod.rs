@@ -188,6 +188,9 @@ impl NiriService {
                     .await
                     .map_err(|e| log_warn!("niri", "Initial windows fetch failed ({e}); starting empty"))
                     .ok();
+                if let Some(ref wins) = windows {
+                    crate::icon::warm_window_icons_off_thread(wins);
+                }
                 let workspaces = ipc::fetch_workspaces()
                     .await
                     .map_err(|e| log_warn!("niri", "Initial workspaces fetch failed ({e}); starting empty"))
@@ -276,6 +279,16 @@ impl NiriService {
                                         drop(st);
                                         crate::util::nudge(&tx_clone);
                                         continue;
+                                    }
+
+                                    match &event {
+                                        Event::WindowsChanged { windows } => {
+                                            crate::icon::warm_window_icons_off_thread(windows);
+                                        }
+                                        Event::WindowOpenedOrChanged { window } => {
+                                            crate::icon::warm_window_icons_off_thread(std::slice::from_ref(window));
+                                        }
+                                        _ => {}
                                     }
 
                                     let changed = crate::util::lock(&state_clone).apply_event(event);
@@ -500,6 +513,7 @@ mod tests {
             id: 100,
             title: Some("Firefox".to_string()),
             app_id: Some("firefox".to_string()),
+            pid: None,
             workspace_id: Some(1),
             is_focused: true,
             layout: Some(WindowLayout {
@@ -515,6 +529,7 @@ mod tests {
             id: 200,
             title: Some("Alacritty".to_string()),
             app_id: Some("Alacritty".to_string()),
+            pid: None,
             workspace_id: Some(2),
             is_focused: true,
             layout: Some(WindowLayout {

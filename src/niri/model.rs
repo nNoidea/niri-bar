@@ -59,7 +59,7 @@ fn truncate_opt(s: Option<String>) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct WindowInfo {
     #[serde(default)]
     pub id: u64,
@@ -67,6 +67,8 @@ pub struct WindowInfo {
     pub title: Option<String>,
     #[serde(default, deserialize_with = "de_truncate_opt")]
     pub app_id: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
     #[serde(default)]
     pub workspace_id: Option<u64>,
     #[serde(default)]
@@ -293,13 +295,14 @@ mod tests {
 
     #[test]
     fn test_deserialize_window_opened_or_changed() {
-        let json = r#"{"WindowOpenedOrChanged":{"window":{"id":100,"title":"Terminal","app_id":"kitty","workspace_id":1,"is_focused":true,"layout":{"pos_in_scrolling_layout":[0,0]}}}}"#;
+        let json = r#"{"WindowOpenedOrChanged":{"window":{"id":100,"title":"Terminal","app_id":"kitty","pid":4242,"workspace_id":1,"is_focused":true,"layout":{"pos_in_scrolling_layout":[0,0]}}}}"#;
         let event: Event = serde_json::from_str(json).unwrap();
         match event {
             Event::WindowOpenedOrChanged { window } => {
                 assert_eq!(window.id, 100);
                 assert_eq!(window.title.as_deref(), Some("Terminal"));
                 assert_eq!(window.app_id.as_deref(), Some("kitty"));
+                assert_eq!(window.pid, Some(4242));
                 assert_eq!(window.workspace_id, Some(1));
                 assert!(window.is_focused);
                 assert_eq!(window.layout.unwrap().pos_in_scrolling_layout, Some((0, 0)));
