@@ -30,7 +30,7 @@ pub struct BarWindow {
 /// `wl-copy` to ensure external Wayland applications and clipboard managers
 /// receive the text.
 pub fn copy_to_clipboard(text: &str) {
-    if gtk::is_initialized() {
+    if gtk::is_initialized_main_thread() {
         if let Some(display) = gdk::Display::default() {
             let clipboard = gtk::Clipboard::for_display(&display, &gdk::SELECTION_CLIPBOARD);
             clipboard.set_text(text);
@@ -42,20 +42,23 @@ pub fn copy_to_clipboard(text: &str) {
         }
     }
 
-    let text_owned = text.to_string();
-    let wl_copy = crate::modules::resolve_helper("wl-copy");
-    std::thread::spawn(move || {
-        if let Ok(mut child) = std::process::Command::new(&wl_copy)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text_owned.as_bytes());
+    #[cfg(not(test))]
+    {
+        let text_owned = text.to_string();
+        let wl_copy = crate::modules::resolve_helper("wl-copy");
+        crate::runtime::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok(mut child) = tokio::process::Command::new(&wl_copy)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text_owned.as_bytes()).await;
+                }
+                let _ = child.wait().await;
             }
-            let _ = child.wait();
-        }
-    });
+        });
+    }
 }
 
 /// How long an unresolved bar waits before re-fetching outputs itself
@@ -562,148 +565,116 @@ mod tests {
 
     #[test]
     fn test_error_badge_show_and_clear() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let badge = ErrorBadge::new();
 
-        let badge = ErrorBadge::new();
+            // Initial state
+            assert!(!badge.button.is_visible());
+            assert!(badge.current_error.borrow().is_none());
 
-        // Initial state
-        assert!(!badge.button.is_visible());
-        assert!(badge.current_error.borrow().is_none());
+            // Show error
+            let msg = "CSS syntax error: unexpected token";
+            badge.show_error(msg);
+            let tooltip = format!("Click to copy error below:\n\n{msg}");
 
-        // Show error
-        let msg = "CSS syntax error: unexpected token";
-        badge.show_error(msg);
-        let tooltip = format!("Click to copy error below:\n\n{msg}");
+            assert!(badge.button.is_visible());
+            assert!(badge.label.is_visible());
+            assert_eq!(badge.label.text(), "ERROR");
+            assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+            assert_eq!(badge.button.tooltip_text().as_deref(), Some(tooltip.as_str()));
+            assert_eq!(badge.current_error.borrow().as_deref(), Some(msg));
 
-        assert!(badge.button.is_visible());
-        assert!(badge.label.is_visible());
-        assert_eq!(badge.label.text(), "ERROR");
-        assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
-        assert_eq!(badge.button.tooltip_text().as_deref(), Some(tooltip.as_str()));
-        assert_eq!(badge.current_error.borrow().as_deref(), Some(msg));
-
-        // Clear error
-        badge.clear_error();
-        assert!(!badge.button.is_visible());
-        assert!(badge.current_error.borrow().is_none());
-        assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+            // Clear error
+            badge.clear_error();
+            assert!(!badge.button.is_visible());
+            assert!(badge.current_error.borrow().is_none());
+            assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+        });
     }
 
     #[test]
     fn test_copy_to_clipboard_does_not_panic() {
+        // Safe off-main-thread
         copy_to_clipboard("test error message\nwith multiple lines & special chars $#@!");
+        // Safe on GTK main thread
+        crate::util::run_gtk_test(|| {
+            copy_to_clipboard("test error message\nwith multiple lines & special chars $#@!");
+        });
     }
 
     #[test]
     fn test_error_badge_cursor_and_clickable_classes() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let button = gtk::Button::new();
+            button.style_context().add_class("clickable");
+            crate::modules::enable_hover_cursor(&button);
 
-        let button = gtk::Button::new();
-        button.style_context().add_class("clickable");
-        crate::modules::enable_hover_cursor(&button);
+            let error_style = gtk::CssProvider::new();
+            let res = error_style.load_from_data(
+                b"button { background: #000000; background-color: #000000; border: 1px solid #ff4444; border-radius: 4px; padding: 2px 6px; margin: 4px; } label { color: #ff4444; font-weight: bold; font-size: 11px; }",
+            );
+            assert!(res.is_ok(), "Inline error badge CSS failed to parse: {:?}", res.err());
 
-        let error_style = gtk::CssProvider::new();
-        let res = error_style.load_from_data(
-            b"button { background: #000000; background-color: #000000; border: 1px solid #ff4444; border-radius: 4px; padding: 2px 6px; margin: 4px; } label { color: #ff4444; font-weight: bold; font-size: 11px; }",
-        );
-        assert!(res.is_ok(), "Inline error badge CSS failed to parse: {:?}", res.err());
-
-        assert!(button.style_context().has_class("clickable"));
-        let events = button.events();
-        assert!(events.contains(gdk::EventMask::ENTER_NOTIFY_MASK));
-        assert!(events.contains(gdk::EventMask::LEAVE_NOTIFY_MASK));
+            assert!(button.style_context().has_class("clickable"));
+            let events = button.events();
+            assert!(events.contains(gdk::EventMask::ENTER_NOTIFY_MASK));
+            assert!(events.contains(gdk::EventMask::LEAVE_NOTIFY_MASK));
+        });
     }
 
     #[test]
     fn test_error_badge_markup_preserved_on_show_and_clear() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
+        crate::util::run_gtk_test(|| {
+            let badge = ErrorBadge::new();
+            assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
 
-        let badge = ErrorBadge::new();
-        assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+            // Call show_error
+            badge.show_error("test error message");
+            assert!(badge.button.is_visible());
+            assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+            assert_eq!(badge.current_error.borrow().as_deref(), Some("test error message"));
 
-        // Call show_error
-        badge.show_error("test error message");
-        assert!(badge.button.is_visible());
-        assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
-        assert_eq!(badge.current_error.borrow().as_deref(), Some("test error message"));
-
-        // Call clear_error
-        badge.clear_error();
-        assert!(!badge.button.is_visible());
-        assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
-        assert!(badge.current_error.borrow().is_none());
+            // Call clear_error
+            badge.clear_error();
+            assert!(!badge.button.is_visible());
+            assert_eq!(badge.label.label().as_str(), ERROR_LABEL_MARKUP);
+            assert!(badge.current_error.borrow().is_none());
+        });
     }
 
     #[test]
     fn test_error_badge_css_valid_for_gtk() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-
-        let provider = gtk::CssProvider::new();
-        let res = provider.load_from_data(ERROR_BADGE_CSS);
-        assert!(res.is_ok(), "ERROR_BADGE_CSS failed to parse: {:?}", res.err());
+        crate::util::run_gtk_test(|| {
+            let provider = gtk::CssProvider::new();
+            let res = provider.load_from_data(ERROR_BADGE_CSS);
+            assert!(res.is_ok(), "ERROR_BADGE_CSS failed to parse: {:?}", res.err());
+        });
     }
 
     #[test]
     fn test_overlay_layout() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_size_request(50, -1);
-        let overlay = gtk::Overlay::new();
-        window.add(&overlay);
+        crate::util::run_gtk_test(|| {
+            // OffscreenWindow realizes children without mapping a real window,
+            // so running the test suite never flashes a window on screen.
+            let window = gtk::OffscreenWindow::new();
+            window.set_size_request(50, -1);
+            let overlay = gtk::Overlay::new();
+            window.add(&overlay);
 
-        let start_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        start_box.set_valign(gtk::Align::Start);
-        start_box.set_halign(gtk::Align::Fill);
-        overlay.add(&start_box);
+            let start_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            start_box.set_valign(gtk::Align::Start);
+            start_box.set_halign(gtk::Align::Fill);
+            overlay.add(&start_box);
 
-        let end_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        end_box.set_valign(gtk::Align::End);
-        end_box.set_halign(gtk::Align::Fill);
-        overlay.add_overlay(&end_box);
+            let end_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            end_box.set_valign(gtk::Align::End);
+            end_box.set_halign(gtk::Align::Fill);
+            overlay.add_overlay(&end_box);
 
-        window.show_all();
-        assert!(overlay.is_visible());
-        assert!(start_box.is_visible());
-        assert!(end_box.is_visible());
+            window.show_all();
+            assert!(overlay.is_visible());
+            assert!(start_box.is_visible());
+            assert!(end_box.is_visible());
+        });
     }
 }

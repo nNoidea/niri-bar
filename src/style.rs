@@ -144,18 +144,10 @@ mod tests {
 
     #[test]
     fn test_default_css_valid_for_gtk() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-
-        let provider = gtk::CssProvider::new();
-        let res = provider.load_from_data(DEFAULT_CSS.as_bytes());
-        assert!(res.is_ok(), "DEFAULT_CSS failed to parse in GTK: {:?}", res.err());
+        crate::util::run_gtk_test(|| {
+            let provider = gtk::CssProvider::new();
+            let res = provider.load_from_data(DEFAULT_CSS.as_bytes());
+            assert!(res.is_ok(), "DEFAULT_CSS failed to parse in GTK: {:?}", res.err());
+        });
     }
 }

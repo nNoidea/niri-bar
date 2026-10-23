@@ -95,32 +95,25 @@ mod tests {
 
     #[test]
     fn test_configure_spacer_button_visibility_and_sizing() {
-        if gtk::is_initialized() {
-            if !gtk::is_initialized_main_thread() {
-                eprintln!("Skipping GTK test: running on non-main GTK thread");
-                return;
-            }
-        } else if gtk::init().is_err() {
-            eprintln!("Skipping GTK test: display not available");
-            return;
-        }
-        let button = gtk::Button::new();
+        crate::util::run_gtk_test(|| {
+            let button = gtk::Button::new();
 
-        // When size <= 0: hidden and no_show_all
-        configure_spacer_button(&button, 0, true);
-        assert!(button.is_no_show_all());
-        assert!(!button.is_visible());
+            // When size <= 0: hidden and no_show_all
+            configure_spacer_button(&button, 0, true);
+            assert!(button.is_no_show_all());
+            assert!(!button.is_visible());
 
-        // When size > 0 and vertical: visible, height = size, width = -1
-        configure_spacer_button(&button, 15, true);
-        assert!(!button.is_no_show_all());
-        assert!(button.is_visible());
-        assert_eq!((button.width_request(), button.height_request()), (-1, 15));
+            // When size > 0 and vertical: visible, height = size, width = -1
+            configure_spacer_button(&button, 15, true);
+            assert!(!button.is_no_show_all());
+            assert!(button.is_visible());
+            assert_eq!((button.width_request(), button.height_request()), (-1, 15));
 
-        // When size > 0 and horizontal: visible, width = size, height = -1
-        configure_spacer_button(&button, 25, false);
-        assert!(!button.is_no_show_all());
-        assert!(button.is_visible());
-        assert_eq!((button.width_request(), button.height_request()), (25, -1));
+            // When size > 0 and horizontal: visible, width = size, height = -1
+            configure_spacer_button(&button, 25, false);
+            assert!(!button.is_no_show_all());
+            assert!(button.is_visible());
+            assert_eq!((button.width_request(), button.height_request()), (25, -1));
+        });
     }
 }

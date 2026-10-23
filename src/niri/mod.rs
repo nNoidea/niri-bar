@@ -7,7 +7,6 @@ use gdk::prelude::MonitorExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::niri::model::{Event, OutputInfo, WindowInfo, WorkspaceInfo};
@@ -19,16 +18,127 @@ pub struct AppState {
     pub workspaces: Vec<WorkspaceInfo>,
 }
 
+impl AppState {
+    /// Apply a Niri IPC event to the in-memory state.
+    ///
+    /// Returns `true` if the state was updated and listeners should be nudged.
+    pub fn apply_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::WorkspacesChanged { workspaces } => {
+                self.workspaces = workspaces;
+            }
+            Event::WorkspaceActivated { id, focused } => {
+                let mut ws_output = None;
+                for ws in &mut self.workspaces {
+                    if ws.id == id {
+                        ws_output.clone_from(&ws.output);
+                        ws.is_active = true;
+                        if focused {
+                            ws.is_focused = true;
+                        }
+                    }
+                }
+                if let Some(out) = ws_output {
+                    for ws in &mut self.workspaces {
+                        if ws.output.as_ref() == Some(&out) && ws.id != id {
+                            ws.is_active = false;
+                            if focused {
+                                ws.is_focused = false;
+                            }
+                        } else if focused && ws.id != id {
+                            ws.is_focused = false;
+                        }
+                    }
+                }
+            }
+            Event::OutputsChanged { outputs } => {
+                if let Some(outs) = outputs.filter(|o| !o.is_empty()) {
+                    self.outputs = outs;
+                }
+            }
+            Event::WindowsChanged { windows } => {
+                self.windows = windows;
+            }
+            Event::WindowOpenedOrChanged { window } => {
+                if window.is_focused {
+                    for w in &mut self.windows {
+                        w.is_focused = w.id == window.id;
+                    }
+                }
+                if let Some(idx) = self.windows.iter().position(|w| w.id == window.id) {
+                    self.windows[idx] = window;
+                } else {
+                    self.windows.push(window);
+                }
+            }
+            Event::WindowClosed { id } => {
+                self.windows.retain(|w| w.id != id);
+                let mut should_reset_drag = false;
+                {
+                    let mut g = crate::util::lock(&drag::GLOBAL_DRAG);
+                    if let Some(ref d) = *g {
+                        if d.window_id == id {
+                            g.take();
+                            should_reset_drag = true;
+                        }
+                    }
+                }
+                // NOTE: background thread — do NOT touch GTK here
+                // (`reset_all_cursors_and_overlay` creates/destroys widgets and
+                // must run on the main thread). We clear the drag state and
+                // request main-thread cleanup via `request_drag_cancel`.
+                if should_reset_drag {
+                    drag::request_drag_cancel(id);
+                }
+            }
+            Event::WindowFocusChanged { id } => {
+                for w in &mut self.windows {
+                    w.is_focused = id == Some(w.id);
+                }
+                if let Some(win_id) = id {
+                    if let Some(ws_id) = self
+                        .windows
+                        .iter()
+                        .find(|w| w.id == win_id)
+                        .and_then(|w| w.workspace_id)
+                    {
+                        for ws in &mut self.workspaces {
+                            if ws.id == ws_id {
+                                ws.is_focused = true;
+                                ws.is_active = true;
+                            } else {
+                                ws.is_focused = false;
+                            }
+                        }
+                    }
+                }
+            }
+            Event::WorkspaceActiveWindowChanged { .. } => {}
+            Event::WindowLayoutsChanged { changes } => {
+                for (win_id, layout) in changes {
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == win_id) {
+                        w.layout = Some(layout);
+                    }
+                }
+            }
+            Event::Other => return false,
+        }
+        true
+    }
+}
+
 pub struct NiriService {
     pub state: Arc<Mutex<AppState>>,
     pub update_tx: async_channel::Sender<()>,
     pub update_rx: async_channel::Receiver<()>,
     running: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for NiriService {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
     }
 }
 
@@ -42,12 +152,14 @@ impl NiriService {
     pub fn refresh_outputs_async(&self) {
         let state = Arc::clone(&self.state);
         let tx = self.update_tx.clone();
-        thread::spawn(move || match ipc::fetch_outputs() {
-            Ok(outputs) => {
-                crate::util::lock(&state).outputs = outputs;
-                crate::util::nudge(&tx);
+        crate::runtime::spawn(async move {
+            match ipc::fetch_outputs().await {
+                Ok(outputs) => {
+                    crate::util::lock(&state).outputs = outputs;
+                    crate::util::nudge(&tx);
+                }
+                Err(e) => log_warn!("niri", "On-demand outputs refetch failed: {e}"),
             }
-            Err(e) => log_warn!("niri", "On-demand outputs refetch failed: {e}"),
         });
     }
 
@@ -55,206 +167,157 @@ impl NiriService {
         let (update_tx, update_rx) = async_channel::unbounded::<()>();
         let state = Arc::new(Mutex::new(AppState::default()));
         let running = Arc::new(AtomicBool::new(true));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Initial fetch off-thread: never stall the GTK main thread on
-        // Unix-socket round-trips at startup. Bars render empty until the
-        // first nudge lands.
+        // Initial fetch as an async task: perform non-blocking socket round-trips
+        // BEFORE acquiring `state` so neither the GTK main thread nor the
+        // event-stream listener is stalled.
         {
             let state_init = Arc::clone(&state);
             let tx_init = update_tx.clone();
-            thread::spawn(move || {
+            let running_init = Arc::clone(&running);
+            crate::runtime::spawn(async move {
+                if !running_init.load(Ordering::SeqCst) {
+                    return;
+                }
+                let outputs = ipc::fetch_outputs()
+                    .await
+                    .map_err(|e| log_warn!("niri", "Initial outputs fetch failed ({e}); starting empty"))
+                    .ok();
+                let windows = ipc::fetch_windows()
+                    .await
+                    .map_err(|e| log_warn!("niri", "Initial windows fetch failed ({e}); starting empty"))
+                    .ok();
+                if let Some(ref wins) = windows {
+                    crate::icon::warm_window_icons_off_thread(wins);
+                }
+                let workspaces = ipc::fetch_workspaces()
+                    .await
+                    .map_err(|e| log_warn!("niri", "Initial workspaces fetch failed ({e}); starting empty"))
+                    .ok();
+
                 let mut st = crate::util::lock(&state_init);
-                if let Ok(outputs) = ipc::fetch_outputs() {
-                    st.outputs = outputs;
-                } else {
-                    log_warn!("niri", "Initial outputs fetch failed; starting empty");
+                if let Some(outputs) = outputs {
+                    if st.outputs.is_empty() {
+                        st.outputs = outputs;
+                    }
                 }
-                if let Ok(windows) = ipc::fetch_windows() {
-                    st.windows = windows;
-                } else {
-                    log_warn!("niri", "Initial windows fetch failed; starting empty");
+                if let Some(windows) = windows {
+                    if st.windows.is_empty() {
+                        st.windows = windows;
+                    }
                 }
-                if let Ok(workspaces) = ipc::fetch_workspaces() {
-                    st.workspaces = workspaces;
-                } else {
-                    log_warn!("niri", "Initial workspaces fetch failed; starting empty");
+                if let Some(workspaces) = workspaces {
+                    if st.workspaces.is_empty() {
+                        st.workspaces = workspaces;
+                    }
                 }
                 drop(st);
                 crate::util::nudge(&tx_init);
             });
         }
 
-        // Spawn background event listener thread
+        // Spawn background event listener task on the shared Tokio runtime
         {
             let state_clone = Arc::clone(&state);
             let running_clone = Arc::clone(&running);
+            let stop_clone = Arc::clone(&stop_notify);
             let tx_clone = update_tx.clone();
 
-            thread::spawn(move || {
-                while running_clone.load(Ordering::Relaxed) {
-                    let state_stream = Arc::clone(&state_clone);
-                    let running_stream = Arc::clone(&running_clone);
-                    let tx_stream = tx_clone.clone();
+            crate::runtime::spawn(async move {
+                while running_clone.load(Ordering::SeqCst) {
                     log_info!("niri", "Starting Niri IPC event listener loop");
-                    let running_check = Arc::clone(&running_clone);
-                    let res = ipc::listen_event_stream(
-                        move |event| {
-                            if !running_stream.load(Ordering::Relaxed) {
-                                return;
+                    match ipc::open_event_stream().await {
+                        Ok(mut lines) => loop {
+                            if !running_clone.load(Ordering::SeqCst) {
+                                break;
                             }
-                            log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
-                            // OutputsChanged needs blocking IPC refetches: do them
-                            // WITHOUT holding the state lock so reconcile/taskbar
-                            // updates are not stalled.
-                            if let Event::OutputsChanged { outputs } = &event {
-                                let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
-                                let fetched_outputs = if need_fetch_outputs {
-                                    match ipc::fetch_outputs() {
-                                        Ok(o) => Some(o),
-                                        Err(e) => {
-                                            log_warn!("niri", "Outputs refetch failed after OutputsChanged: {e}");
+                            let line_res = tokio::select! {
+                                _ = stop_clone.notified() => break,
+                                res = lines.next_line() => res,
+                            };
+                            match line_res {
+                                Ok(Some(line_str)) => {
+                                    let Some(event) = ipc::parse_event_line(&line_str) else {
+                                        continue;
+                                    };
+                                    if !running_clone.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
+                                    if let Event::OutputsChanged { outputs } = &event {
+                                        let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
+                                        let fetched_outputs = if need_fetch_outputs {
+                                            ipc::fetch_outputs()
+                                                .await
+                                                .map_err(|e| {
+                                                    log_warn!(
+                                                        "niri",
+                                                        "Outputs refetch failed after OutputsChanged: {e}"
+                                                    )
+                                                })
+                                                .ok()
+                                        } else {
                                             None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                let fetched_workspaces = match ipc::fetch_workspaces() {
-                                    Ok(w) => Some(w),
-                                    Err(e) => {
-                                        log_warn!("niri", "Workspaces refetch failed after OutputsChanged: {e}");
-                                        None
-                                    }
-                                };
-                                let mut st = crate::util::lock(&state_stream);
-                                if let Some(outs) = outputs.clone() {
-                                    if !outs.is_empty() {
-                                        st.outputs = outs;
-                                    } else if let Some(fetched) = fetched_outputs {
-                                        st.outputs = fetched;
-                                    }
-                                } else if let Some(fetched) = fetched_outputs {
-                                    st.outputs = fetched;
-                                }
-                                if let Some(wspaces) = fetched_workspaces {
-                                    st.workspaces = wspaces;
-                                }
-                                crate::util::nudge(&tx_stream);
-                                return;
-                            }
-                            let mut st = crate::util::lock(&state_stream);
-                            match event {
-                                Event::WorkspacesChanged { workspaces } => {
-                                    st.workspaces = workspaces;
-                                }
-                                Event::WorkspaceActivated { id, focused } => {
-                                    let mut ws_output = None;
-                                    for ws in &mut st.workspaces {
-                                        if ws.id == id {
-                                            ws_output.clone_from(&ws.output);
-                                            ws.is_active = true;
-                                            if focused {
-                                                ws.is_focused = true;
-                                            }
-                                        }
-                                    }
-                                    if let Some(out) = ws_output {
-                                        for ws in &mut st.workspaces {
-                                            if ws.output.as_ref() == Some(&out) && ws.id != id {
-                                                ws.is_active = false;
-                                                if focused {
-                                                    ws.is_focused = false;
-                                                }
-                                            } else if focused && ws.id != id {
-                                                ws.is_focused = false;
-                                            }
-                                        }
-                                    }
-                                }
-                                Event::OutputsChanged { .. } => {
-                                    // Handled above without holding the lock.
-                                }
-                                Event::WindowsChanged { windows } => {
-                                    st.windows = windows;
-                                }
-                                Event::WindowOpenedOrChanged { window } => {
-                                    if window.is_focused {
-                                        for w in &mut st.windows {
-                                            w.is_focused = w.id == window.id;
-                                        }
-                                    }
-                                    if let Some(idx) = st.windows.iter().position(|w| w.id == window.id) {
-                                        st.windows[idx] = window;
-                                    } else {
-                                        st.windows.push(window);
-                                    }
-                                }
-                                Event::WindowClosed { id } => {
-                                    st.windows.retain(|w| w.id != id);
-                                    let mut should_reset_drag = false;
-                                    {
-                                        let mut g = crate::util::lock(&drag::GLOBAL_DRAG);
-                                        if let Some(ref d) = *g {
-                                            if d.window_id == id {
-                                                g.take();
-                                                should_reset_drag = true;
-                                            }
-                                        }
-                                    }
-                                    // NOTE: background thread — do NOT touch GTK here
-                                    // (`reset_all_cursors_and_overlay` creates/destroys
-                                    // widgets and must run on the main thread).
-                                    // We clear the drag state (Sync-safe) and the
-                                    // nudge below wakes the main-thread updater,
-                                    // which performs the GTK cleanup only if the
-                                    // cancelled id still matches (see take_drag_cancel).
-                                    if should_reset_drag {
-                                        drag::request_drag_cancel(id);
-                                    }
-                                }
-                                Event::WindowFocusChanged { id } => {
-                                    for w in &mut st.windows {
-                                        w.is_focused = id == Some(w.id);
-                                    }
-                                    if let Some(win_id) = id {
-                                        if let Some(ws_id) =
-                                            st.windows.iter().find(|w| w.id == win_id).and_then(|w| w.workspace_id)
+                                        };
+                                        let fetched_workspaces = ipc::fetch_workspaces()
+                                            .await
+                                            .map_err(|e| {
+                                                log_warn!("niri", "Workspaces refetch failed after OutputsChanged: {e}")
+                                            })
+                                            .ok();
+
+                                        let mut st = crate::util::lock(&state_clone);
+                                        if let Some(outs) =
+                                            outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs)
                                         {
-                                            for ws in &mut st.workspaces {
-                                                if ws.id == ws_id {
-                                                    ws.is_focused = true;
-                                                    ws.is_active = true;
-                                                } else {
-                                                    ws.is_focused = false;
-                                                }
-                                            }
+                                            st.outputs = outs;
                                         }
+                                        if let Some(wspaces) = fetched_workspaces {
+                                            st.workspaces = wspaces;
+                                        }
+                                        drop(st);
+                                        crate::util::nudge(&tx_clone);
+                                        continue;
+                                    }
+
+                                    match &event {
+                                        Event::WindowsChanged { windows } => {
+                                            crate::icon::warm_window_icons_off_thread(windows);
+                                        }
+                                        Event::WindowOpenedOrChanged { window } => {
+                                            crate::icon::warm_window_icons_off_thread(std::slice::from_ref(window));
+                                        }
+                                        _ => {}
+                                    }
+
+                                    let changed = crate::util::lock(&state_clone).apply_event(event);
+                                    if changed {
+                                        crate::util::nudge(&tx_clone);
                                     }
                                 }
-                                Event::WorkspaceActiveWindowChanged { .. } => {}
-                                Event::WindowLayoutsChanged { changes } => {
-                                    for (win_id, layout) in changes {
-                                        if let Some(w) = st.windows.iter_mut().find(|w| w.id == win_id) {
-                                            w.layout = Some(layout);
-                                        }
-                                    }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    log_warn!("niri", "Error reading from Niri socket: {}", e);
+                                    break;
                                 }
-                                Event::Other => return,
                             }
-
-                            crate::util::nudge(&tx_stream);
                         },
-                        move || running_check.load(Ordering::Relaxed),
-                    );
+                        Err(e) => {
+                            if !running_clone.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
+                        }
+                    }
 
-                    if !running_clone.load(Ordering::Relaxed) {
+                    if !running_clone.load(Ordering::SeqCst) {
                         break;
                     }
-
-                    if let Err(e) = res {
-                        log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
+                    tokio::select! {
+                        _ = stop_clone.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     }
-                    thread::sleep(Duration::from_secs(1));
                 }
             });
         }
@@ -264,6 +327,7 @@ impl NiriService {
             update_tx,
             update_rx,
             running,
+            stop_notify,
         }
     }
 }
@@ -444,51 +508,67 @@ mod tests {
             ..Default::default()
         };
 
-        // 2. Window opened
+        // 2. Window opened via Event::WindowOpenedOrChanged
         let win1 = WindowInfo {
             id: 100,
             title: Some("Firefox".to_string()),
             app_id: Some("firefox".to_string()),
+            pid: None,
             workspace_id: Some(1),
             is_focused: true,
             layout: Some(WindowLayout {
                 pos_in_scrolling_layout: Some((0, 0)),
             }),
         };
-        state.windows.push(win1);
+        assert!(state.apply_event(Event::WindowOpenedOrChanged { window: win1 }));
         assert_eq!(state.windows.len(), 1);
         assert!(state.windows[0].is_focused);
 
-        // 3. Second window opened and focused
+        // 3. Second window opened and focused -> unfocuses win1 automatically
         let win2 = WindowInfo {
             id: 200,
             title: Some("Alacritty".to_string()),
             app_id: Some("Alacritty".to_string()),
-            workspace_id: Some(1),
+            pid: None,
+            workspace_id: Some(2),
             is_focused: true,
             layout: Some(WindowLayout {
                 pos_in_scrolling_layout: Some((1, 0)),
             }),
         };
-        for w in &mut state.windows {
-            w.is_focused = false;
-        }
-        state.windows.push(win2);
+        assert!(state.apply_event(Event::WindowOpenedOrChanged { window: win2 }));
         assert_eq!(state.windows.len(), 2);
         assert!(!state.windows[0].is_focused);
         assert!(state.windows[1].is_focused);
 
-        // 4. Window focus changed back to win1
-        for w in &mut state.windows {
-            w.is_focused = w.id == 100;
-        }
+        // 4. Window focus changed back to win1 -> also updates focused workspace to 1
+        assert!(state.apply_event(Event::WindowFocusChanged { id: Some(100) }));
         assert!(state.windows[0].is_focused);
         assert!(!state.windows[1].is_focused);
+        assert!(state.workspaces[0].is_focused);
+        assert!(!state.workspaces[1].is_focused);
 
-        // 5. Window closed
-        state.windows.retain(|w| w.id != 100);
+        // 5. Window layouts changed
+        assert!(state.apply_event(Event::WindowLayoutsChanged {
+            changes: vec![(
+                200,
+                WindowLayout {
+                    pos_in_scrolling_layout: Some((3, 0))
+                }
+            )],
+        }));
+        assert_eq!(
+            state.windows[1].layout.as_ref().and_then(|l| l.pos_in_scrolling_layout),
+            Some((3, 0))
+        );
+
+        // 6. Window closed
+        assert!(state.apply_event(Event::WindowClosed { id: 100 }));
         assert_eq!(state.windows.len(), 1);
         assert_eq!(state.windows[0].id, 200);
+
+        // 7. Unknown event returns false
+        assert!(!state.apply_event(Event::Other));
     }
 
     #[test]
@@ -509,25 +589,27 @@ mod tests {
                     is_active: false,
                     is_focused: false,
                 },
+                WorkspaceInfo {
+                    id: 3,
+                    idx: 1,
+                    output: Some("DP-1".to_string()),
+                    is_active: true,
+                    is_focused: false,
+                },
             ],
             ..Default::default()
         };
 
-        // Activate workspace 2
-        for ws in &mut state.workspaces {
-            if ws.id == 2 {
-                ws.is_active = true;
-                ws.is_focused = true;
-            } else if ws.output == Some("eDP-1".to_string()) {
-                ws.is_active = false;
-                ws.is_focused = false;
-            }
-        }
+        // Activate workspace 2 on eDP-1 with focus
+        assert!(state.apply_event(Event::WorkspaceActivated { id: 2, focused: true }));
 
         assert!(!state.workspaces[0].is_active);
         assert!(!state.workspaces[0].is_focused);
         assert!(state.workspaces[1].is_active);
         assert!(state.workspaces[1].is_focused);
+        // Workspace 3 on DP-1 remains active on its own output, but not focused
+        assert!(state.workspaces[2].is_active);
+        assert!(!state.workspaces[2].is_focused);
     }
 
     fn test_output(logical: Option<LogicalOutput>, make: &str, model: &str) -> OutputInfo {
@@ -703,5 +785,24 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(match_output_for_monitor(&fp, &outputs, false), Some("DP-1".to_string()));
         }
+    }
+
+    #[test]
+    fn test_niri_service_runs_on_tokio_without_os_threads() {
+        let _ = crate::runtime::handle();
+        crate::runtime::warm_up_shared_test_threads();
+        let warm = NiriService::new();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(warm);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let before = crate::runtime::min_thread_count();
+        let services: Vec<NiriService> = (0..5).map(|_| NiriService::new()).collect();
+        let during = crate::runtime::min_thread_count();
+        drop(services);
+        assert!(
+            during <= before + 4,
+            "5 active NiriService instances should run on shared Tokio runtime, not spawn OS threads (before: {before}, during: {during})"
+        );
     }
 }
