@@ -1,6 +1,6 @@
 [package]
 name = "niri-bar"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 rust-version = "1.85"
 authors = ["nNoidea"]
@@ -26,14 +26,16 @@ gio = "0.18"
 glib = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "1"
+# Only the reading half of `toml` is used (config parsing); disabling the
+# default `display` feature drops the `toml_writer` dependency.
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 async-channel = "2.3"
 chrono = "0.4"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zvariant = "5"
 futures-util = "0.3"
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "process", "io-util", "sync", "fs"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "process", "io-util", "sync"] }
 
 [profile.release]
 opt-level = 3
