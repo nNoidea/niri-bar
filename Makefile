@@ -13,6 +13,7 @@ uninstall:
 
 test:
 	cargo fmt --all -- --check
+	cargo check --all-targets
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 	cargo test --all-targets --all-features --locked
 boxtest:

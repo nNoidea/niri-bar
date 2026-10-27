@@ -107,7 +107,9 @@ pub fn is_probe_candidate(name: &str) -> bool {
 /// `NameOwnerChanged` signal (`name` = well-known name, `old_owner` = unique
 /// name that vanished). Pure so the cleanup matching is unit-testable.
 pub fn belongs_to_disconnected_owner(item_bus: &str, key: &str, name: &str, old_owner: &str) -> bool {
-    item_bus == name || item_bus == old_owner || key.starts_with(name) || key.starts_with(old_owner)
+    let key_bus = key.split_once('/').map_or(key, |(b, _)| b);
+    (!name.is_empty() && (item_bus == name || key_bus == name))
+        || (!old_owner.is_empty() && (item_bus == old_owner || key_bus == old_owner))
 }
 
 /// Parse Ayatana `/org/ayatana/NotificationItem` introspection XML into full
@@ -283,6 +285,27 @@ mod tests {
             ":1.60/StatusNotifierItem",
             "spotify",
             ":1.50"
+        ));
+        // Numeric suffix collision (e.g. `:1.6` or `:1.61` disconnecting
+        // when `:1.616/org/ayatana/NotificationItem/steam` or `:1.636/StatusNotifierItem`
+        // is registered) must NOT match!
+        assert!(!belongs_to_disconnected_owner(
+            ":1.616",
+            ":1.616/org/ayatana/NotificationItem/steam",
+            ":1.6",
+            ":1.6"
+        ));
+        assert!(!belongs_to_disconnected_owner(
+            ":1.616",
+            ":1.616/org/ayatana/NotificationItem/steam",
+            ":1.61",
+            ":1.61"
+        ));
+        assert!(!belongs_to_disconnected_owner(
+            ":1.636",
+            ":1.636/StatusNotifierItem",
+            ":1.63",
+            ":1.63"
         ));
     }
 }
