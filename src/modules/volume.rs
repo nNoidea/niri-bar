@@ -848,8 +848,40 @@ mod tests {
         assert_eq!(s_bt_mut.text.as_deref(), Some("󰂲\nM"));
     }
 
+    // --- Test Helpers ---
+
+    /// Helper for tests to record the live system volume and mute status prior to testing.
+    fn get_system_volume_and_mute() -> (Option<String>, bool) {
+        let output = std::process::Command::new(resolve_helper("wpctl"))
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+            .output()
+            .ok();
+        if let Some(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let muted = text.contains("[MUTED]");
+            let vol = text.split_whitespace().nth(1).map(|v| v.trim().to_string());
+            (vol, muted)
+        } else {
+            (None, false)
+        }
+    }
+
+    /// Helper for tests to restore the live system volume and mute status after tests complete.
+    fn restore_system_volume_and_mute(vol: Option<String>, muted: bool) {
+        if let Some(v) = vol {
+            let _ = std::process::Command::new(resolve_helper("wpctl"))
+                .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &v])
+                .output();
+            let mute_arg = if muted { "1" } else { "0" };
+            let _ = std::process::Command::new(resolve_helper("wpctl"))
+                .args(["set-mute", "@DEFAULT_AUDIO_SINK@", mute_arg])
+                .output();
+        }
+    }
+
     #[test]
     fn test_volume_click_behavior() {
+        let (init_vol, init_muted) = get_system_volume_and_mute();
         let config = VolumeConfig::default();
         let module = VolumeModule::new(config);
 
@@ -876,10 +908,13 @@ mod tests {
         module.handle_click(MouseButton::Middle);
         assert_eq!(module.current_vol.load(Ordering::Relaxed), 50);
         assert!(!module.is_muted.load(Ordering::Relaxed));
+
+        restore_system_volume_and_mute(init_vol, init_muted);
     }
 
     #[test]
     fn test_volume_click_behavior_stability() {
+        let (init_vol, init_muted) = get_system_volume_and_mute();
         for _ in 0..20 {
             let config = VolumeConfig::default();
             let module = VolumeModule::new(config);
@@ -895,6 +930,7 @@ mod tests {
                 "is_muted was overwritten concurrently by background supervisor thread"
             );
         }
+        restore_system_volume_and_mute(init_vol, init_muted);
     }
 
     #[test]
