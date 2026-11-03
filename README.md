@@ -69,7 +69,7 @@ make install
 Niri
 gtk3
 gtk-layer-shell
-wpctl / pw-mon (volume module)
+pipewire-pulse / pulseaudio (volume module)
 bluetoothctl (bluetooth module)
 ```
 
