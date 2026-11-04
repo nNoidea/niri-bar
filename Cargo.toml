@@ -1,8 +1,8 @@
 [package]
 name = "niri-bar"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["nNoidea"]
 description = "A fast, lightweight, standalone Wayland status bar and spatial window taskbar for Niri"
 license = "GPL-3.0-or-later"
@@ -32,8 +32,7 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 async-channel = "2.3"
 chrono = "0.4"
 libc = "0.2"
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-zvariant = "5"
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"] }
 futures-util = "0.3"
 pulseaudio = "0.3"
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "process", "io-util", "sync"] }
