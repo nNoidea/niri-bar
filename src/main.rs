@@ -387,11 +387,7 @@ mod tests {
             Err(_) => return,
         };
         rt.block_on(async {
-            let holder = match zbus::connection::Builder::session() {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            let conn = match holder.build().await {
+            let conn = match zbus::connection::Builder::session().build().await {
                 Ok(c) => c,
                 Err(_) => return,
             };

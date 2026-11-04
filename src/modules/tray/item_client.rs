@@ -153,7 +153,7 @@ pub(super) async fn handle_activate_request(conn: &Connection, req: ActivateRequ
                     menu_path.as_str(),
                     Some("com.canonical.dbusmenu"),
                     "Event",
-                    &(submenu_id, "clicked", zvariant::Value::I32(0), now),
+                    &(submenu_id, "clicked", zbus::Variant::I32(0), now),
                 )
                 .await
             {
@@ -184,13 +184,7 @@ pub(super) async fn handle_activate_request(conn: &Connection, req: ActivateRequ
     }
 }
 
-async fn get_sni_prop(
-    conn: &Connection,
-    bus: &str,
-    path: &str,
-    iface: &str,
-    prop: &str,
-) -> Option<zvariant::OwnedValue> {
+async fn get_sni_prop(conn: &Connection, bus: &str, path: &str, iface: &str, prop: &str) -> Option<zbus::OwnedVariant> {
     let msg = conn
         .call_method(
             Some(bus),
@@ -201,7 +195,7 @@ async fn get_sni_prop(
         )
         .await
         .ok()?;
-    msg.body().deserialize::<zvariant::OwnedValue>().ok()
+    msg.body().deserialize::<zbus::OwnedVariant>().ok()
 }
 
 async fn fetch_sni_icon_pixmap(
@@ -220,11 +214,11 @@ async fn fetch_sni_icon_pixmap(
         )
         .await
         .ok()?;
-    let is_le = zvariant::Endian::from(msg.primary_header().endian_sig()) == zvariant::Endian::Little;
+    let is_le = zbus::wire::Endian::from(msg.primary_header().endian_sig()) == zbus::wire::Endian::Little;
     let body = msg.body();
     let raw_bytes: &[u8] = body.data();
     super::protocol::parse_icon_pixmap_dbus_body(raw_bytes, is_le).or_else(|| {
-        body.deserialize::<zvariant::OwnedValue>()
+        body.deserialize::<zbus::OwnedVariant>()
             .ok()
             .and_then(|v| parse_icon_pixmap(v.deref()))
     })
@@ -254,20 +248,20 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
     let id = id_val
         .as_ref()
         .and_then(|v| match v.deref() {
-            zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .unwrap_or_else(|| bus.to_string());
 
     let title = title_val.as_ref().and_then(|v| match v.deref() {
-        zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+        zbus::Variant::Str(s) => Some(s.as_str().to_string()),
         _ => None,
     });
 
     let icon_name = icon_name_val
         .as_ref()
         .and_then(|v| match v.deref() {
-            zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .filter(|s| !s.trim().is_empty());
@@ -275,7 +269,7 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
     let icon_theme_path = theme_val
         .as_ref()
         .and_then(|v| match v.deref() {
-            zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .filter(|s| !s.trim().is_empty());
@@ -292,9 +286,9 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
     let item_is_menu = is_menu_val
         .as_ref()
         .and_then(|v| match v.deref() {
-            zvariant::Value::Bool(b) => Some(*b),
-            zvariant::Value::I32(i) => Some(*i != 0),
-            zvariant::Value::U32(u) => Some(*u != 0),
+            zbus::Variant::Bool(b) => Some(*b),
+            zbus::Variant::I32(i) => Some(*i != 0),
+            zbus::Variant::U32(u) => Some(*u != 0),
             _ => None,
         })
         .unwrap_or(false);
@@ -302,8 +296,8 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
     let menu_path = menu_val
         .as_ref()
         .and_then(|v| match v.deref() {
-            zvariant::Value::ObjectPath(p) => Some(p.as_str().to_string()),
-            zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+            zbus::Variant::ObjectPath(p) => Some(p.as_str().to_string()),
+            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         })
         .filter(|p| !p.is_empty() && p != "/NO_DBUSMENU" && p != "/");
@@ -413,11 +407,8 @@ pub(super) async fn process_and_track_item(
     ) -> Option<zbus::proxy::Proxy<'static>> {
         zbus::proxy::Builder::new(conn)
             .destination(bus.to_string())
-            .ok()?
             .path(path.to_string())
-            .ok()?
             .interface(iface)
-            .ok()?
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await

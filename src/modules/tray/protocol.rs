@@ -25,22 +25,22 @@ pub fn parse_item_address(service: &str, sender_opt: Option<&str>) -> (String, S
     }
 }
 
-pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap>> {
+pub fn parse_icon_pixmap(val: &zbus::Variant<'_>) -> Option<Vec<TrayIconPixmap>> {
     const MAX_DIM: i32 = 512;
     const MAX_PIXELS: u64 = 512 * 512;
     const MAX_PIXMAPS: usize = 8;
     const MAX_STORED_DIM: i32 = 64;
 
     let arr = match val {
-        zvariant::Value::Array(a) => a,
-        zvariant::Value::Value(inner) => return parse_icon_pixmap(inner),
+        zbus::Variant::Array(a) => a,
+        zbus::Variant::Variant(inner) => return parse_icon_pixmap(inner),
         _ => return None,
     };
 
-    let mut best: Option<(i32, i32, &zvariant::Array<'_>)> = None;
+    let mut best: Option<(i32, i32, &zbus::Array<'_>)> = None;
     for elem in arr.iter().take(MAX_PIXMAPS + 1) {
         let structure = match elem {
-            zvariant::Value::Structure(s) => s,
+            zbus::Variant::Structure(s) => s,
             _ => continue,
         };
         let fields = structure.fields();
@@ -48,17 +48,17 @@ pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap
             continue;
         }
         let w = match &fields[0] {
-            zvariant::Value::I32(v) => *v,
-            zvariant::Value::U32(v) => (*v).min(i32::MAX as u32) as i32,
-            zvariant::Value::I16(v) => *v as i32,
-            zvariant::Value::U16(v) => *v as i32,
+            zbus::Variant::I32(v) => *v,
+            zbus::Variant::U32(v) => (*v).min(i32::MAX as u32) as i32,
+            zbus::Variant::I16(v) => *v as i32,
+            zbus::Variant::U16(v) => *v as i32,
             _ => continue,
         };
         let h = match &fields[1] {
-            zvariant::Value::I32(v) => *v,
-            zvariant::Value::U32(v) => (*v).min(i32::MAX as u32) as i32,
-            zvariant::Value::I16(v) => *v as i32,
-            zvariant::Value::U16(v) => *v as i32,
+            zbus::Variant::I32(v) => *v,
+            zbus::Variant::U32(v) => (*v).min(i32::MAX as u32) as i32,
+            zbus::Variant::I16(v) => *v as i32,
+            zbus::Variant::U16(v) => *v as i32,
             _ => continue,
         };
         // Reject absurd dimensions before any allocation (DoS guard).
@@ -70,7 +70,7 @@ pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap
             _ => continue,
         };
         let data_arr = match &fields[2] {
-            zvariant::Value::Array(a) if a.len() == expected => a,
+            zbus::Variant::Array(a) if a.len() == expected => a,
             _ => continue,
         };
         let area = (w as u64) * (h as u64);
@@ -90,7 +90,7 @@ pub fn parse_icon_pixmap(val: &zvariant::Value<'_>) -> Option<Vec<TrayIconPixmap
 
     if dst_w == w && dst_h == h {
         for b in data_arr.iter() {
-            if let zvariant::Value::U8(byte) = b {
+            if let zbus::Variant::U8(byte) = b {
                 pixels.push(*byte);
             } else {
                 return None;
@@ -242,7 +242,7 @@ pub fn parse_icon_pixmap_dbus_body(data: &[u8], is_le: bool) -> Option<Vec<TrayI
     }])
 }
 
-pub fn parse_tooltip(props: &HashMap<String, zvariant::OwnedValue>) -> Option<TrayTooltip> {
+pub fn parse_tooltip(props: &HashMap<String, zbus::OwnedVariant>) -> Option<TrayTooltip> {
     const MAX_TOOLTIP: usize = 512;
     let trunc = |s: String| {
         if s.len() <= MAX_TOOLTIP {
@@ -253,25 +253,25 @@ pub fn parse_tooltip(props: &HashMap<String, zvariant::OwnedValue>) -> Option<Tr
     };
     let val = props.get("ToolTip").or_else(|| props.get("Tooltip"))?;
     match val.deref() {
-        zvariant::Value::Structure(s) => {
+        zbus::Variant::Structure(s) => {
             let fields = s.fields();
             let title = fields
                 .get(2)
                 .and_then(|v| match v {
-                    zvariant::Value::Str(st) => Some(trunc(st.as_str().to_string())),
+                    zbus::Variant::Str(st) => Some(trunc(st.as_str().to_string())),
                     _ => None,
                 })
                 .unwrap_or_default();
             let description = fields
                 .get(3)
                 .and_then(|v| match v {
-                    zvariant::Value::Str(st) => Some(trunc(st.as_str().to_string())),
+                    zbus::Variant::Str(st) => Some(trunc(st.as_str().to_string())),
                     _ => None,
                 })
                 .unwrap_or_default();
             Some(TrayTooltip { title, description })
         }
-        zvariant::Value::Str(s) => {
+        zbus::Variant::Str(s) => {
             let text = trunc(s.as_str().to_string());
             Some(TrayTooltip {
                 title: text.clone(),
@@ -282,86 +282,86 @@ pub fn parse_tooltip(props: &HashMap<String, zvariant::OwnedValue>) -> Option<Tr
     }
 }
 
-#[derive(serde::Deserialize, zvariant::Type, Debug, Clone)]
+#[derive(serde::Deserialize, zbus::Type, Debug, Clone)]
 pub struct RawMenuItem {
     pub id: i32,
-    pub props: HashMap<String, zvariant::OwnedValue>,
-    pub children: Vec<zvariant::OwnedValue>,
+    pub props: HashMap<String, zbus::OwnedVariant>,
+    pub children: Vec<zbus::OwnedVariant>,
 }
 
-impl<'a> TryFrom<&'a zvariant::Value<'a>> for RawMenuItem {
-    type Error = zvariant::Error;
+impl<'a> TryFrom<&'a zbus::Variant<'a>> for RawMenuItem {
+    type Error = zbus::Error;
 
-    fn try_from(val: &'a zvariant::Value<'a>) -> Result<Self, Self::Error> {
+    fn try_from(val: &'a zbus::Variant<'a>) -> Result<Self, Self::Error> {
         match val {
-            zvariant::Value::Structure(s) => {
+            zbus::Variant::Structure(s) => {
                 let fields = s.fields();
                 if fields.len() < 3 {
-                    return Err(zvariant::Error::IncorrectType);
+                    return Err(zbus::Error::IncorrectType);
                 }
                 let id = match &fields[0] {
-                    zvariant::Value::I32(i) => *i,
-                    zvariant::Value::U32(u) => *u as i32,
-                    _ => return Err(zvariant::Error::IncorrectType),
+                    zbus::Variant::I32(i) => *i,
+                    zbus::Variant::U32(u) => *u as i32,
+                    _ => return Err(zbus::Error::IncorrectType),
                 };
                 let mut props = HashMap::new();
-                if let zvariant::Value::Dict(d) = &fields[1] {
+                if let zbus::Variant::Dict(d) = &fields[1] {
                     for (k, v) in d.iter() {
-                        if let zvariant::Value::Str(ks) = k {
-                            if let Ok(ov) = zvariant::OwnedValue::try_from(v.clone()) {
+                        if let zbus::Variant::Str(ks) = k {
+                            if let Ok(ov) = zbus::OwnedVariant::try_from(v.clone()) {
                                 props.insert(ks.as_str().to_string(), ov);
                             }
                         }
                     }
                 }
                 let mut children = Vec::new();
-                if let zvariant::Value::Array(arr) = &fields[2] {
+                if let zbus::Variant::Array(arr) = &fields[2] {
                     for elem in arr.iter() {
-                        if let Ok(ov) = zvariant::OwnedValue::try_from(elem.clone()) {
+                        if let Ok(ov) = zbus::OwnedVariant::try_from(elem.clone()) {
                             children.push(ov);
                         }
                     }
                 }
                 Ok(RawMenuItem { id, props, children })
             }
-            zvariant::Value::Value(v) => RawMenuItem::try_from(&**v),
-            _ => Err(zvariant::Error::IncorrectType),
+            zbus::Variant::Variant(v) => RawMenuItem::try_from(&**v),
+            _ => Err(zbus::Error::IncorrectType),
         }
     }
 }
 
-impl TryFrom<&zvariant::OwnedValue> for RawMenuItem {
-    type Error = zvariant::Error;
+impl TryFrom<&zbus::OwnedVariant> for RawMenuItem {
+    type Error = zbus::Error;
 
-    fn try_from(val: &zvariant::OwnedValue) -> Result<Self, Self::Error> {
+    fn try_from(val: &zbus::OwnedVariant) -> Result<Self, Self::Error> {
         RawMenuItem::try_from(val.deref())
     }
 }
 
-fn extract_val_str<'a>(val: &'a zvariant::Value<'a>) -> Option<&'a str> {
+fn extract_val_str<'a>(val: &'a zbus::Variant<'a>) -> Option<&'a str> {
     match val {
-        zvariant::Value::Str(s) => Some(s.as_str()),
-        zvariant::Value::Value(inner) => extract_val_str(inner),
+        zbus::Variant::Str(s) => Some(s.as_str()),
+        zbus::Variant::Variant(inner) => extract_val_str(inner),
         _ => None,
     }
 }
 
-fn extract_val_bool(val: &zvariant::Value<'_>) -> Option<bool> {
+fn extract_val_bool(val: &zbus::Variant<'_>) -> Option<bool> {
     match val {
-        zvariant::Value::Bool(b) => Some(*b),
-        zvariant::Value::I32(i) => Some(*i != 0),
-        zvariant::Value::U32(u) => Some(*u != 0),
-        zvariant::Value::Value(inner) => extract_val_bool(inner),
+        zbus::Variant::Bool(b) => Some(*b),
+        zbus::Variant::I32(i) => Some(*i != 0),
+        zbus::Variant::U32(u) => Some(*u != 0),
+        zbus::Variant::Variant(inner) => extract_val_bool(inner),
         _ => None,
     }
 }
 
-fn extract_val_i32(val: &zvariant::Value<'_>) -> Option<i32> {
+fn extract_val_i32(val: &zbus::Variant<'_>) -> Option<i32> {
     match val {
-        zvariant::Value::I32(i) => Some(*i),
-        zvariant::Value::U32(u) => Some(*u as i32),
-        zvariant::Value::Bool(b) => Some(if *b { 1 } else { 0 }),
-        zvariant::Value::Value(inner) => extract_val_i32(inner),
+        zbus::Variant::I32(i) => Some(*i),
+        zbus::Variant::U32(u) => Some(*u as i32),
+        zbus::Variant::Bool(b) => Some(if *b { 1 } else { 0 }),
+        zbus::Variant::Variant(inner) => extract_val_i32(inner),
         _ => None,
     }
 }
@@ -481,43 +481,43 @@ mod tests {
         let mut props_root = HashMap::new();
         props_root.insert(
             "children-display".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("submenu")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("submenu")).unwrap(),
         );
 
         let mut props_child1 = HashMap::new();
         props_child1.insert(
             "label".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("Open Toolbox")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("Open Toolbox")).unwrap(),
         );
         props_child1.insert(
             "enabled".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from(true)).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from(true)).unwrap(),
         );
         props_child1.insert(
             "visible".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from(true)).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from(true)).unwrap(),
         );
 
         let mut props_child2 = HashMap::new();
         props_child2.insert(
             "label".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("Quit App")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("Quit App")).unwrap(),
         );
         props_child2.insert(
             "type".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("standard")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("standard")).unwrap(),
         );
 
-        let child1_struct = zvariant::Structure::from((1i32, props_child1, Vec::<zvariant::OwnedValue>::new()));
+        let child1_struct = zbus::Structure::from((1i32, props_child1, Vec::<zbus::OwnedVariant>::new()));
 
-        let child2_struct = zvariant::Structure::from((2i32, props_child2, Vec::<zvariant::OwnedValue>::new()));
+        let child2_struct = zbus::Structure::from((2i32, props_child2, Vec::<zbus::OwnedVariant>::new()));
 
         let root = RawMenuItem {
             id: 0,
             props: props_root,
             children: vec![
-                zvariant::OwnedValue::try_from(zvariant::Value::Structure(child1_struct)).unwrap(),
-                zvariant::OwnedValue::try_from(zvariant::Value::Structure(child2_struct)).unwrap(),
+                zbus::OwnedVariant::try_from(zbus::Variant::Structure(child1_struct)).unwrap(),
+                zbus::OwnedVariant::try_from(zbus::Variant::Structure(child2_struct)).unwrap(),
             ],
         };
 
@@ -533,39 +533,39 @@ mod tests {
         let mut props_sep = HashMap::new();
         props_sep.insert(
             "type".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("separator")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("separator")).unwrap(),
         );
 
         let mut props_check = HashMap::new();
         props_check.insert(
             "label".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("Dark Mode")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("Dark Mode")).unwrap(),
         );
         props_check.insert(
             "toggle-type".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("checkmark")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("checkmark")).unwrap(),
         );
         props_check.insert(
             "toggle-state".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from(1i32)).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from(1i32)).unwrap(),
         );
 
-        let sep_struct = zvariant::Structure::from((10i32, props_sep, Vec::<zvariant::OwnedValue>::new()));
+        let sep_struct = zbus::Structure::from((10i32, props_sep, Vec::<zbus::OwnedVariant>::new()));
 
-        let check_struct = zvariant::Structure::from((11i32, props_check, Vec::<zvariant::OwnedValue>::new()));
+        let check_struct = zbus::Structure::from((11i32, props_check, Vec::<zbus::OwnedVariant>::new()));
 
         let mut props_root = HashMap::new();
         props_root.insert(
             "children-display".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("submenu")).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("submenu")).unwrap(),
         );
 
         let root = RawMenuItem {
             id: 0,
             props: props_root,
             children: vec![
-                zvariant::OwnedValue::try_from(zvariant::Value::Structure(sep_struct)).unwrap(),
-                zvariant::OwnedValue::try_from(zvariant::Value::Structure(check_struct)).unwrap(),
+                zbus::OwnedVariant::try_from(zbus::Variant::Structure(sep_struct)).unwrap(),
+                zbus::OwnedVariant::try_from(zbus::Variant::Structure(check_struct)).unwrap(),
             ],
         };
 
@@ -593,11 +593,11 @@ mod tests {
             children: Vec::new(),
         };
         for id in (0..depth).rev() {
-            let wrapped = zvariant::Structure::from((
+            let wrapped = zbus::Structure::from((
                 id as i32,
-                HashMap::<String, zvariant::OwnedValue>::new(),
+                HashMap::<String, zbus::OwnedVariant>::new(),
                 vec![
-                    zvariant::OwnedValue::try_from(zvariant::Value::Structure(zvariant::Structure::from((
+                    zbus::OwnedVariant::try_from(zbus::Variant::Structure(zbus::Structure::from((
                         child.id,
                         child.props.clone(),
                         child.children.clone(),
@@ -605,9 +605,8 @@ mod tests {
                     .unwrap(),
                 ],
             ));
-            child =
-                RawMenuItem::try_from(&zvariant::OwnedValue::try_from(zvariant::Value::Structure(wrapped)).unwrap())
-                    .expect("test menu nesting must parse as RawMenuItem");
+            child = RawMenuItem::try_from(&zbus::OwnedVariant::try_from(zbus::Variant::Structure(wrapped)).unwrap())
+                .expect("test menu nesting must parse as RawMenuItem");
         }
         child
     }
@@ -631,7 +630,7 @@ mod tests {
         let mut props = HashMap::new();
         props.insert(
             "label".to_string(),
-            zvariant::OwnedValue::try_from(zvariant::Value::from("x".repeat(2000).as_str())).unwrap(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("x".repeat(2000).as_str())).unwrap(),
         );
         let item = RawMenuItem {
             id: 1,
@@ -645,25 +644,25 @@ mod tests {
     #[test]
     fn test_pixmap_dimension_caps() {
         // Absurd dimensions with a short buffer must be rejected, not allocated.
-        let huge = zvariant::Value::from(vec![zvariant::Value::Structure(zvariant::Structure::from((
+        let huge = zbus::Variant::from(vec![zbus::Variant::Structure(zbus::Structure::from((
             99999i32,
             99999i32,
-            zvariant::Value::from(vec![0u8; 16]),
+            zbus::Variant::from(vec![0u8; 16]),
         )))]);
         assert!(parse_icon_pixmap(&huge).is_none());
 
         // Length mismatch (declares 2x2x4, delivers 4 bytes) rejected.
-        let short = zvariant::Value::from(vec![zvariant::Value::Structure(zvariant::Structure::from((
+        let short = zbus::Variant::from(vec![zbus::Variant::Structure(zbus::Structure::from((
             2i32,
             2i32,
-            zvariant::Value::from(vec![0u8; 4]),
+            zbus::Variant::from(vec![0u8; 4]),
         )))]);
         assert!(parse_icon_pixmap(&short).is_none());
     }
 
     #[test]
     fn test_pixmap_downsamples_oversized_and_keeps_single_best() {
-        let val = zvariant::Value::from(vec![
+        let val = zbus::Variant::from(vec![
             (16i32, 16i32, vec![0xAAu8; 16 * 16 * 4]),
             (512i32, 512i32, vec![0xFFu8; 512 * 512 * 4]),
         ]);
@@ -675,9 +674,18 @@ mod tests {
         assert!(parsed[0].pixels.iter().all(|&b| b == 0xFF));
 
         // Verify zero-copy D-Bus wire body parser produces the exact same output
-        let ctxt = zvariant::serialized::Context::new_dbus(zvariant::LE, 0);
-        let bytes = zvariant::to_bytes(ctxt, &val).unwrap();
+        let ctxt = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
+        let bytes = zbus::wire::to_bytes(ctxt, &val).unwrap();
         let wire_parsed = parse_icon_pixmap_dbus_body(&bytes, true).expect("Should parse D-Bus wire body");
         assert_eq!(wire_parsed, parsed);
+    }
+
+    #[test]
+    fn test_nested_variant_unwrapping() {
+        let inner = zbus::Variant::from(vec![(4i32, 4i32, vec![0x77u8; 4 * 4 * 4])]);
+        let wrapped = zbus::Variant::Variant(Box::new(inner));
+        let parsed = parse_icon_pixmap(&wrapped).expect("Nested Variant::Variant must unwrap");
+        assert_eq!(parsed[0].width, 4);
+        assert_eq!(parsed[0].height, 4);
     }
 }

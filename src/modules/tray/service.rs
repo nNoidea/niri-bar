@@ -138,17 +138,11 @@ async fn run_tray_session(
     item_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     probe_sem: Arc<tokio::sync::Semaphore>,
 ) -> Option<String> {
-    let conn = match zbus::connection::Builder::session() {
-        Ok(builder) => match builder.build().await {
-            Ok(c) => c,
-            Err(e) => {
-                log_warn!("tray", "Failed to connect to DBus session: {}", e);
-                return Some(format!("connect failed: {e}"));
-            }
-        },
+    let conn = match zbus::connection::Builder::session().build().await {
+        Ok(c) => c,
         Err(e) => {
-            log_warn!("tray", "Failed to create DBus builder: {}", e);
-            return Some(format!("builder failed: {e}"));
+            log_warn!("tray", "Failed to connect to DBus session: {}", e);
+            return Some(format!("connect failed: {e}"));
         }
     };
     *current_conn.lock().await = Some(conn.clone());

@@ -172,11 +172,7 @@ pub fn pixmap_to_pixbuf(pixmaps: &[RawIconPixmap]) -> Option<Pixbuf> {
         }
     };
     let mut rgba = Vec::with_capacity(expected_len);
-    for chunk in best.pixels.chunks_exact(4) {
-        let a = chunk[0];
-        let r = chunk[1];
-        let g = chunk[2];
-        let b = chunk[3];
+    for &[a, r, g, b] in best.pixels.as_chunks::<4>().0 {
         rgba.push(r);
         rgba.push(g);
         rgba.push(b);
@@ -223,8 +219,8 @@ pub fn decode_png_bytes_to_pixbuf(png_bytes: &[u8], target_size: i32) -> Option<
         let data = surface.data().ok()?;
         for y in 0..h as usize {
             let row = &data[y * (stride as usize)..y * (stride as usize) + (w as usize) * 4];
-            for px in row.chunks_exact(4) {
-                let raw = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]);
+            for &px in row.as_chunks::<4>().0 {
+                let raw = u32::from_ne_bytes(px);
                 let a = if has_alpha { ((raw >> 24) & 0xff) as u8 } else { 0xff };
                 let r_pre = (raw >> 16) & 0xff;
                 let g_pre = (raw >> 8) & 0xff;
