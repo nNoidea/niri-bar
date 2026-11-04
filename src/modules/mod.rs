@@ -145,7 +145,6 @@ pub fn dbus_get_variant(
 pub struct ModuleCore {
     subscribers: ModuleSubscribers,
     stop_signal: StopSignal,
-    child: Arc<Mutex<Option<std::process::Child>>>,
 }
 
 impl ModuleCore {
@@ -153,16 +152,7 @@ impl ModuleCore {
         Self {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             stop_signal: StopSignal::new(),
-            child: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn set_child(&self, child: std::process::Child) {
-        *crate::util::lock(&self.child) = Some(child);
-    }
-
-    pub fn take_child(&self) -> Option<std::process::Child> {
-        crate::util::lock(&self.child).take()
     }
 
     pub fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
@@ -181,10 +171,6 @@ impl ModuleCore {
 
     pub fn shutdown(&self) {
         self.stop_signal.stop();
-        if let Some(mut child) = crate::util::lock(&self.child).take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 
     pub fn notify(&self) {
@@ -260,6 +246,7 @@ impl SharedModules {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Right,
@@ -344,16 +331,6 @@ pub fn resolve_helper(name: &str) -> String {
         }
     }
     name.to_string()
-}
-
-/// Truncate untrusted text for logs (500 chars, matching IPC precedent).
-pub fn truncate_log(s: &str) -> String {
-    const MAX: usize = 500;
-    if s.len() <= MAX {
-        s.to_string()
-    } else {
-        format!("{}…[truncated {} chars]", &s[..MAX], s.len() - MAX)
-    }
 }
 
 /// Idle cadence for a failing poll worker: `base, 2*base, 4*base…` capped
@@ -528,14 +505,12 @@ impl ModuleWidget {
             }
         });
 
-        // Mouse click bindings
+        // Mouse click bindings (ignore synthesized DoubleButtonPress / TripleButtonPress
+        // so rapid clicks within GTK's 400ms double-click window don't fire twice and cancel out).
         let mod_click = Arc::clone(&module);
         button.connect_button_press_event(move |_, ev| {
-            match ev.button() {
-                1 => mod_click.handle_click(MouseButton::Left),
-                2 => mod_click.handle_click(MouseButton::Middle),
-                3 => mod_click.handle_click(MouseButton::Right),
-                _ => {}
+            if let Some(btn) = Self::map_button_event(ev.event_type(), ev.button()) {
+                mod_click.handle_click(btn);
             }
             Propagation::Proceed
         });
@@ -562,6 +537,18 @@ impl ModuleWidget {
         button.show_all();
 
         Self { button }
+    }
+
+    pub fn map_button_event(event_type: gdk::EventType, button_num: u32) -> Option<MouseButton> {
+        if event_type != gdk::EventType::ButtonPress {
+            return None;
+        }
+        match button_num {
+            1 => Some(MouseButton::Left),
+            2 => Some(MouseButton::Middle),
+            3 => Some(MouseButton::Right),
+            _ => None,
+        }
     }
 
     pub fn format_combined_label(icon: Option<&str>, text: Option<&str>, orientation: Orientation) -> String {
@@ -726,12 +713,27 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_log_caps() {
-        assert_eq!(truncate_log("hi"), "hi");
-        let long = "x".repeat(600);
-        let t = truncate_log(&long);
-        assert!(t.contains("truncated"));
-        assert!(t.len() < long.len());
+    fn test_map_button_event_ignores_double_and_triple_press() {
+        assert_eq!(
+            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 1),
+            Some(MouseButton::Left)
+        );
+        assert_eq!(
+            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 2),
+            Some(MouseButton::Middle)
+        );
+        assert_eq!(
+            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 3),
+            Some(MouseButton::Right)
+        );
+        assert_eq!(
+            ModuleWidget::map_button_event(gdk::EventType::DoubleButtonPress, 1),
+            None
+        );
+        assert_eq!(
+            ModuleWidget::map_button_event(gdk::EventType::TripleButtonPress, 1),
+            None
+        );
     }
 
     #[test]
