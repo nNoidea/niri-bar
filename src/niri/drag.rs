@@ -482,6 +482,7 @@ pub fn spawn_monitor_overlays(
         overlay.add_controller(key_ctrl);
 
         overlay.set_visible(true);
+        gtk::prelude::WidgetExt::realize(&overlay);
         OVERLAY_WINDOWS.with(|cell| cell.borrow_mut().push(overlay));
     }
 }
@@ -504,16 +505,48 @@ fn release_drag_cursor_grab() {
 
 pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Option<&Button>) {
     let size = if size <= 0 { 20 } else { size };
-    if let Some(pixbuf) = crate::icon::load_pixbuf_at_size(icon_key, size) {
+    let texture_opt = source_button
+        .and_then(|b| b.child())
+        .and_then(|c| c.downcast::<gtk::Image>().ok())
+        .and_then(|img| img.paintable())
+        .and_then(|p| p.downcast::<gdk::Texture>().ok())
+        .or_else(|| crate::icon::load_pixbuf_at_size(icon_key, size).map(|pb| gdk::Texture::for_pixbuf(&pb)));
+
+    if let Some(texture) = texture_opt {
         if let Some(display) = gdk::Display::default() {
-            let texture = gdk::Texture::for_pixbuf(&pixbuf);
-            let cursor = gdk::Cursor::from_texture(&texture, size / 2, size / 2, None);
-            for win in gtk::Window::list_toplevels() {
-                win.set_cursor(Some(&cursor));
+            let hotspot_x = texture.width() / 2;
+            let hotspot_y = texture.height() / 2;
+            let cursor = gdk::Cursor::from_texture(&texture, hotspot_x, hotspot_y, None);
+
+            for widget in gtk::Window::list_toplevels() {
+                widget.set_cursor(Some(&cursor));
+                if let Some(native) = widget.native() {
+                    if let Some(surface) = native.surface() {
+                        surface.set_cursor(Some(&cursor));
+                    }
+                }
             }
+
+            OVERLAY_WINDOWS.with(|cell| {
+                for win in cell.borrow().iter() {
+                    win.set_cursor(Some(&cursor));
+                    if let Some(native) = win.native() {
+                        if let Some(surface) = native.surface() {
+                            surface.set_cursor(Some(&cursor));
+                        }
+                    }
+                }
+            });
+
             if let Some(b) = source_button {
                 b.set_cursor(Some(&cursor));
+                if let Some(native) = b.native() {
+                    if let Some(surface) = native.surface() {
+                        surface.set_cursor(Some(&cursor));
+                    }
+                }
             }
+
             DRAG_CURSOR_GRAB.with(|g| g.set(true));
             display.flush();
         }
@@ -524,9 +557,26 @@ pub fn reset_all_cursors_and_overlay(source_button: Option<&Button>) {
     release_drag_cursor_grab();
 
     if let Some(display) = gdk::Display::default() {
-        for win in gtk::Window::list_toplevels() {
-            win.set_cursor(None);
+        for widget in gtk::Window::list_toplevels() {
+            widget.set_cursor(None);
+            if let Some(native) = widget.native() {
+                if let Some(surface) = native.surface() {
+                    surface.set_cursor(None);
+                }
+            }
         }
+
+        OVERLAY_WINDOWS.with(|cell| {
+            for win in cell.borrow().iter() {
+                win.set_cursor(None);
+                if let Some(native) = win.native() {
+                    if let Some(surface) = native.surface() {
+                        surface.set_cursor(None);
+                    }
+                }
+            }
+        });
+
         display.flush();
     }
 
@@ -537,6 +587,11 @@ pub fn reset_all_cursors_and_overlay(source_button: Option<&Button>) {
         b.remove_css_class("drag-placeholder");
         b.remove_css_class("drag-source-away");
         b.set_cursor_from_name(Some("pointer"));
+        if let Some(native) = b.native() {
+            if let Some(surface) = native.surface() {
+                surface.set_cursor(None);
+            }
+        }
     }
 
     if let Some(display) = gdk::Display::default() {
@@ -869,6 +924,59 @@ mod tests {
     }
 
     #[test]
+    fn test_drag_cursor_applied_to_surfaces_and_reset() {
+        crate::util::run_gtk_test(|| {
+            struct Teardown;
+            impl Drop for Teardown {
+                fn drop(&mut self) {
+                    reset_all_cursors_and_overlay(None);
+                }
+            }
+            let _guard = Teardown;
+
+            let win = Window::new();
+            win.set_visible(true);
+            gtk::prelude::WidgetExt::realize(&win);
+
+            let native = win.native().expect("Window must have a native");
+            let surface = native.surface().expect("Window must have a native surface");
+            assert!(surface.cursor().is_none(), "Initial surface cursor must be None");
+
+            let source_btn = Button::new();
+            source_btn.set_cursor_from_name(Some("pointer"));
+            let pb = crate::icon::load_pixbuf_at_size("firefox", 24).unwrap();
+            let texture = gdk::Texture::for_pixbuf(&pb);
+            let img = gtk::Image::from_paintable(Some(&texture));
+            source_btn.set_child(Some(&img));
+            win.set_child(Some(&source_btn));
+
+            apply_drag_cursor_globally("firefox", 24, Some(&source_btn));
+
+            assert!(drag_cursor_grab_active(), "DRAG_CURSOR_GRAB must be true");
+            assert!(win.cursor().is_some(), "Window widget cursor must be set");
+            assert!(
+                surface.cursor().is_some(),
+                "GDK surface cursor must be set to the drag icon so Wayland compositor displays it"
+            );
+            assert!(source_btn.cursor().is_some(), "Source button widget cursor must be set");
+
+            reset_all_cursors_and_overlay(Some(&source_btn));
+
+            assert!(!drag_cursor_grab_active(), "DRAG_CURSOR_GRAB must be false after reset");
+            assert!(
+                surface.cursor().is_none(),
+                "GDK surface cursor must be None after reset"
+            );
+            assert!(win.cursor().is_none(), "Window widget cursor must be None after reset");
+            assert_eq!(
+                source_btn.cursor().map(|c| c.name().map(|n| n.to_string())),
+                Some(Some("pointer".to_string())),
+                "Source button cursor must be restored to pointer after reset"
+            );
+        });
+    }
+
+    #[test]
     fn test_create_surface_from_pixbuf_with_scale() {
         crate::util::run_gtk_test(|| {
             let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).unwrap();
@@ -1031,6 +1139,19 @@ mod tests {
                 assert!(has_legacy, "Overlay must have Capture-phase EventControllerLegacy");
                 assert!(has_click, "Overlay must have Capture-phase GestureClick on button 0");
                 assert!(has_key, "Overlay must have EventControllerKey for Escape");
+            });
+
+            // Verify that applying drag cursor sets cursor on overlay window and its surface
+            apply_drag_cursor_globally("firefox", 24, Some(&source_btn));
+            OVERLAY_WINDOWS.with(|cell| {
+                let windows = cell.borrow();
+                let overlay = &windows[0];
+                assert!(overlay.cursor().is_some(), "Overlay window widget cursor must be set");
+                if let Some(native) = overlay.native() {
+                    if let Some(surface) = native.surface() {
+                        assert!(surface.cursor().is_some(), "Overlay GDK surface cursor must be set");
+                    }
+                }
             });
 
             // Teardown via close_overlay_windows
