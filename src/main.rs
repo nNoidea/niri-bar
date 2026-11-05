@@ -507,6 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ci_workflows_bypass_azure_apt_mirror() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflows_dir = root.join(".github/workflows");
+
+        for workflow_name in ["dev.yml", "main.yml", "other.yml"] {
+            let workflow_path = workflows_dir.join(workflow_name);
+            let content = std::fs::read_to_string(&workflow_path)
+                .unwrap_or_else(|e| panic!("Failed to read {workflow_name}: {e}"));
+
+            // Must replace flaky Azure mirror with official Canonical archive.ubuntu.com
+            assert!(
+                content.contains("azure\\.archive\\.ubuntu\\.com") && content.contains("archive.ubuntu.com"),
+                "{workflow_name} must switch from azure.archive.ubuntu.com to official archive.ubuntu.com"
+            );
+            assert!(
+                content.contains("Acquire::http::Timeout"),
+                "{workflow_name} must configure apt timeouts to avoid hanging"
+            );
+        }
+    }
+
+    #[test]
     fn test_no_include_str_on_gitignored_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src_dir = root.join("src");
