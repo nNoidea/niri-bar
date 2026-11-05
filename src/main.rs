@@ -452,8 +452,8 @@ mod tests {
             "scripts/boxtest.sh must not use ubuntu:24.04 as it lacks libgtk4-layer-shell-dev"
         );
         assert!(
-            boxtest.contains("ubuntu:latest") || boxtest.contains("ubuntu:26.04"),
-            "scripts/boxtest.sh must target an Ubuntu image that packages GTK4 layer shell"
+            boxtest.contains("IMAGE=\"${IMAGE:-ubuntu:26.04}\""),
+            "scripts/boxtest.sh must default to ubuntu:26.04 which natively packages GTK4 layer shell"
         );
         assert!(
             !boxtest.contains("sudo -E"),
@@ -474,5 +474,35 @@ mod tests {
             readme.contains("gtk4") && readme.contains("gtk4-layer-shell"),
             "README.md must list gtk4 and gtk4-layer-shell in requirements"
         );
+    }
+
+    #[test]
+    fn test_ci_workflows_target_ubuntu_26_04() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflows_dir = root.join(".github/workflows");
+
+        for workflow_name in ["dev.yml", "main.yml", "other.yml"] {
+            let workflow_path = workflows_dir.join(workflow_name);
+            let content = std::fs::read_to_string(&workflow_path)
+                .unwrap_or_else(|e| panic!("Failed to read {workflow_name}: {e}"));
+
+            // Must use ubuntu-26.04 runners so libgtk4-layer-shell-dev is natively available
+            assert!(
+                content.contains("runs-on: ubuntu-26.04"),
+                "{workflow_name} must specify runs-on: ubuntu-26.04"
+            );
+            assert!(
+                !content.contains("runs-on: ubuntu-latest"),
+                "{workflow_name} must not use ubuntu-latest as it can map to 24.04 lacking gtk4-layer-shell"
+            );
+            assert!(
+                !content.contains("archive.ubuntu.com/ubuntu/pool/universe/g/gtk4-layer-shell"),
+                "{workflow_name} should cleanly install native packages without manual deb fallbacks"
+            );
+            assert!(
+                content.contains("libgtk-4-dev libgtk4-layer-shell-dev"),
+                "{workflow_name} must install native libgtk-4-dev and libgtk4-layer-shell-dev"
+            );
+        }
     }
 }

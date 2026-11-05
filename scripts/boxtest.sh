@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONTAINER_NAME="niri-bar-ci-test"
-IMAGE="${IMAGE:-ubuntu:latest}"
+IMAGE="${IMAGE:-ubuntu:26.04}"
 
 # Check if distrobox is installed
 if ! command -v distrobox >/dev/null 2>&1; then

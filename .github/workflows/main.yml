@@ -16,7 +16,7 @@ concurrency:
 jobs:
   gate:
     name: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
@@ -46,7 +46,7 @@ jobs:
     name: test
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -75,7 +75,7 @@ jobs:
   build:
     name: build
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -128,7 +128,7 @@ jobs:
     name: release
     needs: build
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
