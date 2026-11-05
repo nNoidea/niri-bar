@@ -505,4 +505,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_no_include_str_on_gitignored_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = root.join("src");
+
+        fn check_dir(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).expect("read_dir failed") {
+                let entry = entry.expect("entry failed");
+                let path = entry.path();
+                if path.is_dir() {
+                    check_dir(&path);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let content = std::fs::read_to_string(&path).expect("read failed");
+                    assert!(
+                        !content.contains("include_str!(\"../../../.config")
+                            && !content.contains("include_str!(\"../../.config")
+                            && !content.contains("include_str!(\"../.config")
+                            && !content.contains("include_str!(\".config"),
+                        "File {} must not use compile-time include_str! on gitignored .config path",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        check_dir(&src_dir);
+    }
 }
