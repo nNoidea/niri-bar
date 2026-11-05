@@ -9,16 +9,16 @@ Source0:        {{{ git_dir_pack }}}
 
 BuildRequires:  cargo
 BuildRequires:  rust >= 1.85
-BuildRequires:  pkgconfig(gtk+-3.0)
-BuildRequires:  pkgconfig(gtk-layer-shell-0)
+BuildRequires:  pkgconfig(gtk4)
+BuildRequires:  pkgconfig(gtk4-layer-shell-0)
 BuildRequires:  gcc
 
 # Runtime dependencies
-Requires:       gtk3
-Requires:       gtk-layer-shell
+Requires:       gtk4
+Requires:       gtk4-layer-shell
 
 # Optional modules (gracefully hidden when hardware is not present)
-Recommends:     pipewire-utils
+Recommends:     (pipewire-pulseaudio or pulseaudio)
 Recommends:     bluez
 
 %description

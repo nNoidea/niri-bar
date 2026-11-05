@@ -1,12 +1,18 @@
 use gtk::Orientation;
+use std::collections::HashMap;
 use std::fs;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
 use crate::modules::{
-    spawn_command, BarModule, DbusSubscriptions, ModuleCore, ModuleState, MouseButton, ScrollDirection,
+    spawn_command, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState, MouseButton,
+    ScrollDirection,
 };
+
+pub(crate) type BluezManagedObjects =
+    HashMap<zbus::OwnedObjectPath, HashMap<String, HashMap<String, zbus::OwnedVariant>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothState {
@@ -30,9 +36,14 @@ impl BluetoothModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
-        // Single read at construction so `current_state` has real data immediately;
-        // afterwards the worker owns freshness and `current_state` is lock-only.
-        let (initial, initial_healthy) = Self::read_bluetooth_state_full();
+        // Fast non-blocking rfkill seed at construction so `current_state` has
+        // real data immediately without blocking startup on BlueZ D-Bus I/O.
+        let (rfkill_ok, _) = Self::read_rfkill();
+        let initial = if rfkill_ok {
+            BluetoothState::Off
+        } else {
+            BluetoothState::Absent
+        };
         let last: Arc<Mutex<BluetoothState>> = Arc::new(Mutex::new(initial.clone()));
         let last_worker = Arc::clone(&last);
 
@@ -44,30 +55,35 @@ impl BluetoothModule {
             if core_worker.is_stopped() {
                 return;
             }
-            let mut last_state: Option<BluetoothState> = Some(initial.clone());
-            let mut fast_poll_ticks: usize = if initial == BluetoothState::Loading { 20 } else { 0 };
-            let mut fail_streak: u32 = u32::from(!initial_healthy);
+            let mut last_state: Option<BluetoothState> = Some(initial);
+            let mut fast_poll_ticks: usize = 0;
+            let mut fail_streak: u32 = 0;
             let mut degraded_warned = false;
             let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
             let mut last_renew = std::time::Instant::now();
+            let mut first_pass = true;
 
             loop {
-                let wait = if fast_poll_ticks > 0 {
-                    fast_poll_ticks -= 1;
-                    Duration::from_millis(100)
+                if first_pass {
+                    first_pass = false;
                 } else {
-                    crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30))
-                };
-                let (stopped, notified) = core_worker.wait_or_notified_async(wait).await;
-                if stopped {
-                    break;
-                }
-                if notified {
-                    fast_poll_ticks = 40; // 40 * 100ms = 4.0s of fast-polling
-                    last_state = None; // Invalidate cache so live state is immediately broadcast
+                    let wait = if fast_poll_ticks > 0 {
+                        fast_poll_ticks -= 1;
+                        Duration::from_millis(100)
+                    } else {
+                        crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30))
+                    };
+                    let (stopped, notified) = core_worker.wait_or_notified_async(wait).await;
+                    if stopped {
+                        break;
+                    }
+                    if notified {
+                        fast_poll_ticks = 40; // 40 * 100ms = 4.0s of fast-polling
+                        last_state = None; // Invalidate cache so live state is immediately broadcast
+                    }
                 }
 
-                let (current_state, healthy) = BluetoothModule::read_bluetooth_state_full();
+                let (current_state, healthy) = BluetoothModule::read_bluetooth_state_full().await;
 
                 if healthy {
                     if fail_streak > 0 {
@@ -108,35 +124,16 @@ impl BluetoothModule {
 
     /// Subscribe to BlueZ signals. Worker-owned: renewed periodically and
     /// unsubscribed automatically when `DbusSubscriptions` is dropped.
-    fn subscribe_triggers(core: &ModuleCore) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
-        let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
-        let mut ids = Vec::new();
-        let core_props = core.clone();
-        ids.push(conn.signal_subscribe(
-            Some("org.bluez"),
-            Some("org.freedesktop.DBus.Properties"),
-            Some("PropertiesChanged"),
-            None,
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, _params| {
-                core_props.notify();
-            },
-        ));
-
-        let core_obj = core.clone();
-        ids.push(conn.signal_subscribe(
-            Some("org.bluez"),
-            Some("org.freedesktop.DBus.ObjectManager"),
-            None,
-            None,
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, _params| {
-                core_obj.notify();
-            },
-        ));
-        Some((conn, ids))
+    fn subscribe_triggers(core: &ModuleCore) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![
+            spawn_dbus_trigger(
+                core,
+                "org.bluez",
+                "org.freedesktop.DBus.Properties",
+                Some("PropertiesChanged"),
+            ),
+            spawn_dbus_trigger(core, "org.bluez", "org.freedesktop.DBus.ObjectManager", None),
+        ]
     }
 
     /// `(readable, unblocked)`: whether rfkill state could be determined.
@@ -203,88 +200,43 @@ impl BluetoothModule {
         }
     }
 
-    fn read_bluetooth_state_dbus() -> Option<BluetoothState> {
-        let conn = match gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
-            Ok(c) => c,
-            Err(e) => {
-                log_debug!("bluetooth", "System bus unavailable for BlueZ: {e}");
-                return None;
-            }
-        };
-        let res = match conn.call_sync(
-            Some("org.bluez"),
-            "/",
-            "org.freedesktop.DBus.ObjectManager",
-            "GetManagedObjects",
-            None,
-            None,
-            gio::DBusCallFlags::NONE,
-            500,
-            gio::Cancellable::NONE,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                log_debug!("bluetooth", "BlueZ GetManagedObjects failed: {e}");
-                return None;
-            }
-        };
-
-        let objects = res.child_value(0);
+    pub(crate) fn parse_managed_objects(objects: &BluezManagedObjects) -> Option<BluetoothState> {
         let mut adapter_found = false;
         let mut adapter_powered = false;
         let mut adapter_power_state = None;
         let mut devices = Vec::new();
 
-        for i in 0..objects.n_children() {
-            let entry = objects.child_value(i);
-            let ifaces_dict = entry.child_value(1);
-
-            for j in 0..ifaces_dict.n_children() {
-                let iface_entry = ifaces_dict.child_value(j);
-                let iface_name = iface_entry.child_value(0).str().unwrap_or_default().to_string();
-                let props_dict = iface_entry.child_value(1);
-
-                if iface_name == "org.bluez.Adapter1" {
-                    adapter_found = true;
-                    for k in 0..props_dict.n_children() {
-                        let prop_entry = props_dict.child_value(k);
-                        let key_var = prop_entry.child_value(0);
-                        let prop_name = key_var.str().unwrap_or_default();
-                        let prop_val = prop_entry.child_value(1).as_variant();
-                        if let Some(v) = prop_val {
-                            if prop_name == "Powered" {
-                                if let Some(p) = v.get::<bool>() {
-                                    adapter_powered = p;
-                                }
-                            } else if prop_name == "PowerState" {
-                                if let Some(s) = v.str() {
-                                    adapter_power_state = Some(s.to_string());
-                                }
-                            }
-                        }
+        for ifaces in objects.values() {
+            if let Some(props) = ifaces.get("org.bluez.Adapter1") {
+                adapter_found = true;
+                if let Some(v) = props.get("Powered") {
+                    if let zbus::Variant::Bool(b) = v.deref() {
+                        adapter_powered = *b;
                     }
-                } else if iface_name == "org.bluez.Device1" {
-                    let mut is_connected = false;
-                    let mut dev_name = String::new();
-
-                    for k in 0..props_dict.n_children() {
-                        let prop_entry = props_dict.child_value(k);
-                        let key_var = prop_entry.child_value(0);
-                        let prop_name = key_var.str().unwrap_or_default();
-                        let prop_val = prop_entry.child_value(1).as_variant();
-                        if let Some(v) = prop_val {
-                            if prop_name == "Connected" {
-                                if let Some(c) = v.get::<bool>() {
-                                    is_connected = c;
-                                }
-                            } else if matches!(prop_name, "Alias" | "Name") && dev_name.is_empty() {
-                                dev_name = v.str().unwrap_or_default().to_string();
-                            }
-                        }
-                    }
-
-                    devices.push((dev_name, is_connected));
                 }
+                if let Some(v) = props.get("PowerState") {
+                    if let zbus::Variant::Str(s) = v.deref() {
+                        adapter_power_state = Some(s.as_str().to_string());
+                    }
+                }
+            }
+            if let Some(props) = ifaces.get("org.bluez.Device1") {
+                let is_connected = props
+                    .get("Connected")
+                    .and_then(|v| match v.deref() {
+                        zbus::Variant::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                let dev_name = props
+                    .get("Alias")
+                    .or_else(|| props.get("Name"))
+                    .and_then(|v| match v.deref() {
+                        zbus::Variant::Str(s) => Some(s.as_str().to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                devices.push((dev_name, is_connected));
             }
         }
 
@@ -300,17 +252,45 @@ impl BluetoothModule {
         ))
     }
 
+    async fn read_bluetooth_state_dbus() -> Option<BluetoothState> {
+        let conn = system_bus().await?;
+        let res = tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.call_method(
+                Some("org.bluez"),
+                "/",
+                Some("org.freedesktop.DBus.ObjectManager"),
+                "GetManagedObjects",
+                &(),
+            ),
+        )
+        .await;
+        let msg = match res {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                log_debug!("bluetooth", "BlueZ GetManagedObjects failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                log_debug!("bluetooth", "BlueZ GetManagedObjects timed out");
+                return None;
+            }
+        };
+        let objects: BluezManagedObjects = msg.body().deserialize().ok()?;
+        Self::parse_managed_objects(&objects)
+    }
+
     /// State plus backend health. `healthy` is false when no usable adapter
     /// could be determined (BlueZ down/absent with inconclusive rfkill) —
     /// the worker backs off and the toggle refuses to fire blind commands.
     /// An explicitly rfkill-blocked adapter is `Off` but healthy.
-    pub fn read_bluetooth_state_full() -> (BluetoothState, bool) {
+    pub async fn read_bluetooth_state_full() -> (BluetoothState, bool) {
         let (rfkill_ok, unblocked) = Self::read_rfkill();
         if !unblocked {
             return (BluetoothState::Off, true);
         }
 
-        match Self::read_bluetooth_state_dbus() {
+        match Self::read_bluetooth_state_dbus().await {
             Some(state) => (state, true),
             None => {
                 if rfkill_ok {
@@ -323,10 +303,9 @@ impl BluetoothModule {
     }
 
     pub fn toggle_bluetooth() {
-        // `read_bluetooth_state` does blocking D-Bus `call_sync` (500ms
-        // timeout); never run it on the GTK main thread. Decide off-thread.
+        // Decide off-thread on the shared Tokio runtime.
         crate::runtime::spawn(async {
-            let (state, healthy) = Self::read_bluetooth_state_full();
+            let (state, healthy) = Self::read_bluetooth_state_full().await;
             if !healthy || state == BluetoothState::Absent {
                 log_warn!("bluetooth", "Toggle ignored: no bluetooth adapter found");
                 return;
@@ -594,5 +573,52 @@ mod tests {
         assert_eq!(state_hidden.text, None);
         assert_eq!(state_hidden.icon, None);
         assert!(state_hidden.css_classes.contains(&"no-adapter".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bluez_managed_objects_map() {
+        use std::collections::HashMap;
+        let mut objects: BluezManagedObjects = HashMap::new();
+
+        let mut adapter_props = HashMap::new();
+        adapter_props.insert(
+            "Powered".to_string(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from(true)).unwrap(),
+        );
+        adapter_props.insert(
+            "PowerState".to_string(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("on")).unwrap(),
+        );
+        let mut adapter_ifaces = HashMap::new();
+        adapter_ifaces.insert("org.bluez.Adapter1".to_string(), adapter_props);
+        objects.insert(
+            zbus::OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
+            adapter_ifaces,
+        );
+
+        let mut dev_props = HashMap::new();
+        dev_props.insert(
+            "Connected".to_string(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from(true)).unwrap(),
+        );
+        dev_props.insert(
+            "Alias".to_string(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("AirPods Pro")).unwrap(),
+        );
+        let mut dev_ifaces = HashMap::new();
+        dev_ifaces.insert("org.bluez.Device1".to_string(), dev_props);
+        objects.insert(
+            zbus::OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB").unwrap(),
+            dev_ifaces,
+        );
+
+        let state = BluetoothModule::parse_managed_objects(&objects).expect("Should parse BlueZ managed objects");
+        assert_eq!(
+            state,
+            BluetoothState::Connected {
+                count: 1,
+                device_name: Some("AirPods Pro".to_string()),
+            }
+        );
     }
 }

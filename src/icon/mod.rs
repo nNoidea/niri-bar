@@ -8,7 +8,6 @@ pub use exe::{load_pixbuf_from_exe_path, load_pixbuf_from_pid, warm_window_icons
 pub use pixbuf::{normalize_pixbuf_to_size, pixmap_to_pixbuf, RawIconPixmap};
 
 use exe::app_id_exe_cache;
-use gdk::prelude::*;
 use gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 use gtk::Image;
@@ -28,7 +27,31 @@ pub fn sanitize_icon_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Load an unnormalized pixbuf at a target size from desktop entries, theme, or path.
+/// Look up `key` (or its `_`-delimited prefix, e.g. `Antigravity_status_icon_1` -> `antigravity`)
+/// in `APP_ID_EXE_CACHE`.
+fn lookup_cached_exe_pixbuf(safe_key: &str, size: i32) -> Option<Pixbuf> {
+    let lower = safe_key.to_lowercase();
+    let prefix = lower.split('_').next().unwrap_or("");
+    let candidates = [safe_key, lower.as_str(), prefix];
+    for cand in candidates {
+        if cand.is_empty() {
+            continue;
+        }
+        let cached_exe = {
+            let map = crate::util::lock(app_id_exe_cache());
+            map.get(cand).cloned().flatten()
+        };
+        if let Some(exe_path) = cached_exe {
+            if let Some(pb) = load_pixbuf_from_exe_path(&exe_path, cand, size) {
+                return Some(pb);
+            }
+        }
+    }
+    None
+}
+
+/// Load an unnormalized pixbuf at a target size from desktop entries, XDG icon dirs, or exe cache.
+/// Never initializes `GtkIconTheme` or `libglycin`, avoiding ~12 MB RSS and 14 background threads.
 fn load_raw_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
     let size = if target_size <= 0 { 32 } else { target_size }.min(512);
 
@@ -38,7 +61,6 @@ fn load_raw_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
         return load_file_pixbuf_fast(Path::new(icon_key), size);
     }
     let safe_key = sanitize_icon_name(icon_key)?;
-    let flags = gtk::IconLookupFlags::FORCE_SIZE | gtk::IconLookupFlags::GENERIC_FALLBACK;
 
     // 2. Resolve via desktop entries
     if let Some(resolved) = find_app_icon(&safe_key) {
@@ -46,46 +68,30 @@ fn load_raw_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
             if let Some(pb) = load_file_pixbuf_fast(Path::new(&resolved), size) {
                 return Some(pb);
             }
-        } else if let Some(safe_resolved) = sanitize_icon_name(&resolved) {
-            if let Some(theme) = gtk::IconTheme::default() {
-                if let Ok(Some(pb)) = theme.load_icon(&safe_resolved, size, flags) {
-                    return Some(pb);
-                }
+        } else if let Some(png_path) = desktop::resolve_xdg_png_icon(&resolved) {
+            if let Some(pb) = load_file_pixbuf_fast(&png_path, size) {
+                return Some(pb);
             }
         }
     }
 
-    // 3. Look up in GTK icon theme directly (excluding generic fallback first so PID/exe cache can win)
-    if let Some(theme) = gtk::IconTheme::default() {
-        let lower = safe_key.to_lowercase();
-        for candidate in [safe_key.as_str(), lower.as_str()] {
-            if sanitize_icon_name(candidate).is_some() && theme.has_icon(candidate) {
-                if let Ok(Some(pb)) = theme.load_icon(candidate, size, flags) {
-                    return Some(pb);
-                }
+    // 3. Direct XDG raster `.png` lookup (bypasses GtkIconTheme + libglycin)
+    let lower = safe_key.to_lowercase();
+    for candidate in [safe_key.as_str(), lower.as_str()] {
+        if let Some(png_path) = desktop::resolve_xdg_png_icon(candidate) {
+            if let Some(pb) = load_file_pixbuf_fast(&png_path, size) {
+                return Some(pb);
             }
         }
     }
 
-    // 4. Check if `app_id` was previously mapped to an executable path via PID
-    let cached_exe = {
-        let map = crate::util::lock(app_id_exe_cache());
-        map.get(&safe_key).cloned().flatten()
-    };
-    if let Some(exe_path) = cached_exe {
-        if let Some(pb) = load_pixbuf_from_exe_path(&exe_path, &safe_key, size) {
-            return Some(pb);
-        }
+    // 4. Check if `app_id` (or tray prefix like `Antigravity_status_icon_1`) was mapped to an executable path via PID
+    if let Some(pb) = lookup_cached_exe_pixbuf(&safe_key, size) {
+        return Some(pb);
     }
 
-    // 5. Generic executable fallback in GTK icon theme
-    if let Some(theme) = gtk::IconTheme::default() {
-        if let Ok(Some(pb)) = theme.load_icon("application-x-executable", size, flags) {
-            return Some(pb);
-        }
-    }
-
-    None
+    // 5. Generic executable fallback (in-process, no libglycin)
+    pixbuf::fallback_executable_pixbuf(size)
 }
 
 /// Load a normalized square pixbuf directly at a target size from desktop entries, theme, or path.
@@ -94,12 +100,9 @@ pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
     load_raw_pixbuf_at_size(icon_key, size).map(|pb| normalize_pixbuf_to_size(pb, size))
 }
 
-fn apply_pixbuf_to_image(img: &Image, pixbuf: &Pixbuf, logical_size: i32, scale: i32) {
-    if let Some(surface) = pixbuf.create_surface(scale, Option::<&gdk::Window>::None) {
-        img.set_from_surface(Some(&surface));
-    } else {
-        img.set_from_pixbuf(Some(pixbuf));
-    }
+fn apply_pixbuf_to_image(img: &Image, pixbuf: &Pixbuf, logical_size: i32, _scale: i32) {
+    let texture = gdk::Texture::for_pixbuf(pixbuf);
+    img.set_paintable(Some(&texture));
     img.set_pixel_size(logical_size);
 }
 
@@ -115,7 +118,6 @@ pub fn create_app_image_with_pid(app_id: &str, pid: Option<u32>, logical_size: i
     img.set_halign(gtk::Align::Center);
     img.set_valign(gtk::Align::Center);
     update_app_image_with_pid(&img, app_id, pid, logical_size, scale_factor);
-    img.show();
     img
 }
 
@@ -125,8 +127,8 @@ pub fn update_app_image_with_pid(img: &Image, app_id: &str, pid: Option<u32>, lo
     let scale = scale_factor.max(1);
     let load_size = size * scale;
 
-    let set_pixbuf_from_file = |path: &str| -> bool {
-        if let Some(pixbuf) = load_file_pixbuf_fast(Path::new(path), load_size) {
+    let set_pixbuf_from_file = |path: &Path| -> bool {
+        if let Some(pixbuf) = load_file_pixbuf_fast(path, load_size) {
             let square = normalize_pixbuf_to_size(pixbuf, load_size);
             apply_pixbuf_to_image(img, &square, size, scale);
             return true;
@@ -135,55 +137,50 @@ pub fn update_app_image_with_pid(img: &Image, app_id: &str, pid: Option<u32>, lo
     };
 
     // 1. Direct absolute file path
-    if Path::new(app_id).is_absolute() && Path::new(app_id).exists() && set_pixbuf_from_file(app_id) {
+    let app_path = Path::new(app_id);
+    if app_path.is_absolute() && app_path.exists() && set_pixbuf_from_file(app_path) {
         return;
     }
 
-    // 2. Resolve via desktop entry cache
+    // 2. Resolve via desktop entry cache + direct XDG raster `.png` lookup (zero GtkIconTheme/libglycin overhead)
     let resolved_opt = find_app_icon(app_id);
     if let Some(ref resolved) = resolved_opt {
-        if Path::new(resolved).is_absolute() && Path::new(resolved).exists() && set_pixbuf_from_file(resolved) {
+        let res_path = Path::new(resolved);
+        if res_path.is_absolute() && res_path.exists() && set_pixbuf_from_file(res_path) {
             return;
         }
+        if let Some(png_path) = desktop::resolve_xdg_png_icon(resolved) {
+            if set_pixbuf_from_file(&png_path) {
+                return;
+            }
+        }
     }
-
-    // 3. Named theme icon (GTK dynamically renders vectors at monitor scale)
-    if let Some(theme) = gtk::IconTheme::default() {
-        let lower = app_id.to_lowercase();
-        for candidate in [resolved_opt.as_deref(), Some(app_id), Some(lower.as_str())]
-            .into_iter()
-            .flatten()
-        {
-            if theme.has_icon(candidate) {
-                img.set_from_icon_name(Some(candidate), gtk::IconSize::Button);
-                img.set_pixel_size(size);
+    let lower = app_id.to_lowercase();
+    for candidate in [app_id, lower.as_str()] {
+        if let Some(png_path) = desktop::resolve_xdg_png_icon(candidate) {
+            if set_pixbuf_from_file(&png_path) {
                 return;
             }
         }
     }
 
-    // 4. Inspect process executable directory (`PID` -> `/proc/<pid>/exe`) for portable apps / Electron `.asar`
+    // 3. Inspect process executable directory (`PID` -> `/proc/<pid>/exe`) for portable apps / Electron `.asar`
     if let Some(p) = pid {
         if let Some(square) = load_pixbuf_from_pid(p, app_id, load_size) {
             apply_pixbuf_to_image(img, &square, size, scale);
             return;
         }
     } else if let Some(safe_key) = sanitize_icon_name(app_id) {
-        let cached_exe = {
-            let map = crate::util::lock(app_id_exe_cache());
-            map.get(&safe_key).cloned().flatten()
-        };
-        if let Some(exe_path) = cached_exe {
-            if let Some(square) = load_pixbuf_from_exe_path(&exe_path, &safe_key, load_size) {
-                apply_pixbuf_to_image(img, &square, size, scale);
-                return;
-            }
+        if let Some(square) = lookup_cached_exe_pixbuf(&safe_key, load_size) {
+            apply_pixbuf_to_image(img, &square, size, scale);
+            return;
         }
     }
 
-    // 5. Generic executable fallback (steps 1-4 already checked desktop entries, theme, and PID cache)
-    img.set_from_icon_name(Some("application-x-executable"), gtk::IconSize::Button);
-    img.set_pixel_size(size);
+    // 4. Generic executable fallback (in-process memory texture, never triggers GtkIconTheme/libglycin)
+    if let Some(fallback) = pixbuf::fallback_executable_pixbuf(load_size) {
+        apply_pixbuf_to_image(img, &fallback, size, scale);
+    }
 }
 
 /// Resolve tray icon pixbuf from all StatusNotifierItem sources.
@@ -271,27 +268,12 @@ pub fn update_tray_image(
 ) {
     let scale = scale_factor.max(1);
     let size = if icon_size <= 0 { 22 } else { icon_size };
-
-    let theme = gtk::IconTheme::default();
-    let is_theme_icon = icon_pixmap.is_none()
-        && icon_theme_path.is_none()
-        && icon_name
-            .is_some_and(|name| !Path::new(name).is_absolute() && theme.as_ref().is_some_and(|t| t.has_icon(name)));
-
-    if is_theme_icon {
-        if let Some(name) = icon_name {
-            image.set_from_icon_name(Some(name), gtk::IconSize::Button);
-            image.set_pixel_size(size);
-            return;
-        }
-    }
-
     let target_size = size * scale;
+
     if let Some(pb) = resolve_tray_pixbuf_scaled(icon_name, icon_pixmap, icon_theme_path, id, target_size) {
         apply_pixbuf_to_image(image, &pb, size, scale);
-    } else {
-        image.set_from_icon_name(Some("application-x-executable"), gtk::IconSize::Button);
-        image.set_pixel_size(size);
+    } else if let Some(fallback) = pixbuf::fallback_executable_pixbuf(target_size) {
+        apply_pixbuf_to_image(image, &fallback, size, scale);
     }
 }
 
@@ -389,7 +371,7 @@ mod tests {
     fn test_create_app_image_theme_icon() {
         crate::util::run_gtk_test(|| {
             let img = create_app_image("application-x-executable", 32, 2);
-            assert_eq!(img.storage_type(), gtk::ImageType::IconName);
+            assert_eq!(img.storage_type(), gtk::ImageType::Paintable);
             assert_eq!(img.pixel_size(), 32);
         });
     }
@@ -427,9 +409,10 @@ mod tests {
                 1,
             );
 
-            assert!(
-                img.storage_type() == gtk::ImageType::Surface || img.storage_type() == gtk::ImageType::Pixbuf,
-                "Expected Surface or Pixbuf from icon_theme_path, but got {:?}",
+            assert_eq!(
+                img.storage_type(),
+                gtk::ImageType::Paintable,
+                "Expected Paintable from icon_theme_path, but got {:?}",
                 img.storage_type()
             );
         });

@@ -1,12 +1,33 @@
 use crate::config::get_config_dir;
-use gtk::prelude::*;
+use glib::prelude::*;
 use std::cell::RefCell;
 use std::fs;
+use std::rc::Rc;
 
 const DEFAULT_CSS: &str = include_str!("../resources/style.default.css");
 
 thread_local! {
     static ACTIVE_PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+}
+
+/// Load `css` into `provider` while capturing any GTK4 CSS `parsing-error` signal.
+pub fn load_css_checked(provider: &gtk::CssProvider, css: &str) -> Result<(), String> {
+    let err_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let err_clone = Rc::clone(&err_slot);
+    let handler_id = provider.connect_parsing_error(move |_, section, err| {
+        let mut slot = err_clone.borrow_mut();
+        if slot.is_none() {
+            let line = section.end_location().lines() + 1;
+            *slot = Some(format!("line {line}: {err}"));
+        }
+    });
+    provider.load_from_data(css);
+    provider.disconnect(handler_id);
+    let taken = err_slot.borrow_mut().take();
+    match taken {
+        Some(e) => Err(format!("CSS error: {e}")),
+        None => Ok(()),
+    }
 }
 
 /// Load GTK CSS, writing the default template on first launch.
@@ -37,23 +58,22 @@ pub fn init_styles() -> Option<String> {
 
     let mut startup_error = read_error;
     let provider = gtk::CssProvider::new();
-    if let Err(e) = provider.load_from_data(css_content.as_bytes()) {
-        let err_msg = format!("CSS error: {e}");
+    if let Err(err_msg) = load_css_checked(&provider, &css_content) {
         crate::logger::emit(
             "WARN",
             "style",
-            &format!("Failed to parse CSS: {e}. Using default theme."),
+            &format!("Failed to parse CSS ({err_msg}). Using default theme."),
         );
         startup_error = Some(err_msg);
         // Embedded default is tested for balanced braces; if it also fails,
         // log so the broken build is visible instead of silently unstyled.
-        if let Err(e2) = provider.load_from_data(DEFAULT_CSS.as_bytes()) {
+        if let Err(e2) = load_css_checked(&provider, DEFAULT_CSS) {
             crate::logger::emit("WARN", "style", &format!("Embedded default CSS also failed: {e2}"));
         }
     }
 
-    if let Some(screen) = gdk::Screen::default() {
-        gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
     }
     ACTIVE_PROVIDER.with(|p| *p.borrow_mut() = Some(provider));
 
@@ -72,9 +92,7 @@ pub fn validate_css(css_content: &str) -> Result<(), String> {
 
     if gtk::is_initialized_main_thread() {
         let test_provider = gtk::CssProvider::new();
-        test_provider
-            .load_from_data(css_content.as_bytes())
-            .map_err(|e| format!("CSS error: {e}"))?;
+        load_css_checked(&test_provider, css_content)?;
     }
     Ok(())
 }
@@ -90,7 +108,7 @@ pub fn reload_styles() -> Result<(), String> {
 
     ACTIVE_PROVIDER.with(|p| {
         if let Some(provider) = p.borrow().as_ref() {
-            let _ = provider.load_from_data(content.as_bytes());
+            provider.load_from_data(&content);
         }
     });
 
@@ -146,8 +164,30 @@ mod tests {
     fn test_default_css_valid_for_gtk() {
         crate::util::run_gtk_test(|| {
             let provider = gtk::CssProvider::new();
-            let res = provider.load_from_data(DEFAULT_CSS.as_bytes());
-            assert!(res.is_ok(), "DEFAULT_CSS failed to parse in GTK: {:?}", res.err());
+            let res = load_css_checked(&provider, DEFAULT_CSS);
+            assert!(res.is_ok(), "DEFAULT_CSS failed to parse in GTK4: {:?}", res.err());
         });
+    }
+
+    #[test]
+    fn test_tray_menu_popover_dark_mode_styling_no_double_card() {
+        assert!(
+            DEFAULT_CSS.contains("popover.tray-menu") && DEFAULT_CSS.contains("background: transparent;"),
+            "Outer popover.tray-menu must have transparent background to prevent double card rendering"
+        );
+        assert!(
+            DEFAULT_CSS.contains("popover.tray-menu > contents") && DEFAULT_CSS.contains("background-color: #313244;"),
+            "Inner popover.tray-menu > contents must hold the solid card styling"
+        );
+    }
+
+    #[test]
+    fn test_css_contains_no_gtk3_legacy_menu_selectors() {
+        for legacy in ["menuitem", "checkmenuitem", "radiomenuitem"] {
+            assert!(
+                !DEFAULT_CSS.contains(legacy),
+                "DEFAULT_CSS should not contain legacy GTK3 selector '{legacy}'"
+            );
+        }
     }
 }

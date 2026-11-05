@@ -1,7 +1,7 @@
 use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Button, Orientation};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -250,37 +250,31 @@ impl TaskbarWidget {
         update_tx: async_channel::Sender<()>,
     ) -> Self {
         let container = GtkBox::new(orientation, spacing);
-        container.style_context().add_class("taskbar");
+        container.add_css_class("taskbar");
         let active_widgets = Rc::new(RefCell::new(HashMap::new()));
         let viewport = Rc::new(RefCell::new(TaskbarViewport::new()));
 
-        container.add_events(gdk::EventMask::SCROLL_MASK);
         let vp_scroll = Rc::clone(&viewport);
         let tx_clone = update_tx;
         let is_vert = orientation == Orientation::Vertical;
 
-        container.connect_scroll_event(move |_, event| {
-            let delta = match event.direction() {
-                gdk::ScrollDirection::Down | gdk::ScrollDirection::Right => 1,
-                gdk::ScrollDirection::Up | gdk::ScrollDirection::Left => -1,
-                gdk::ScrollDirection::Smooth => {
-                    let (dx, dy) = event.scroll_deltas().unwrap_or((0.0, 0.0));
-                    let d = if is_vert {
-                        dy
-                    } else if dx.abs() > dy.abs() {
-                        dx
-                    } else {
-                        dy
-                    };
-                    if d > 0.0 {
-                        1
-                    } else if d < 0.0 {
-                        -1
-                    } else {
-                        0
-                    }
-                }
-                _ => 0,
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        scroll.connect_scroll(move |_, dx, dy| {
+            let d = if is_vert {
+                dy
+            } else if dx.abs() > dy.abs() {
+                dx
+            } else {
+                dy
+            };
+            let delta = if d > 0.0 {
+                1
+            } else if d < 0.0 {
+                -1
+            } else {
+                0
             };
 
             if delta != 0 {
@@ -291,6 +285,7 @@ impl TaskbarWidget {
                 Propagation::Proceed
             }
         });
+        container.add_controller(scroll);
 
         Self {
             container,
@@ -311,10 +306,10 @@ impl TaskbarWidget {
         capacity: usize,
     ) {
         if !config.enabled {
-            self.container.hide();
+            self.container.set_visible(false);
             return;
         }
-        self.container.show();
+        self.container.set_visible(true);
 
         let (windows, workspaces, outputs) = {
             let st = crate::util::lock(state);
@@ -356,19 +351,21 @@ impl TaskbarWidget {
                             let rel_mon_x = drag.current_global_x - mon_x;
                             let rel_mon_y = drag.current_global_y - mon_y;
 
-                            let (container_off_x, container_off_y) = if let Some(toplevel) = self.container.toplevel() {
-                                self.container.translate_coordinates(&toplevel, 0, 0).unwrap_or((0, 0))
+                            let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
+                                self.container
+                                    .translate_coordinates(&root, 0.0, 0.0)
+                                    .unwrap_or((0.0, 0.0))
                             } else {
-                                (0, 0)
+                                (0.0, 0.0)
                             };
 
-                            let rel_container_x = rel_mon_x - (container_off_x as f64);
-                            let rel_container_y = rel_mon_y - (container_off_y as f64);
+                            let rel_container_x = rel_mon_x - container_off_x;
+                            let rel_container_y = rel_mon_y - container_off_y;
 
-                            let existing_children = self.container.children();
+                            let existing_children = crate::util::widget_children(&self.container);
                             let non_preview: Vec<_> = existing_children
                                 .iter()
-                                .filter(|c| !c.style_context().has_class("cross-monitor-preview"))
+                                .filter(|c| !c.has_css_class("cross-monitor-preview"))
                                 .collect();
 
                             let mut slot = non_preview.len();
@@ -452,6 +449,9 @@ impl TaskbarWidget {
         });
 
         // 2. Reconcile remaining / new windows in visible window
+        let any_locally_dragging = drag_snapshot
+            .as_ref()
+            .is_some_and(|d| d.is_dragging && d.source_output == *current_output && d.target_output.is_none());
         let scale_factor = self.container.scale_factor().max(1);
         for (idx, window) in visible_windows.iter().enumerate() {
             let win_id = window.id;
@@ -467,44 +467,44 @@ impl TaskbarWidget {
                 // Focus styling
                 if widget.is_focused != is_focused {
                     if is_focused {
-                        widget.button.style_context().add_class("focused");
+                        widget.button.add_css_class("focused");
                     } else {
-                        widget.button.style_context().remove_class("focused");
+                        widget.button.remove_css_class("focused");
                     }
                     widget.is_focused = is_focused;
                 }
 
                 // Drag state styling
                 if is_ghost_preview {
-                    widget.button.style_context().add_class("drag-placeholder");
-                    widget.button.style_context().add_class("cross-monitor-preview");
-                    widget.button.style_context().remove_class("is-dragging");
+                    widget.button.add_css_class("drag-placeholder");
+                    widget.button.add_css_class("cross-monitor-preview");
+                    widget.button.remove_css_class("is-dragging");
                 } else {
-                    widget.button.style_context().remove_class("cross-monitor-preview");
+                    widget.button.remove_css_class("cross-monitor-preview");
                     let is_locally_dragging = drag_snapshot
                         .as_ref()
                         .map(|d| d.window_id == win_id && d.source_output == *current_output && d.is_dragging)
                         .unwrap_or(false);
 
                     if is_locally_dragging {
-                        widget.button.style_context().add_class("is-dragging");
+                        widget.button.add_css_class("is-dragging");
                         let is_targeting_other = drag_snapshot
                             .as_ref()
                             .map(|d| d.target_output.is_some())
                             .unwrap_or(false);
                         if is_targeting_other {
-                            widget.button.style_context().add_class("drag-source-away");
-                            widget.button.style_context().remove_class("drag-placeholder");
+                            widget.button.add_css_class("drag-source-away");
+                            widget.button.remove_css_class("drag-placeholder");
                             widget.button.set_opacity(0.0);
                         } else {
-                            widget.button.style_context().remove_class("drag-source-away");
-                            widget.button.style_context().add_class("drag-placeholder");
+                            widget.button.remove_css_class("drag-source-away");
+                            widget.button.add_css_class("drag-placeholder");
                             widget.button.set_opacity(1.0);
                         }
                     } else {
-                        widget.button.style_context().remove_class("drag-placeholder");
-                        widget.button.style_context().remove_class("is-dragging");
-                        widget.button.style_context().remove_class("drag-source-away");
+                        widget.button.remove_css_class("drag-placeholder");
+                        widget.button.remove_css_class("is-dragging");
+                        widget.button.remove_css_class("drag-source-away");
                         widget.button.set_opacity(1.0);
                     }
                 }
@@ -519,83 +519,65 @@ impl TaskbarWidget {
                 if *widget.icon_key.borrow() != icon_key || widget.icon_scale != scale_factor {
                     let img =
                         crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
-                    widget.button.set_image(Some(&img));
+                    widget.button.set_child(Some(&img));
                     (*widget.icon_key.borrow_mut()).clone_from(&icon_key);
                     widget.icon_scale = scale_factor;
                 }
 
-                let is_locally_dragging = drag_snapshot
-                    .as_ref()
-                    .map(|d| d.window_id == win_id && d.source_output == *current_output)
-                    .unwrap_or(false);
-
-                if !is_locally_dragging {
-                    self.container.reorder_child(&widget.button, idx as i32);
+                if !any_locally_dragging {
+                    crate::util::reorder_box_child(&self.container, &widget.button, idx);
                 }
             } else {
                 // Create new button widget
                 let button = Button::new();
-                button.style_context().add_class("app-button");
+                button.add_css_class("app-button");
+                button.set_has_frame(false);
                 button.set_halign(gtk::Align::Center);
                 button.set_valign(gtk::Align::Center);
-
-                button.add_events(
-                    gdk::EventMask::BUTTON_PRESS_MASK
-                        | gdk::EventMask::BUTTON_RELEASE_MASK
-                        | gdk::EventMask::POINTER_MOTION_MASK
-                        | gdk::EventMask::ENTER_NOTIFY_MASK
-                        | gdk::EventMask::LEAVE_NOTIFY_MASK,
-                );
-
-                button.connect_enter_notify_event(|b, _| {
-                    let is_drag_active = crate::util::lock(&GLOBAL_DRAG)
-                        .as_ref()
-                        .map(|g| g.is_dragging)
-                        .unwrap_or(false);
-                    if !is_drag_active {
-                        if let Some(w) = b.window() {
-                            let display = w.display();
-                            let pointer_cursor = gdk::Cursor::from_name(&display, "pointer");
-                            w.set_cursor(pointer_cursor.as_ref());
-                        }
-                    }
-                    Propagation::Proceed
-                });
-
-                button.connect_leave_notify_event(|b, _| {
-                    let is_drag_active = crate::util::lock(&GLOBAL_DRAG)
-                        .as_ref()
-                        .map(|g| g.is_dragging)
-                        .unwrap_or(false);
-                    if !is_drag_active {
-                        if let Some(w) = b.window() {
-                            w.set_cursor(None);
-                        }
-                    }
-                    Propagation::Proceed
-                });
+                button.set_focusable(false);
+                button.set_cursor_from_name(Some("pointer"));
 
                 let shared_icon_key = Rc::new(RefCell::new(icon_key.clone()));
                 let window_id = window.id;
 
                 if is_focused {
-                    button.style_context().add_class("focused");
+                    button.add_css_class("focused");
                 }
 
                 if is_ghost_preview {
-                    button.style_context().add_class("drag-placeholder");
-                    button.style_context().add_class("cross-monitor-preview");
+                    button.add_css_class("drag-placeholder");
+                    button.add_css_class("cross-monitor-preview");
                 }
 
                 let img = crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
-                button.set_image(Some(&img));
-                button.set_always_show_image(true);
+                button.set_child(Some(&img));
 
                 if config.show_tooltips {
                     button.set_tooltip_text(Some(&title));
                 }
 
-                // Drag & Drop tracking
+                // Middle click: close window
+                let middle_click = gtk::GestureClick::builder()
+                    .button(2)
+                    .propagation_phase(gtk::PropagationPhase::Capture)
+                    .build();
+                middle_click.connect_pressed(move |gesture, n_press, _, _| {
+                    if n_press >= 1 {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        crate::runtime::spawn(async move {
+                            if let Err(e) = ipc::close_window(window_id).await {
+                                log_warn!("taskbar", "Close window {window_id} failed: {e}");
+                            }
+                        });
+                    }
+                });
+                button.add_controller(middle_click);
+
+                // Drag & Drop + Left click tracking via Capture-phase GestureDrag.
+                // Claiming the sequence in `connect_drag_begin` grabs the pointer sequence
+                // so `connect_drag_update` keeps receiving motion even after the cursor
+                // leaves the 44x44px button allocation (whereas EventControllerMotion stops
+                // at the widget border), and never fires on plain hover motion.
                 let current_output_clone = current_output.clone();
                 let state_clone_press = Arc::clone(state);
                 let state_clone_motion = Arc::clone(state);
@@ -605,100 +587,110 @@ impl TaskbarWidget {
                 let bar_pos = self.bar_position;
                 let bar_sz = self.bar_size;
                 let vp_press = Rc::clone(&self.viewport);
-
-                // Button press
-                button.connect_button_press_event(move |b, event| {
-                    if event.button() == 2 {
-                        gio::spawn_blocking(move || {
-                            if let Err(e) = ipc::close_window(window_id) {
-                                log_warn!("taskbar", "Close window {window_id} failed: {e}");
-                            }
-                        });
-                        return Propagation::Stop;
-                    }
-
-                    if event.button() == 1 {
-                        let (root_x, root_y) = event.root();
-                        let parent = b.parent().and_then(|p| p.downcast::<GtkBox>().ok());
-                        let current_idx = parent
-                            .as_ref()
-                            .map(|p| {
-                                let children = p.children();
-                                children.iter().position(|c| c == b).unwrap_or(idx)
-                            })
-                            .unwrap_or(idx);
-
-                        let cur_start = vp_press.borrow().start;
-                        let global_idx = cur_start + current_idx;
-
-                        // Anchor the press in Niri space through the monitor
-                        // containing it (see `map_root_to_niri`) — no
-                        // widget-offset arithmetic, so GDK↔Niri skew cannot
-                        // offset the whole drag.
-                        let (source_out, (start_global_x, start_global_y)) = {
-                            let st = crate::util::lock(&state_clone_press);
-                            let out_name = current_output_clone.clone();
-                            let (pt, _) = map_root_to_niri(root_x, root_y, &out_name, &st.outputs, bar_pos, bar_sz);
-                            (out_name, pt)
-                        };
-
-                        let mut drag = crate::util::lock(&GLOBAL_DRAG);
-                        // Single-drag guard: never clobber an active drag
-                        // from another button/overlay.
-                        if let Some(ref existing) = *drag {
-                            if existing.is_dragging && existing.window_id != window_id {
-                                return Propagation::Proceed;
-                            }
-                        }
-                        let generation = crate::niri::drag::DRAG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        *drag = Some(GlobalDragState {
-                            window_id,
-                            source_output: source_out,
-                            source_index: global_idx,
-                            start_root_x: root_x,
-                            start_root_y: root_y,
-                            current_global_x: start_global_x,
-                            current_global_y: start_global_y,
-                            is_dragging: false,
-                            current_target_slot: global_idx,
-                            target_output: None,
-                            target_slot: global_idx,
-                            target_slot_valid: false,
-                            generation,
-                        });
-                    }
-
-                    Propagation::Proceed
-                });
-
-                // Motion notify on source button
-                let niri_tx_motion = niri_tx.clone();
                 let vp_motion = Rc::clone(&self.viewport);
 
-                button.connect_motion_notify_event(move |b, event| {
+                let drag_gesture = gtk::GestureDrag::builder()
+                    .button(1)
+                    .propagation_phase(gtk::PropagationPhase::Capture)
+                    .build();
+                let seq_cancelled = Rc::new(Cell::new(false));
+
+                let seq_cancelled_begin = Rc::clone(&seq_cancelled);
+                let btn_press_weak = button.downgrade();
+                drag_gesture.connect_drag_begin(move |gesture, x, y| {
+                    seq_cancelled_begin.set(false);
+                    let Some(b) = btn_press_weak.upgrade() else {
+                        return;
+                    };
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, x, y);
+                    let parent = b.parent().and_then(|p| p.downcast::<GtkBox>().ok());
+                    let current_idx = parent
+                        .as_ref()
+                        .map(|p| {
+                            let children = crate::util::widget_children(p);
+                            let b_widget: &gtk::Widget = b.upcast_ref();
+                            children.iter().position(|c| c == b_widget).unwrap_or(idx)
+                        })
+                        .unwrap_or(idx);
+
+                    let cur_start = vp_press.borrow().start;
+                    let global_idx = cur_start + current_idx;
+
+                    // Anchor the press in Niri space through the monitor
+                    // containing it (see `map_root_to_niri`) — no
+                    // widget-offset arithmetic, so GDK↔Niri skew cannot
+                    // offset the whole drag.
+                    let (source_out, (start_global_x, start_global_y)) = {
+                        let st = crate::util::lock(&state_clone_press);
+                        let out_name = current_output_clone.clone();
+                        let (pt, _) = map_root_to_niri(root_x, root_y, &out_name, &st.outputs, bar_pos, bar_sz);
+                        (out_name, pt)
+                    };
+
+                    let mut drag = crate::util::lock(&GLOBAL_DRAG);
+                    // Single-drag guard: never clobber an active drag
+                    // from another button/overlay.
+                    if let Some(ref existing) = *drag {
+                        if existing.is_dragging && existing.window_id != window_id {
+                            return;
+                        }
+                    }
+                    let generation = crate::niri::drag::DRAG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    *drag = Some(GlobalDragState {
+                        window_id,
+                        source_output: source_out,
+                        source_index: global_idx,
+                        start_root_x: root_x,
+                        start_root_y: root_y,
+                        current_global_x: start_global_x,
+                        current_global_y: start_global_y,
+                        is_dragging: false,
+                        current_target_slot: global_idx,
+                        target_output: None,
+                        target_slot: global_idx,
+                        target_slot_valid: false,
+                        generation,
+                    });
+                });
+
+                let seq_cancelled_cancel = Rc::clone(&seq_cancelled);
+                drag_gesture.connect_cancel(move |_, _| {
+                    seq_cancelled_cancel.set(true);
+                });
+
+                let niri_tx_motion = niri_tx.clone();
+                let btn_motion_weak = button.downgrade();
+                drag_gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+                    let Some(b) = btn_motion_weak.upgrade() else {
+                        return;
+                    };
+                    let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
+                    let evt_x = start_x + offset_x;
+                    let evt_y = start_y + offset_y;
+
                     let mut drag_guard = crate::util::lock(&GLOBAL_DRAG);
                     if let Some(ref mut drag) = *drag_guard {
                         if drag.window_id == window_id {
-                            let (root_x, root_y) = event.root();
+                            let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, evt_x, evt_y);
                             let dx = root_x - drag.start_root_x;
                             let dy = root_y - drag.start_root_y;
                             let dist = (dx * dx + dy * dy).sqrt();
-                            let threshold = DRAG_THRESHOLD_LOGICAL_PX * f64::from(b.scale_factor().max(1));
 
-                            if dist > threshold {
+                            if dist > DRAG_THRESHOLD_LOGICAL_PX {
                                 if !drag.is_dragging {
                                     drag.is_dragging = true;
-                                    b.style_context().add_class("is-dragging");
-                                    b.style_context().add_class("drag-placeholder");
+                                    b.add_css_class("is-dragging");
+                                    b.add_css_class("drag-placeholder");
 
                                     // Fullscreen transparent overlays so the
                                     // drag tracks across monitors (see drag.rs).
                                     // Spawn BEFORE applying the cursor so the
                                     // overlay windows get the icon cursor too.
-                                    spawn_monitor_overlays(&state_clone_motion, &niri_tx_motion, window_id, b);
+                                    spawn_monitor_overlays(&state_clone_motion, &niri_tx_motion, window_id, &b);
 
                                     let current_key = shared_icon_key_motion.borrow().clone();
-                                    apply_drag_cursor_globally(&current_key, config_icon_sz, Some(b));
+                                    apply_drag_cursor_globally(&current_key, config_icon_sz, Some(&b));
                                 }
 
                                 let source_out_snapshot = drag.source_output.clone();
@@ -728,51 +720,17 @@ impl TaskbarWidget {
 
                                 if !is_cross_monitor {
                                     if let Some(parent) = b.parent().and_then(|p| p.downcast::<GtkBox>().ok()) {
-                                        let children = parent.children();
-                                        let total = children.len();
-                                        if total > 1 {
-                                            let (evt_x, evt_y) = event.position();
-                                            let (rel_x, rel_y) = b
-                                                .translate_coordinates(&parent, evt_x as i32, evt_y as i32)
-                                                .unwrap_or((0, 0));
-
-                                            let current_pos = children.iter().position(|c| c == b).unwrap_or(0);
-
-                                            let bounds: Vec<ChildBounds> = children
-                                                .iter()
-                                                .map(|child| {
-                                                    let alloc = child.allocation();
-                                                    if is_vertical {
-                                                        ChildBounds {
-                                                            pos: alloc.y(),
-                                                            len: alloc.height(),
-                                                        }
-                                                    } else {
-                                                        ChildBounds {
-                                                            pos: alloc.x(),
-                                                            len: alloc.width(),
-                                                        }
-                                                    }
-                                                })
-                                                .collect();
-                                            let pointer = if is_vertical { rel_y } else { rel_x };
-                                            let target_idx = reorder_target(&bounds, pointer, current_pos);
-
-                                            if target_idx != current_pos {
-                                                parent.reorder_child(b, target_idx as i32);
-                                            }
-                                            {
-                                                let cur_start = vp_motion.borrow().start;
-                                                let global_target = cur_start + target_idx;
-                                                let mut g = crate::util::lock(&GLOBAL_DRAG);
-                                                if let Some(ref mut d) = *g {
-                                                    if d.window_id == window_id {
-                                                        d.current_target_slot = global_target;
-                                                        d.target_slot = global_target;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        let (rel_x, rel_y) =
+                                            b.translate_coordinates(&parent, evt_x, evt_y).unwrap_or((0.0, 0.0));
+                                        update_local_drag_reorder(
+                                            &parent,
+                                            &b,
+                                            rel_x,
+                                            rel_y,
+                                            is_vertical,
+                                            vp_motion.borrow().start,
+                                            window_id,
+                                        );
                                     }
                                     if target_out_changed {
                                         crate::util::nudge(&niri_tx_motion);
@@ -783,31 +741,24 @@ impl TaskbarWidget {
                             }
                         }
                     }
-                    Propagation::Proceed
                 });
 
-                // Button release on source button
-                let niri_tx_release = niri_tx.clone();
+                let seq_cancelled_end = Rc::clone(&seq_cancelled);
+                let niri_tx_release = niri_tx;
                 let b_release = button.clone();
-
-                button.connect_button_release_event(move |_, event| {
-                    if event.button() != 1 {
-                        return Propagation::Proceed;
-                    }
-
-                    reset_all_cursors_and_overlay(Some(&b_release));
-                    // Plain click (no drag threshold crossed) focuses the window.
-                    finish_drag(window_id, true);
-
-                    crate::util::nudge(&niri_tx_release);
-
-                    Propagation::Stop
+                drag_gesture.connect_drag_end(move |_, _, _| {
+                    crate::niri::drag::handle_source_gesture_end(
+                        window_id,
+                        seq_cancelled_end.get(),
+                        Some(&b_release),
+                        &niri_tx_release,
+                    );
                 });
+                button.add_controller(drag_gesture);
 
                 // Add to container and ensure correct initial index
-                self.container.add(&button);
-                self.container.reorder_child(&button, idx as i32);
-                button.show_all();
+                self.container.append(&button);
+                crate::util::reorder_box_child(&self.container, &button, idx);
 
                 widgets_map.insert(
                     window_id,
@@ -820,6 +771,94 @@ impl TaskbarWidget {
                     },
                 );
             }
+        }
+
+        if any_locally_dragging {
+            if let Some(ref drag) = drag_snapshot {
+                if let Some(drag_widget) = widgets_map.get(&drag.window_id) {
+                    let mon_logical = current_output
+                        .as_ref()
+                        .and_then(|curr_out| outputs.get(curr_out))
+                        .and_then(|o| o.logical.clone());
+                    let (mon_x, mon_y) = mon_logical.map(|l| (l.x as f64, l.y as f64)).unwrap_or((0.0, 0.0));
+                    let rel_mon_x = drag.current_global_x - mon_x;
+                    let rel_mon_y = drag.current_global_y - mon_y;
+                    let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
+                        self.container
+                            .translate_coordinates(&root, 0.0, 0.0)
+                            .unwrap_or((0.0, 0.0))
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let rel_container_x = rel_mon_x - container_off_x;
+                    let rel_container_y = rel_mon_y - container_off_y;
+                    update_local_drag_reorder(
+                        &self.container,
+                        &drag_widget.button,
+                        rel_container_x,
+                        rel_container_y,
+                        is_vertical,
+                        start_idx,
+                        drag.window_id,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn update_local_drag_reorder(
+    parent: &GtkBox,
+    b: &Button,
+    rel_x: f64,
+    rel_y: f64,
+    is_vertical: bool,
+    viewport_start: usize,
+    window_id: u64,
+) {
+    let children = crate::util::widget_children(parent);
+    if children.len() <= 1 {
+        return;
+    }
+
+    let b_widget: &gtk::Widget = b.upcast_ref();
+    let current_pos = children.iter().position(|c| c == b_widget).unwrap_or(0);
+
+    let bounds: Vec<ChildBounds> = children
+        .iter()
+        .map(|child| {
+            let alloc = child.allocation();
+            if is_vertical {
+                ChildBounds {
+                    pos: alloc.y(),
+                    len: alloc.height(),
+                }
+            } else {
+                ChildBounds {
+                    pos: alloc.x(),
+                    len: alloc.width(),
+                }
+            }
+        })
+        .collect();
+
+    if !bounds.iter().any(|bd| bd.len > 0) {
+        return;
+    }
+
+    let pointer = if is_vertical { rel_y as i32 } else { rel_x as i32 };
+    let target_idx = reorder_target(&bounds, pointer, current_pos);
+
+    if target_idx != current_pos {
+        crate::util::reorder_box_child(parent, b, target_idx);
+    }
+
+    let global_target = viewport_start + target_idx;
+    let mut g = crate::util::lock(&GLOBAL_DRAG);
+    if let Some(ref mut d) = *g {
+        if d.window_id == window_id {
+            d.current_target_slot = global_target;
+            d.target_slot = global_target;
         }
     }
 }
@@ -1213,5 +1252,371 @@ mod tests {
         // At end: 10 windows, start = 5
         vp.start = 5;
         assert_eq!(vp.visible_range(), (5, 10));
+    }
+
+    #[test]
+    fn test_taskbar_button_click_gestures_use_capture_phase() {
+        crate::util::run_gtk_test(|| {
+            use crate::config::TaskbarConfig;
+            use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
+            use gtk::prelude::*;
+
+            let niri = std::sync::Arc::new(NiriService::new_mock());
+            let tb = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                niri.update_tx.clone(),
+            );
+            {
+                let mut st = AppState::default();
+                st.workspaces.push(WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("eDP-1".into()),
+                    is_active: true,
+                    is_focused: true,
+                });
+                st.windows.push(WindowInfo {
+                    id: 99,
+                    title: Some("Firefox".into()),
+                    app_id: Some("firefox".into()),
+                    workspace_id: Some(1),
+                    is_focused: true,
+                    layout: Default::default(),
+                    pid: None,
+                });
+                *crate::util::lock(&niri.state) = st;
+            }
+            tb.reconcile(&Some("eDP-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
+
+            let children = crate::util::widget_children(&tb.container);
+            assert_eq!(children.len(), 1);
+            let btn = children[0].clone().downcast::<gtk::Button>().unwrap();
+            assert!(
+                !btn.is_focusable(),
+                "Taskbar app button should not be focusable to avoid GTK4 focus rings"
+            );
+
+            let controllers = btn.observe_controllers();
+            let mut has_capture_drag = false;
+            let mut has_capture_middle = false;
+            for i in 0..controllers.n_items() {
+                if let Some(ctrl) = controllers.item(i).and_then(|o| o.downcast::<gtk::GestureDrag>().ok()) {
+                    if ctrl.button() == 1 {
+                        assert_eq!(
+                            ctrl.propagation_phase(),
+                            gtk::PropagationPhase::Capture,
+                            "GestureDrag on gtk::Button must use Capture phase"
+                        );
+                        has_capture_drag = true;
+                    }
+                }
+                if let Some(ctrl) = controllers.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()) {
+                    if ctrl.button() == 2 {
+                        assert_eq!(
+                            ctrl.propagation_phase(),
+                            gtk::PropagationPhase::Capture,
+                            "Middle-click GestureClick on gtk::Button must use Capture phase"
+                        );
+                        has_capture_middle = true;
+                    }
+                }
+                if controllers
+                    .item(i)
+                    .and_then(|o| o.downcast::<gtk::EventControllerMotion>().ok())
+                    .is_some()
+                {
+                    panic!("Taskbar app button must NOT have EventControllerMotion attached (intercepts hover and breaks drag tracking past widget allocation in GTK4)");
+                }
+            }
+            assert!(has_capture_drag, "Expected Capture-phase GestureDrag for button 1");
+            assert!(
+                has_capture_middle,
+                "Expected Capture-phase GestureClick for middle button"
+            );
+        });
+    }
+
+    #[test]
+    fn test_reconcile_during_local_drag_preserves_reordered_box_position() {
+        crate::util::run_gtk_test(|| {
+            *crate::util::lock(&crate::niri::drag::GLOBAL_DRAG) = None;
+            use crate::config::TaskbarConfig;
+            use crate::niri::drag::{GlobalDragState, GLOBAL_DRAG};
+            use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
+            use gtk::prelude::*;
+
+            let niri = std::sync::Arc::new(NiriService::new_mock());
+            let tb = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                niri.update_tx.clone(),
+            );
+            {
+                let mut st = AppState::default();
+                st.workspaces.push(WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("eDP-1".into()),
+                    is_active: true,
+                    is_focused: true,
+                });
+                for (id, col) in [(10u64, 1usize), (20u64, 2usize), (30u64, 3usize)] {
+                    st.windows.push(WindowInfo {
+                        id,
+                        title: Some(format!("Win {id}")),
+                        app_id: Some("firefox".into()),
+                        workspace_id: Some(1),
+                        is_focused: id == 10,
+                        layout: Some(crate::niri::model::WindowLayout {
+                            pos_in_scrolling_layout: Some((col, 1)),
+                        }),
+                        pid: None,
+                    });
+                }
+                *crate::util::lock(&niri.state) = st;
+            }
+            tb.reconcile(&Some("eDP-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
+
+            let initial_children = crate::util::widget_children(&tb.container);
+            assert_eq!(initial_children.len(), 3);
+            let btn_10 = initial_children[0].clone().downcast::<gtk::Button>().unwrap();
+
+            // Simulate dragging window 10 to slot 2 (index 2)
+            crate::util::reorder_box_child(&tb.container, &btn_10, 2);
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 10,
+                source_output: Some("eDP-1".into()),
+                source_index: 0,
+                start_root_x: 10.0,
+                start_root_y: 10.0,
+                current_global_x: 10.0,
+                current_global_y: 120.0,
+                is_dragging: true,
+                current_target_slot: 2,
+                target_output: None,
+                target_slot: 0,
+                target_slot_valid: false,
+                generation: 1,
+            });
+
+            // Reconcile while dragging locally must NOT snap btn_10 back to index 0
+            tb.reconcile(&Some("eDP-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
+
+            let after_children = crate::util::widget_children(&tb.container);
+            assert_eq!(
+                &after_children[2],
+                btn_10.upcast_ref::<gtk::Widget>(),
+                "Reconcile during active local drag must not snap dragged button back to index 0"
+            );
+
+            *crate::util::lock(&GLOBAL_DRAG) = None;
+        });
+    }
+
+    #[test]
+    fn test_cross_monitor_drag_preview_reconcile_and_cleanup() {
+        crate::util::run_gtk_test(|| {
+            *crate::util::lock(&crate::niri::drag::GLOBAL_DRAG) = None;
+            use crate::config::TaskbarConfig;
+            use crate::niri::drag::{GlobalDragState, GLOBAL_DRAG};
+            use crate::niri::model::{LogicalOutput, OutputInfo};
+            use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
+            use gtk::prelude::*;
+            use std::collections::HashMap;
+
+            let niri = std::sync::Arc::new(NiriService::new_mock());
+            let tb_source = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                niri.update_tx.clone(),
+            );
+            let tb_target = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                niri.update_tx.clone(),
+            );
+
+            let mut outputs = HashMap::new();
+            outputs.insert(
+                "eDP-1".to_string(),
+                OutputInfo {
+                    name: Some("eDP-1".to_string()),
+                    make: None,
+                    model: None,
+                    physical_size: None,
+                    logical: Some(LogicalOutput {
+                        x: 0,
+                        y: 0,
+                        width: 1422,
+                        height: 800,
+                        scale: Some(1.0),
+                    }),
+                },
+            );
+            outputs.insert(
+                "DP-1".to_string(),
+                OutputInfo {
+                    name: Some("DP-1".to_string()),
+                    make: None,
+                    model: None,
+                    physical_size: None,
+                    logical: Some(LogicalOutput {
+                        x: 1423,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                        scale: Some(1.0),
+                    }),
+                },
+            );
+
+            {
+                let mut st = AppState {
+                    outputs,
+                    ..Default::default()
+                };
+                st.workspaces.push(WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("eDP-1".into()),
+                    is_active: true,
+                    is_focused: true,
+                });
+                st.workspaces.push(WorkspaceInfo {
+                    id: 2,
+                    idx: 2,
+                    output: Some("DP-1".into()),
+                    is_active: true,
+                    is_focused: false,
+                });
+                st.windows.push(WindowInfo {
+                    id: 10,
+                    title: Some("Firefox".into()),
+                    app_id: Some("firefox".into()),
+                    workspace_id: Some(1),
+                    is_focused: true,
+                    layout: Some(crate::niri::model::WindowLayout {
+                        pos_in_scrolling_layout: Some((1, 1)),
+                    }),
+                    pid: None,
+                });
+                st.windows.push(WindowInfo {
+                    id: 20,
+                    title: Some("Terminal".into()),
+                    app_id: Some("firefox".into()),
+                    workspace_id: Some(2),
+                    is_focused: false,
+                    layout: Some(crate::niri::model::WindowLayout {
+                        pos_in_scrolling_layout: Some((1, 1)),
+                    }),
+                    pid: None,
+                });
+                *crate::util::lock(&niri.state) = st;
+            }
+
+            let cfg = TaskbarConfig::default();
+
+            // Initial reconcile: source bar has win 10, target bar has win 20
+            tb_source.reconcile(&Some("eDP-1".into()), &niri.state, &cfg, &niri, 10);
+            tb_target.reconcile(&Some("DP-1".into()), &niri.state, &cfg, &niri, 10);
+
+            assert_eq!(crate::util::widget_children(&tb_source.container).len(), 1);
+            assert_eq!(crate::util::widget_children(&tb_target.container).len(), 1);
+
+            // 1. Simulate cross-monitor drag of win 10 targeting DP-1
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 10,
+                source_output: Some("eDP-1".into()),
+                source_index: 0,
+                start_root_x: 20.0,
+                start_root_y: 20.0,
+                current_global_x: 1500.0,
+                current_global_y: 50.0,
+                is_dragging: true,
+                current_target_slot: 0,
+                target_output: Some("DP-1".into()),
+                target_slot: 0,
+                target_slot_valid: false,
+                generation: 1,
+            });
+
+            // Target bar reconciles: must insert ghost preview button
+            tb_target.reconcile(&Some("DP-1".into()), &niri.state, &cfg, &niri, 10);
+            let target_children = crate::util::widget_children(&tb_target.container);
+            assert_eq!(
+                target_children.len(),
+                2,
+                "Target bar must render original window + ghost preview button"
+            );
+
+            let preview_btn = target_children
+                .iter()
+                .find(|c| c.has_css_class("cross-monitor-preview"))
+                .expect("Ghost preview button must have .cross-monitor-preview class");
+            assert!(
+                preview_btn.has_css_class("drag-placeholder"),
+                "Ghost preview button must have .drag-placeholder class"
+            );
+
+            // GLOBAL_DRAG target_slot_valid must now be true
+            {
+                let g = crate::util::lock(&GLOBAL_DRAG);
+                let d = g.as_ref().unwrap();
+                assert!(d.target_slot_valid, "Drag target slot must be marked valid");
+            }
+
+            // Source bar reconciles: win 10 button must become drag-source-away with opacity 0.0
+            tb_source.reconcile(&Some("eDP-1".into()), &niri.state, &cfg, &niri, 10);
+            let source_children = crate::util::widget_children(&tb_source.container);
+            assert_eq!(source_children.len(), 1);
+            assert!(
+                source_children[0].has_css_class("drag-source-away"),
+                "Source button must have .drag-source-away class while targeting another monitor"
+            );
+            assert_eq!(
+                source_children[0].opacity(),
+                0.0,
+                "Source button must have 0.0 opacity while targeting another monitor"
+            );
+
+            // 2. Drag ends (dropped or cancelled): clean up
+            *crate::util::lock(&GLOBAL_DRAG) = None;
+
+            // Target bar reconciles again: ghost preview button must be removed
+            tb_target.reconcile(&Some("DP-1".into()), &niri.state, &cfg, &niri, 10);
+            let target_clean_children = crate::util::widget_children(&tb_target.container);
+            assert_eq!(
+                target_clean_children.len(),
+                1,
+                "Target bar must remove ghost preview button after drag ends"
+            );
+            assert!(
+                !target_clean_children[0].has_css_class("cross-monitor-preview"),
+                "Remaining button on target bar must not have .cross-monitor-preview"
+            );
+
+            // Source bar reconciles again: source button restores opacity and removes drag-source-away
+            tb_source.reconcile(&Some("eDP-1".into()), &niri.state, &cfg, &niri, 10);
+            let source_clean_children = crate::util::widget_children(&tb_source.container);
+            assert_eq!(source_clean_children.len(), 1);
+            assert!(
+                !source_clean_children[0].has_css_class("drag-source-away"),
+                "Source button must remove .drag-source-away after drag ends"
+            );
+            assert_eq!(
+                source_clean_children[0].opacity(),
+                1.0,
+                "Source button opacity must be restored to 1.0"
+            );
+        });
     }
 }

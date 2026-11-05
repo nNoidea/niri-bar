@@ -1,5 +1,6 @@
+use gdk::prelude::*;
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Orientation, Window, WindowType};
+use gtk::{Box as GtkBox, Orientation, Window};
 use std::sync::Arc;
 
 use crate::config::{AppConfig, BarPosition};
@@ -32,13 +33,8 @@ pub struct BarWindow {
 pub fn copy_to_clipboard(text: &str) {
     if gtk::is_initialized_main_thread() {
         if let Some(display) = gdk::Display::default() {
-            let clipboard = gtk::Clipboard::for_display(&display, &gdk::SELECTION_CLIPBOARD);
-            clipboard.set_text(text);
-            clipboard.store();
-
-            let primary = gtk::Clipboard::for_display(&display, &gdk::SELECTION_PRIMARY);
-            primary.set_text(text);
-            primary.store();
+            display.clipboard().set_text(text);
+            display.primary_clipboard().set_text(text);
         }
     }
 
@@ -94,17 +90,17 @@ pub fn compute_taskbar_capacity(
         mon_geom.width()
     };
     let (_, end_req) = end_box.preferred_size();
-    let end_len = if is_vertical { end_req.height } else { end_req.width };
-    let start_non_taskbar_len: i32 = start_box
-        .children()
+    let end_len = if is_vertical { end_req.height() } else { end_req.width() };
+    let taskbar_widget: &gtk::Widget = taskbar_container.upcast_ref();
+    let start_non_taskbar_len: i32 = crate::util::widget_children(start_box)
         .iter()
-        .filter(|c| *c != taskbar_container)
+        .filter(|c| *c != taskbar_widget)
         .map(|c| {
             let (_, req) = c.preferred_size();
             if is_vertical {
-                req.height
+                req.height()
             } else {
-                req.width
+                req.width()
             }
         })
         .sum();
@@ -132,7 +128,7 @@ pub enum ModulePlacement {
     Simple,
 }
 
-pub const ERROR_BADGE_CSS: &[u8] = b"#bar-error-badge,
+pub const ERROR_BADGE_CSS: &str = "#bar-error-badge,
 button#bar-error-badge,
 #bar-error-badge:backdrop,
 button#bar-error-badge:backdrop {
@@ -146,7 +142,6 @@ button#bar-error-badge:backdrop {
     margin: 4px 2px;
     box-shadow: none;
     text-shadow: none;
-    -gtk-icon-shadow: none;
 }
 
 #bar-error-badge:hover,
@@ -205,21 +200,20 @@ impl ErrorBadge {
         let current_error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
         let button = gtk::Button::new();
         button.set_widget_name("bar-error-badge");
-        button.style_context().add_class("clickable");
+        button.add_css_class("clickable");
         crate::modules::enable_hover_cursor(&button);
-        button.set_no_show_all(true);
         button.set_visible(false);
 
-        // Screen-wide provider installed once per process: per-badge screen
+        // Display-wide provider installed once per process: per-badge display
         // installs leaked (old providers survived config-reload bar rebuilds
         // and stacked).
-        let error_style = gtk::CssProvider::new();
-        let _ = error_style.load_from_data(ERROR_BADGE_CSS);
         ERROR_STYLE_INSTALLED.with(|done| {
             if !done.get() {
-                if let Some(screen) = gdk::Screen::default() {
-                    gtk::StyleContext::add_provider_for_screen(
-                        &screen,
+                let error_style = gtk::CssProvider::new();
+                error_style.load_from_data(ERROR_BADGE_CSS);
+                if let Some(display) = gdk::Display::default() {
+                    gtk::style_context_add_provider_for_display(
+                        &display,
                         &error_style,
                         gtk::STYLE_PROVIDER_PRIORITY_USER + 1000,
                     );
@@ -227,14 +221,10 @@ impl ErrorBadge {
                 done.set(true);
             }
         });
-        button
-            .style_context()
-            .add_provider(&error_style, gtk::STYLE_PROVIDER_PRIORITY_USER + 1000);
 
         let label = gtk::Label::new(None);
         label.set_markup(ERROR_LABEL_MARKUP);
-        label.show();
-        button.add(&label);
+        button.set_child(Some(&label));
 
         let err_clone = std::rc::Rc::clone(&current_error);
         let err_lbl_clone = label.clone();
@@ -262,16 +252,14 @@ impl ErrorBadge {
         self.label.set_markup(ERROR_LABEL_MARKUP);
         self.button
             .set_tooltip_text(Some(&format!("Click to copy error below:\n\n{error}")));
-        self.button.set_no_show_all(false);
-        self.button.show_all();
-        self.button.set_no_show_all(true);
+        self.button.set_visible(true);
     }
 
     /// Clear error badge when configuration or CSS is valid again.
     pub fn clear_error(&self) {
         *self.current_error.borrow_mut() = None;
         self.label.set_markup(ERROR_LABEL_MARKUP);
-        self.button.hide();
+        self.button.set_visible(false);
     }
 }
 
@@ -283,9 +271,9 @@ impl BarWindow {
         tray_service: &Arc<TrayService>,
         modules: &SharedModules,
     ) -> Self {
-        let window = Window::new(WindowType::Toplevel);
+        let window = Window::new();
         window.init_layer_shell();
-        window.set_monitor(&monitor);
+        window.set_monitor(Some(&monitor));
         window.set_layer(Layer::Top);
         window.auto_exclusive_zone_enable();
 
@@ -324,22 +312,20 @@ impl BarWindow {
             }
         }
 
-        let ctx = window.style_context();
-        ctx.add_class("niri-bar");
+        window.add_css_class("niri-bar");
         if is_vertical {
-            ctx.add_class("vertical");
+            window.add_css_class("vertical");
         } else {
-            ctx.add_class("horizontal");
+            window.add_css_class("horizontal");
         }
 
         let overlay = gtk::Overlay::new();
-        window.add(&overlay);
+        window.set_child(Some(&overlay));
 
         // 1. Section 1: Modules at start (base layer)
         let start_box = GtkBox::new(box_orient, config.spacing);
-        let start_ctx = start_box.style_context();
-        start_ctx.add_class("taskbar-section");
-        start_ctx.add_class("start-section");
+        start_box.add_css_class("taskbar-section");
+        start_box.add_css_class("start-section");
         if is_vertical {
             start_box.set_valign(gtk::Align::Start);
             start_box.set_halign(gtk::Align::Fill);
@@ -354,14 +340,13 @@ impl BarWindow {
             config.size,
             niri.update_tx.clone(),
         );
-        overlay.add(&start_box);
+        overlay.set_child(Some(&start_box));
 
         // 2. Section 2: Modules at end (overlay layer)
         let end_box = GtkBox::new(box_orient, config.spacing);
-        let end_ctx = end_box.style_context();
-        end_ctx.add_class("modules-box");
-        end_ctx.add_class("modules-section");
-        end_ctx.add_class("end-section");
+        end_box.add_css_class("modules-box");
+        end_box.add_css_class("modules-section");
+        end_box.add_css_class("end-section");
         if is_vertical {
             end_box.set_valign(gtk::Align::End);
             end_box.set_halign(gtk::Align::Fill);
@@ -370,11 +355,10 @@ impl BarWindow {
             end_box.set_valign(gtk::Align::Fill);
         }
         overlay.add_overlay(&end_box);
-        overlay.set_overlay_pass_through(&end_box, false);
 
         let add_module = |container: &GtkBox, mod_name: &str| match resolve_module_placement(mod_name) {
             Some(ModulePlacement::Taskbar) => {
-                container.pack_start(&taskbar.container, false, false, 0);
+                container.append(&taskbar.container);
             }
             Some(ModulePlacement::Tray) => {
                 let tray_w = TrayWidget::new(
@@ -384,7 +368,7 @@ impl BarWindow {
                     config.tray.icon_size,
                     config.tray.spacing,
                 );
-                container.pack_start(&tray_w.container, false, false, 0);
+                container.append(&tray_w.container);
             }
             Some(ModulePlacement::Simple) => {
                 if let Some(m) = modules.get(mod_name) {
@@ -392,7 +376,7 @@ impl BarWindow {
                     if mod_name == "spacer" {
                         crate::modules::spacer::configure_spacer_button(&w.button, config.spacer.size, is_vertical);
                     }
-                    container.pack_start(&w.button, false, false, 0);
+                    container.append(&w.button);
                 }
             }
             None => {
@@ -414,18 +398,9 @@ impl BarWindow {
 
         // Live config / style error badge (black background, red text, self-contained without external CSS)
         let error_badge = ErrorBadge::new();
-        end_box.pack_end(&error_badge.button, false, false, 0);
+        end_box.append(&error_badge.button);
 
-        window.connect_size_allocate(|_, alloc| {
-            log_debug!(
-                "bar",
-                "Bar allocated geometry: {}px wide × {}px high",
-                alloc.width(),
-                alloc.height()
-            );
-        });
-
-        window.show_all();
+        window.set_visible(true);
 
         // Initial taskbar reconcile
         let detected_output = {
@@ -606,19 +581,18 @@ mod tests {
     fn test_error_badge_cursor_and_clickable_classes() {
         crate::util::run_gtk_test(|| {
             let button = gtk::Button::new();
-            button.style_context().add_class("clickable");
+            button.add_css_class("clickable");
             crate::modules::enable_hover_cursor(&button);
 
             let error_style = gtk::CssProvider::new();
-            let res = error_style.load_from_data(
-                b"button { background: #000000; background-color: #000000; border: 1px solid #ff4444; border-radius: 4px; padding: 2px 6px; margin: 4px; } label { color: #ff4444; font-weight: bold; font-size: 11px; }",
+            let res = crate::style::load_css_checked(
+                &error_style,
+                "button { background: #000000; background-color: #000000; border: 1px solid #ff4444; border-radius: 4px; padding: 2px 6px; margin: 4px; } label { color: #ff4444; font-weight: bold; font-size: 11px; }",
             );
             assert!(res.is_ok(), "Inline error badge CSS failed to parse: {:?}", res.err());
 
-            assert!(button.style_context().has_class("clickable"));
-            let events = button.events();
-            assert!(events.contains(gdk::EventMask::ENTER_NOTIFY_MASK));
-            assert!(events.contains(gdk::EventMask::LEAVE_NOTIFY_MASK));
+            assert!(button.has_css_class("clickable"));
+            assert!(button.cursor().is_some());
         });
     }
 
@@ -646,7 +620,7 @@ mod tests {
     fn test_error_badge_css_valid_for_gtk() {
         crate::util::run_gtk_test(|| {
             let provider = gtk::CssProvider::new();
-            let res = provider.load_from_data(ERROR_BADGE_CSS);
+            let res = crate::style::load_css_checked(&provider, ERROR_BADGE_CSS);
             assert!(res.is_ok(), "ERROR_BADGE_CSS failed to parse: {:?}", res.err());
         });
     }
@@ -654,24 +628,19 @@ mod tests {
     #[test]
     fn test_overlay_layout() {
         crate::util::run_gtk_test(|| {
-            // OffscreenWindow realizes children without mapping a real window,
-            // so running the test suite never flashes a window on screen.
-            let window = gtk::OffscreenWindow::new();
-            window.set_size_request(50, -1);
             let overlay = gtk::Overlay::new();
-            window.add(&overlay);
+            overlay.set_size_request(50, -1);
 
             let start_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
             start_box.set_valign(gtk::Align::Start);
             start_box.set_halign(gtk::Align::Fill);
-            overlay.add(&start_box);
+            overlay.set_child(Some(&start_box));
 
             let end_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
             end_box.set_valign(gtk::Align::End);
             end_box.set_halign(gtk::Align::Fill);
             overlay.add_overlay(&end_box);
 
-            window.show_all();
             assert!(overlay.is_visible());
             assert!(start_box.is_visible());
             assert!(end_box.is_visible());

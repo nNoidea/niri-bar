@@ -2,23 +2,11 @@ use crate::niri::model::{Event, OutputInfo, WindowInfo, WorkspaceInfo};
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 /// Niri socket path from `$NIRI_SOCKET` (set by Niri for its clients).
 pub fn get_socket_path() -> Option<String> {
     env::var("NIRI_SOCKET").ok()
-}
-
-fn connect_socket() -> Result<UnixStream, String> {
-    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
-    let stream = UnixStream::connect(&socket_path)
-        .map_err(|e| format!("Failed to connect to Niri socket at {}: {}", socket_path, e))?;
-    let timeout = Duration::from_millis(1000);
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    Ok(stream)
 }
 
 #[derive(serde::Deserialize)]
@@ -48,57 +36,74 @@ pub fn parse_niri_response<T: serde::de::DeserializeOwned>(line: &str) -> Result
     }
 }
 
-fn execute_actions(action_payloads: &[serde_json::Value]) -> Result<(), String> {
-    const MAX_LINE: u64 = 8 * 1024 * 1024;
-    let mut stream = connect_socket()?;
-    for payload in action_payloads {
-        let req_str = build_action_request(payload.clone());
-        stream
-            .write_all(req_str.as_bytes())
-            .map_err(|e| format!("Failed to write to Niri socket: {e}"))?;
-        stream
-            .flush()
-            .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
+pub(crate) async fn execute_actions_at(socket_path: &str, action_payloads: &[serde_json::Value]) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-        // Scoped reader per response so the mutable write borrow ends first.
+    const MAX_LINE: u64 = 8 * 1024 * 1024;
+    let timeout_dur = Duration::from_millis(1000);
+
+    tokio::time::timeout(timeout_dur, async {
+        let mut stream = tokio::net::UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| format!("Failed to connect to Niri socket at {socket_path}: {e}"))?;
+        let (rd, mut wr) = stream.split();
+        let mut reader = tokio::io::BufReader::new(rd);
         let mut line = String::new();
-        {
-            let reader = BufReader::new(&stream);
-            reader
+
+        for payload in action_payloads {
+            let req_str = build_action_request(payload.clone());
+            wr.write_all(req_str.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write to Niri socket: {e}"))?;
+            wr.flush()
+                .await
+                .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
+
+            line.clear();
+            (&mut reader)
                 .take(MAX_LINE)
                 .read_line(&mut line)
+                .await
                 .map_err(|e| format!("Failed to read action response from Niri socket: {e}"))?;
+            if line.len() >= MAX_LINE as usize {
+                return Err("Action response exceeds 8MB cap".to_string());
+            }
+            let _: serde_json::Value = parse_niri_response(&line)?;
         }
-        if line.len() >= MAX_LINE as usize {
-            return Err("Action response exceeds 8MB cap".to_string());
-        }
-        let _: serde_json::Value = parse_niri_response(&line)?;
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Timed out executing action on Niri socket".to_string())?
 }
 
-fn execute_action(action_payload: serde_json::Value) -> Result<(), String> {
-    execute_actions(&[action_payload])
+async fn execute_actions(action_payloads: &[serde_json::Value]) -> Result<(), String> {
+    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
+    execute_actions_at(&socket_path, action_payloads).await
 }
 
-pub fn focus_window(id: u64) -> Result<(), String> {
-    execute_action(json!({ "FocusWindow": { "id": id } }))
+async fn execute_action(action_payload: serde_json::Value) -> Result<(), String> {
+    execute_actions(&[action_payload]).await
 }
 
-pub fn close_window(id: u64) -> Result<(), String> {
-    execute_action(json!({ "CloseWindow": { "id": id } }))
+pub async fn focus_window(id: u64) -> Result<(), String> {
+    execute_action(json!({ "FocusWindow": { "id": id } })).await
 }
 
-pub fn move_window_to_column(id: u64, index: usize) -> Result<(), String> {
+pub async fn close_window(id: u64) -> Result<(), String> {
+    execute_action(json!({ "CloseWindow": { "id": id } })).await
+}
+
+pub async fn move_window_to_column(id: u64, index: usize) -> Result<(), String> {
     // One connection for focus+move: halves timeout exposure and shrinks
     // the focus-change race window (server-side focus is still not atomic).
     execute_actions(&[
         json!({ "FocusWindow": { "id": id } }),
         json!({ "MoveColumnToIndex": { "index": index } }),
     ])
+    .await
 }
 
-pub fn move_window_to_monitor(id: u64, output: &str, target_slot: Option<usize>) -> Result<(), String> {
+pub async fn move_window_to_monitor(id: u64, output: &str, target_slot: Option<usize>) -> Result<(), String> {
     // One connection for focus+move(+index).
     let mut actions = vec![
         json!({ "FocusWindow": { "id": id } }),
@@ -107,7 +112,7 @@ pub fn move_window_to_monitor(id: u64, output: &str, target_slot: Option<usize>)
     if let Some(slot) = target_slot {
         actions.push(json!({ "MoveColumnToIndex": { "index": slot } }));
     }
-    execute_actions(&actions)
+    execute_actions(&actions).await
 }
 
 async fn fetch_niri_resource<T: serde::de::DeserializeOwned>(resource_name: &str) -> Result<T, String> {
@@ -262,5 +267,50 @@ mod tests {
         let parsed: Result<serde_json::Value, String> = parse_niri_response(line);
         assert!(parsed.is_err());
         assert!(parsed.unwrap_err().contains("Failed to parse response"));
+    }
+
+    #[test]
+    fn test_execute_actions_async_on_unix_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = std::env::temp_dir().join(format!("niri-bar-ipc-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock_path = dir.join("niri.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (rd, mut wr) = stream.into_split();
+                let mut lines = BufReader::new(rd).lines();
+                let mut received = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    received.push(line);
+                    wr.write_all(b"{\"Ok\":\"Handled\"}\n").await.unwrap();
+                }
+                received
+            });
+
+            execute_actions_at(
+                &sock_path.to_string_lossy(),
+                &[
+                    json!({ "FocusWindow": { "id": 7 } }),
+                    json!({ "MoveColumnToIndex": { "index": 3 } }),
+                ],
+            )
+            .await
+            .expect("Async execute_actions_at must succeed");
+
+            let received = server.await.unwrap();
+            assert_eq!(received.len(), 2);
+            assert_eq!(received[0], "{\"Action\":{\"FocusWindow\":{\"id\":7}}}");
+            assert_eq!(received[1], "{\"Action\":{\"MoveColumnToIndex\":{\"index\":3}}}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

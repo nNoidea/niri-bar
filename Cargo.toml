@@ -1,6 +1,6 @@
 [package]
 name = "niri-bar"
-version = "0.4.8"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["nNoidea"]
@@ -8,22 +8,22 @@ description = "A fast, lightweight, standalone Wayland status bar and spatial wi
 license = "GPL-3.0-or-later"
 repository = "https://github.com/nNoidea/niri-bar"
 
-# NOTE: GTK3 is intentional. This bar stays resident at all times, so we
-# prefer the lower memory/CPU overhead of GTK3 over GTK4. Do not migrate
-# to gtk4 / gtk4-layer-shell without measuring resident RSS first.
+# NOTE: GTK4 is configured with `GSK_RENDERER=cairo` at startup so the bar
+# uses the lightweight Cairo software renderer instead of spinning up a
+# Vulkan/GL context and shader cache, keeping resident RSS minimal (~22 MB).
 
 [[bin]]
 name = "niri-bar"
 path = "src/main.rs"
 
 [dependencies]
-gtk = { version = "0.18", features = ["v3_24"] }
-gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
-gdk = "0.18"
-gdk-pixbuf = "0.18"
-cairo-rs = { version = "0.18", features = ["png"] }
-gio = "0.18"
-glib = "0.18"
+gtk = { package = "gtk4", version = "0.11" }
+gtk4-layer-shell = "0.8"
+gdk = { package = "gdk4", version = "0.11" }
+gdk-pixbuf = "0.22"
+cairo-rs = { version = "0.22", features = ["png"] }
+gio = "0.22"
+glib = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Only the reading half of `toml` is used (config parsing); disabling the
@@ -31,11 +31,10 @@ serde_json = "1.0"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 async-channel = "2.3"
 chrono = "0.4"
-libc = "0.2"
 zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"] }
 futures-util = "0.3"
 pulseaudio = "0.3"
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "process", "io-util", "sync"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "process", "io-util", "sync", "signal"] }
 
 [profile.release]
 opt-level = 3
@@ -52,7 +51,7 @@ license-file = ["LICENSE", "4"]
 extended-description = """\
 A fast, lightweight Wayland status bar and spatial window taskbar built \
 specifically for the Niri scrollable-tiling compositor."""
-depends = "$auto, libgtk-3-0, libgtk-layer-shell0"
+depends = "$auto, libgtk-4-1, libgtk4-layer-shell0"
 recommends = "pipewire-pulse | pulseaudio, bluez"
 section = "utils"
 priority = "optional"
@@ -76,8 +75,8 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/licenses/niri-bar/LICENSE", mode = "644" },
 ]
 auto-req = "yes"
-requires = { "gtk3" = "*", "gtk-layer-shell" = "*" }
-recommends = { "pipewire-pulse" = "*", "bluez" = "*" }
+requires = { "gtk4" = "*", "gtk4-layer-shell" = "*" }
+recommends = { "pipewire-pulseaudio" = "*", "bluez" = "*" }
 
 
 [lints.rust]

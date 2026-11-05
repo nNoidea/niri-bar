@@ -121,6 +121,7 @@ fn load_desktop_entries() -> HashMap<String, String> {
             }
         }
     }
+    map.shrink_to_fit();
     map
 }
 
@@ -197,6 +198,59 @@ pub(crate) fn resolve_icon_path_or_name(icon: &str) -> Option<String> {
     Some(icon.to_string())
 }
 
+/// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `pixmaps`) for a raster `.png` icon
+/// matching `name` so it can be decoded directly in-process via `libpng16` without
+/// initializing `GtkIconTheme` or `libglycin`.
+pub(crate) fn resolve_xdg_png_icon(name: &str) -> Option<PathBuf> {
+    let safe = crate::icon::sanitize_icon_name(name)?;
+    resolve_xdg_png_icon_in_dirs(&safe, &get_data_dirs())
+}
+
+pub(crate) fn resolve_xdg_png_icon_in_dirs(safe_name: &str, data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    const HICOLOR_SIZES: &[&str] = &[
+        "64x64", "48x48", "128x128", "32x32", "256x256", "512x512", "24x24", "22x22", "16x16",
+    ];
+    const CATEGORIES: &[&str] = &[
+        "apps",
+        "status",
+        "devices",
+        "places",
+        "mimetypes",
+        "categories",
+        "legacy",
+    ];
+    let filename = format!("{safe_name}.png");
+
+    for data_dir in data_dirs {
+        let icons_dir = data_dir.join("icons");
+        if icons_dir.is_dir() {
+            for theme in ["hicolor", "AdwaitaLegacy", "Adwaita"] {
+                let theme_dir = icons_dir.join(theme);
+                if !theme_dir.is_dir() {
+                    continue;
+                }
+                for sz in HICOLOR_SIZES {
+                    let sz_dir = theme_dir.join(sz);
+                    if !sz_dir.is_dir() {
+                        continue;
+                    }
+                    for cat in CATEGORIES {
+                        let candidate = sz_dir.join(cat).join(&filename);
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        let pixmap = data_dir.join("pixmaps").join(&filename);
+        if pixmap.is_file() {
+            return Some(pixmap);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +313,17 @@ Icon=list-add
         assert_eq!(icon, "firefox");
         assert_eq!(wm_class.as_deref(), Some("firefox-aurora"));
         assert_eq!(name.as_deref(), Some("Firefox Web Browser"));
+    }
+
+    #[test]
+    fn test_resolve_xdg_png_icon_in_dirs() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_png");
+        let apps_dir = dir.join("icons/hicolor/48x48/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let png_path = apps_dir.join("org.example.App.png");
+        crate::icon::tests_common::write_test_png(&png_path, 48, 48);
+
+        let found = resolve_xdg_png_icon_in_dirs("org.example.App", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(png_path));
     }
 }

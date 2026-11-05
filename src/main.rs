@@ -22,11 +22,12 @@ mod runtime;
 mod style;
 mod util;
 
-use gio::prelude::*;
 use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use glib::prelude::*;
 
 use crate::bar::BarWindow;
 use crate::config::load_config_with_error;
@@ -116,60 +117,46 @@ fn run_check_cli() -> bool {
 /// duplicate fullscreen drag overlays, and split press/release event
 /// delivery between two independent drag states (ghost on the wrong
 /// monitor, stuck drags). No bus available (tests/headless) allows startup.
-static SINGLE_INSTANCE_DBUS: std::sync::OnceLock<gio::DBusConnection> = std::sync::OnceLock::new();
+static SINGLE_INSTANCE_DBUS: std::sync::OnceLock<zbus::Connection> = std::sync::OnceLock::new();
 
 fn ensure_single_instance() -> bool {
     const NAME: &str = "org.nnoidea.niri-bar";
 
-    // D-Bus RequestName Input Flags (bitmask):
-    // 0 = default (wait in queue if name is already owned)
-    // 1 = DBUS_NAME_FLAG_ALLOW_REPLACEMENT (allow another process to steal this name)
-    // 2 = DBUS_NAME_FLAG_REPLACE_EXISTING  (attempt to steal name from existing owner)
-    // 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE      (fail immediately if already taken, do not wait)
-    const DBUS_NAME_FLAG_DO_NOT_QUEUE: u32 = 4;
-
-    // D-Bus RequestName Return Reply Codes:
-    // 1 = DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER (granted: we are the primary owner)
-    // 2 = DBUS_REQUEST_NAME_REPLY_IN_QUEUE      (queued: someone owns it, we are waiting)
-    // 3 = DBUS_REQUEST_NAME_REPLY_EXISTS        (rejected: someone owns it, DO_NOT_QUEUE set)
-    // 4 = DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER (already owned by this connection)
-    const DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER: u32 = 1;
-
-    let dbus = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
-        Ok(c) => c,
-        Err(_) => return true,
-    };
-    let reply = dbus.call_sync(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-        "RequestName",
-        Some(&(NAME, DBUS_NAME_FLAG_DO_NOT_QUEUE).to_variant()),
-        None,
-        gio::DBusCallFlags::NONE,
-        5000,
-        gio::Cancellable::NONE,
-    );
-    match reply {
-        Ok(v) => {
-            let is_owner = v.child_value(0).get::<u32>() == Some(DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
-            if is_owner {
-                // Keep the connection alive for the entire process lifetime so D-Bus
-                // does not release the name when this function returns.
-                let _ = SINGLE_INSTANCE_DBUS.set(dbus);
-                true
-            } else {
-                log_error!(
-                    "startup",
-                    "Another niri-bar instance already owns the session bus name; exiting to avoid duplicate bars and competing drag overlays."
-                );
-                eprintln!(
-                    "\x1b[1;31merror:\x1b[0m Another niri-bar instance is already running (owns org.nnoidea.niri-bar). Refusing to start a second one."
-                );
-                false
+    let (tx, rx) = async_channel::bounded(1);
+    crate::runtime::spawn(async move {
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let conn = zbus::connection::Builder::session().build().await?;
+            match conn
+                .request_name_with_flags(NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
+                .await
+            {
+                Ok(_) => Ok(Some(conn)),
+                Err(zbus::Error::NameTaken) => Ok(None),
+                Err(e) => Err(e),
             }
+        })
+        .await;
+        let _ = tx.send(res).await;
+    });
+
+    match rx.recv_blocking() {
+        Ok(Ok(Ok(Some(conn)))) => {
+            // Keep the connection alive for the entire process lifetime so D-Bus
+            // does not release the name when this function returns.
+            let _ = SINGLE_INSTANCE_DBUS.set(conn);
+            true
         }
-        Err(_) => true,
+        Ok(Ok(Ok(None))) => {
+            log_error!(
+                "startup",
+                "Another niri-bar instance already owns the session bus name; exiting to avoid duplicate bars and competing drag overlays."
+            );
+            eprintln!(
+                "\x1b[1;31merror:\x1b[0m Another niri-bar instance is already running (owns org.nnoidea.niri-bar). Refusing to start a second one."
+            );
+            false
+        }
+        _ => true,
     }
 }
 
@@ -218,6 +205,7 @@ fn main() {
         // disgusting, but its for CLI compliance
         std::process::exit(code);
     }
+    crate::util::ensure_optimal_process_env(&argv);
 
     init_logger();
     if !ensure_single_instance() {
@@ -234,6 +222,7 @@ fn main() {
         std::env::var("NIRI_SOCKET").ok()
     );
 
+    crate::util::ensure_cairo_renderer();
     if gtk::init().is_err() {
         log_error!("startup", "Failed to initialize GTK.");
         eprintln!(
@@ -269,6 +258,8 @@ fn main() {
     // Kept alive for the process lifetime: dropping the monitor stops events.
     let mut _file_monitor = None;
 
+    let main_loop = glib::MainLoop::new(None, false);
+
     if let Some(display) = gdk::Display::default() {
         let ctx = ReconcileCtx {
             display: display.clone(),
@@ -294,22 +285,36 @@ fn main() {
         connect_monitor_and_sleep_signals(&display, &niri, &schedule_reconcile);
 
         // Clean Shutdown on SIGINT / SIGTERM (e.g. PC shutdown, logout, killall)
-        glib::unix_signal_add_local(libc::SIGINT, || {
-            log_info!(
-                "lifecycle",
-                "Received SIGINT (Ctrl+C). Shutting down niri-bar cleanly..."
-            );
-            gtk::main_quit();
-            glib::ControlFlow::Break
+        let (sig_tx, sig_rx) = async_channel::bounded::<&'static str>(1);
+        crate::runtime::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint = signal(SignalKind::interrupt()).ok();
+            let mut sigterm = signal(SignalKind::terminate()).ok();
+            tokio::select! {
+                _ = async {
+                    match sigint.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let _ = sig_tx.send("SIGINT (Ctrl+C)").await;
+                }
+                _ = async {
+                    match sigterm.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let _ = sig_tx.send("SIGTERM (System shutdown / logout)").await;
+                }
+            }
         });
-
-        glib::unix_signal_add_local(libc::SIGTERM, || {
-            log_info!(
-                "lifecycle",
-                "Received SIGTERM (System shutdown / logout). Shutting down niri-bar cleanly..."
-            );
-            gtk::main_quit();
-            glib::ControlFlow::Break
+        let loop_quit = main_loop.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(sig_name) = sig_rx.recv().await {
+                log_info!("lifecycle", "Received {sig_name}. Shutting down niri-bar cleanly...");
+                loop_quit.quit();
+            }
         });
 
         // Subscribe to Niri updates
@@ -349,7 +354,7 @@ fn main() {
         });
     }
 
-    gtk::main();
+    main_loop.run();
 
     log_info!(
         "lifecycle",
@@ -391,11 +396,83 @@ mod tests {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            match conn.request_name("org.nnoidea.niri-bar").await {
+            match conn
+                .request_name_with_flags("org.nnoidea.niri-bar", zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
+                .await
+            {
                 // We own it, or a live bar does: either way refusal must trigger.
-                Ok(()) | Err(zbus::Error::NameTaken) => assert!(!ensure_single_instance()),
+                Ok(_) | Err(zbus::Error::NameTaken) => assert!(!ensure_single_instance()),
                 Err(_) => (),
             }
         });
+    }
+
+    #[test]
+    fn test_packaging_and_docs_require_gtk4() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        for spec_name in ["niri-bar.spec", "niri-bar-dev.spec"] {
+            let spec_path = root.join(spec_name);
+            let content =
+                std::fs::read_to_string(&spec_path).unwrap_or_else(|e| panic!("Failed to read {spec_name}: {e}"));
+            assert!(
+                content.contains("pkgconfig(gtk4)") && content.contains("pkgconfig(gtk4-layer-shell-0)"),
+                "{spec_name} must build-require pkgconfig(gtk4) and pkgconfig(gtk4-layer-shell-0)"
+            );
+            assert!(
+                content.contains("Requires:       gtk4") && content.contains("Requires:       gtk4-layer-shell"),
+                "{spec_name} must require gtk4 and gtk4-layer-shell"
+            );
+            assert!(
+                !content.contains("gtk3") && !content.contains("gtk+-3.0"),
+                "{spec_name} must not contain references to gtk3"
+            );
+            assert!(
+                !content.contains("pipewire-utils"),
+                "{spec_name} must not recommend obsolete pipewire-utils"
+            );
+            assert!(
+                content.contains("pipewire-pulseaudio"),
+                "{spec_name} must recommend native pipewire-pulseaudio"
+            );
+        }
+
+        let boxtest_path = root.join("scripts/boxtest.sh");
+        let boxtest = std::fs::read_to_string(&boxtest_path).expect("Failed to read scripts/boxtest.sh");
+        assert!(
+            boxtest.contains("libgtk-4-dev libgtk4-layer-shell-dev"),
+            "scripts/boxtest.sh must install GTK4 packages"
+        );
+        assert!(
+            !boxtest.contains("libgtk-3-dev"),
+            "scripts/boxtest.sh must not install libgtk-3-dev"
+        );
+        assert!(
+            !boxtest.contains("ubuntu:24.04"),
+            "scripts/boxtest.sh must not use ubuntu:24.04 as it lacks libgtk4-layer-shell-dev"
+        );
+        assert!(
+            boxtest.contains("ubuntu:latest") || boxtest.contains("ubuntu:26.04"),
+            "scripts/boxtest.sh must target an Ubuntu image that packages GTK4 layer shell"
+        );
+        assert!(
+            !boxtest.contains("sudo -E"),
+            "scripts/boxtest.sh must not use 'sudo -E' for rustup as modern sudo ignores -E and drops CARGO_HOME"
+        );
+        assert!(
+            boxtest.contains("sudo mkdir -p /usr/local/cargo /usr/local/rustup"),
+            "scripts/boxtest.sh must pre-create /usr/local/cargo and /usr/local/rustup"
+        );
+
+        let readme_path = root.join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).expect("Failed to read README.md");
+        assert!(
+            !readme.contains("gtk3") && !readme.contains("GTK3"),
+            "README.md must not reference GTK3"
+        );
+        assert!(
+            readme.contains("gtk4") && readme.contains("gtk4-layer-shell"),
+            "README.md must list gtk4 and gtk4-layer-shell in requirements"
+        );
     }
 }

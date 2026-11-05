@@ -27,6 +27,83 @@ pub fn nudge(tx: &async_channel::Sender<()>) {
     let _ = tx.try_send(());
 }
 
+/// Default GTK4 to its lightweight Cairo software renderer (`GSK_RENDERER=cairo`)
+/// and disable the AT-SPI accessibility D-Bus tree (`GTK_A11Y=none`) unless the
+/// user explicitly set those variables in their environment.
+///
+/// Must be called before `gtk::init()` so GTK4 does not initialize a Vulkan/GL
+/// context, shader cache, or AT-SPI D-Bus bridge, keeping resident memory minimal.
+pub fn ensure_cairo_renderer() {
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        std::env::set_var("GSK_RENDERER", "cairo");
+    }
+    if std::env::var_os("GTK_A11Y").is_none() {
+        std::env::set_var("GTK_A11Y", "none");
+    }
+}
+
+/// Ensure glibc's allocator (`MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_=65536`)
+/// and GTK4 environment (`GSK_RENDERER=cairo`, `GTK_A11Y=none`) are active from
+/// process startup (`__libc_start_main`) by performing a one-shot self-exec if
+/// `NIRI_BAR_ENV_TUNED` is not yet set.
+pub fn ensure_optimal_process_env(argv: &[String]) {
+    ensure_cairo_renderer();
+    if std::env::var_os("NIRI_BAR_ENV_TUNED").is_none() && std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        std::env::set_var("MALLOC_ARENA_MAX", "2");
+        if std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none() {
+            std::env::set_var("MALLOC_TRIM_THRESHOLD_", "65536");
+        }
+        std::env::set_var("NIRI_BAR_ENV_TUNED", "1");
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::unix::process::CommandExt;
+            let args = if argv.len() > 1 { &argv[1..] } else { &[] };
+            let _ = std::process::Command::new(exe).args(args).exec();
+        }
+    }
+}
+
+/// Collect the direct child widgets of `parent` in order (`first_child` .. `next_sibling`).
+pub fn widget_children(parent: &impl gtk::prelude::WidgetExt) -> Vec<gtk::Widget> {
+    use gtk::prelude::*;
+    let mut out = Vec::new();
+    let mut child_opt = parent.first_child();
+    while let Some(c) = child_opt {
+        child_opt = c.next_sibling();
+        out.push(c);
+    }
+    out
+}
+
+/// Move `child` to zero-based index `target_idx` inside `container`.
+pub fn reorder_box_child(container: &gtk::Box, child: &impl gtk::prelude::IsA<gtk::Widget>, target_idx: usize) {
+    use gtk::prelude::*;
+    let children = widget_children(container);
+    let child_ref: &gtk::Widget = child.as_ref();
+    let cur_idx = children.iter().position(|c| c == child_ref);
+    if cur_idx == Some(target_idx) {
+        return;
+    }
+    if target_idx == 0 {
+        container.reorder_child_after(child, Option::<&gtk::Widget>::None);
+    } else {
+        let others: Vec<&gtk::Widget> = children.iter().filter(|c| *c != child_ref).collect();
+        let prev = others
+            .get(target_idx.saturating_sub(1))
+            .copied()
+            .or_else(|| others.last().copied());
+        container.reorder_child_after(child, prev);
+    }
+}
+
+/// Translate widget-local `(x, y)` coordinates into the widget's toplevel (`root`) surface space.
+pub fn widget_to_toplevel_coords(widget: &impl gtk::prelude::WidgetExt, x: f64, y: f64) -> (f64, f64) {
+    if let Some(root) = widget.root() {
+        widget.translate_coordinates(&root, x, y).unwrap_or((x, y))
+    } else {
+        (x, y)
+    }
+}
+
 #[cfg(test)]
 type GtkTestJob = (
     Box<dyn FnOnce() + Send + 'static>,
@@ -35,7 +112,7 @@ type GtkTestJob = (
 
 /// Execute a test closure on a dedicated, persistent GTK main thread.
 ///
-/// Rust's test harness spawns a fresh OS thread per `#[test]`, whereas GTK3
+/// Rust's test harness spawns a fresh OS thread per `#[test]`, whereas GTK4
 /// permanently binds its main thread to whichever OS thread called `gtk::init()`
 /// first. Running all GTK widget tests on this single persistent thread ensures
 /// every GTK test actually executes (zero skipped tests) and is safe under
@@ -56,6 +133,7 @@ where
         std::thread::Builder::new()
             .name("gtk-test-main".to_string())
             .spawn(move || {
+                ensure_cairo_renderer();
                 if let Err(err) = gtk::init() {
                     let _ = init_tx.send(Err(format!("Failed to initialize GTK for tests: {err}")));
                     return;
@@ -66,10 +144,11 @@ where
                 }
                 let _ = init_tx.send(Ok(()));
 
+                let main_ctx = glib::MainContext::default();
                 while let Ok((job, reply_tx)) = rx.recv() {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                    while gtk::events_pending() {
-                        gtk::main_iteration_do(false);
+                    while main_ctx.pending() {
+                        main_ctx.iteration(false);
                     }
                     let _ = reply_tx.send(result);
                 }
@@ -99,6 +178,47 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_ensure_cairo_renderer_defaults_to_cairo() {
+        ensure_cairo_renderer();
+        let val = std::env::var("GSK_RENDERER").unwrap_or_default();
+        assert!(!val.is_empty());
+    }
+
+    #[test]
+    fn test_widget_children_and_reorder_box_child() {
+        run_gtk_test(|| {
+            use gtk::prelude::*;
+            let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let b1 = gtk::Button::new();
+            let b2 = gtk::Button::new();
+            let b3 = gtk::Button::new();
+            b.append(&b1);
+            b.append(&b2);
+            b.append(&b3);
+
+            let children = widget_children(&b);
+            assert_eq!(children.len(), 3);
+            assert_eq!(&children[0], b1.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[1], b2.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[2], b3.upcast_ref::<gtk::Widget>());
+
+            // Move b3 to index 0
+            reorder_box_child(&b, &b3, 0);
+            let children = widget_children(&b);
+            assert_eq!(&children[0], b3.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[1], b1.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[2], b2.upcast_ref::<gtk::Widget>());
+
+            // Move b3 to index 1
+            reorder_box_child(&b, &b3, 1);
+            let children = widget_children(&b);
+            assert_eq!(&children[0], b1.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[1], b3.upcast_ref::<gtk::Widget>());
+            assert_eq!(&children[2], b2.upcast_ref::<gtk::Widget>());
+        });
+    }
+
+    #[test]
     fn test_lock_recovers_from_poison() {
         let m = Arc::new(Mutex::new(41u32));
         let m2 = Arc::clone(&m);
@@ -121,6 +241,15 @@ mod tests {
         // Closed receiver: nudge must stay silent, never panic.
         rx.close();
         nudge(&tx);
+    }
+
+    #[test]
+    fn test_ensure_cairo_renderer_sets_defaults() {
+        std::env::remove_var("GSK_RENDERER");
+        std::env::remove_var("GTK_A11Y");
+        ensure_cairo_renderer();
+        assert_eq!(std::env::var("GSK_RENDERER").as_deref(), Ok("cairo"));
+        assert_eq!(std::env::var("GTK_A11Y").as_deref(), Ok("none"));
     }
 
     #[test]

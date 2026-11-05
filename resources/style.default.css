@@ -5,7 +5,6 @@
     border-radius: 0;
     box-shadow: none;
     text-shadow: none;
-    -gtk-icon-shadow: none;
     background-image: none;
     font-family: "JetBrainsMono Nerd Font", "AdwaitaMono Nerd Font", monospace;
     font-size: 13px;
@@ -19,10 +18,8 @@ label:backdrop {
     padding: 0;
 }
 
-window,
-window.background,
 window.niri-bar,
-window:backdrop,
+window.niri-bar.background,
 window.niri-bar:backdrop,
 .niri-bar,
 .modules-box {
@@ -30,15 +27,36 @@ window.niri-bar:backdrop,
     color: #cdd6f4;
 }
 
+window.drag-overlay,
+window.drag-overlay.background,
+window.drag-overlay:backdrop {
+    background-color: transparent;
+    background: none;
+    box-shadow: none;
+    border: none;
+}
+
 /* Module and Taskbar button reset */
 button,
 button:backdrop,
+button:focus,
+button:focus-visible,
+button:active,
+button:checked,
+button.flat,
+button.flat:backdrop,
+button.flat:focus,
+button.flat:active,
+button.flat:checked,
 button.module-item,
 button.module-item:backdrop,
 button.app-button,
 button.app-button:backdrop,
 button.tray-item,
 button.tray-item:backdrop,
+button.tray-item:focus,
+button.tray-item:active,
+button.tray-item:checked,
 .module-item button,
 .taskbar button,
 .tray button {
@@ -49,7 +67,7 @@ button.tray-item:backdrop,
     border-radius: 8px;
     box-shadow: none;
     text-shadow: none;
-    -gtk-icon-shadow: none;
+    outline: none;
 }
 
 /* Hover effect for interactive elements */
@@ -239,8 +257,8 @@ window.niri-bar.horizontal button.module-spacer {
 }
 
 /* System Tray Popup Menu Dark Mode Styling */
-menu,
-menu.background,
+popover.tray-menu > contents,
+popover.tray-menu contents,
 .tray-menu {
     background-color: #313244;
     color: #cdd6f4;
@@ -250,8 +268,17 @@ menu.background,
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
 }
 
-menuitem,
-menuitem.menuitem,
+popover.tray-menu,
+popover.tray-menu.background,
+popover.tray-menu:backdrop {
+    background: transparent;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0;
+}
+
 .tray-menu-item {
     background-color: transparent;
     color: #cdd6f4;
@@ -263,7 +290,6 @@ menuitem.menuitem,
     transition: background 0.1s ease-in-out;
 }
 
-menuitem label,
 .tray-menu-item label {
     color: #cdd6f4;
     font-size: 11px;
@@ -271,24 +297,18 @@ menuitem label,
     padding: 0;
 }
 
-menuitem:hover,
-menuitem:selected,
 .tray-menu-item:hover,
 .tray-menu-item:selected {
     background-color: #45475a;
     color: #89b4fa;
 }
 
-menuitem:hover label,
-menuitem:selected label,
 .tray-menu-item:hover label,
 .tray-menu-item:selected label {
     color: #ffffff;
     font-weight: 500;
 }
 
-menuitem:disabled,
-menuitem:disabled label,
 .tray-menu-item:disabled,
 .tray-menu-item:disabled label {
     color: #585b70;
@@ -296,7 +316,6 @@ menuitem:disabled label,
 
 separator,
 separator.horizontal,
-menu separator,
 .tray-menu-separator {
     background-color: #45475a;
     min-height: 1px;
@@ -304,8 +323,7 @@ menu separator,
     padding: 0;
 }
 
-checkmenuitem check,
-radiomenuitem radio {
+checkbutton.tray-menu-check check {
     min-width: 10px;
     min-height: 10px;
     border: 1px solid #585b70;
@@ -316,22 +334,10 @@ radiomenuitem radio {
     padding: 0;
 }
 
-checkmenuitem check:checked,
-radiomenuitem radio:checked {
+checkbutton.tray-menu-check check:checked {
     background-color: #89b4fa;
     border-color: #89b4fa;
     color: #1e1e2e;
-}
-
-arrow {
-    color: #cdd6f4;
-    min-width: 8px;
-    min-height: 8px;
-}
-
-menuitem:hover arrow,
-menuitem:selected arrow {
-    color: #ffffff;
 }
 
 @keyframes blink {

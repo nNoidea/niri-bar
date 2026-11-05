@@ -330,6 +330,21 @@ impl NiriService {
             stop_notify,
         }
     }
+
+    #[cfg(test)]
+    pub fn new_mock() -> Self {
+        let (update_tx, update_rx) = async_channel::unbounded::<()>();
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let running = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
+        Self {
+            state,
+            update_tx,
+            update_rx,
+            running,
+            stop_notify,
+        }
+    }
 }
 
 /// Tolerances for monitor↔output matching. GDK and Niri disagree by a few
@@ -474,7 +489,9 @@ pub fn detect_monitor_output(monitor: &gdk::Monitor, outputs: &HashMap<String, O
         h_mm: monitor.height_mm(),
     };
     let single = if outputs.len() == 1 {
-        gdk::Display::default().map(|d| d.n_monitors() == 1).unwrap_or(false)
+        gdk::Display::default()
+            .map(|d| crate::monitor::display_monitors(&d).len() == 1)
+            .unwrap_or(false)
     } else {
         false
     };

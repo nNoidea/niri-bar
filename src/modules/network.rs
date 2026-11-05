@@ -1,10 +1,14 @@
 use gtk::Orientation;
 use std::fs;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{resolve_mode, NetworkConfig};
-use crate::modules::{dbus_get_variant, BarModule, DbusSubscriptions, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{
+    dbus_get_property, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState,
+    ScrollDirection,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkType {
@@ -21,63 +25,76 @@ pub struct NetworkModule {
     core: ModuleCore,
 }
 
-/// Extract a string from a `Properties.Get` reply (unwraps the outer variant).
-fn variant_to_string(v: &glib::Variant) -> Option<String> {
-    if let Some(s) = v.str() {
-        return Some(s.to_string());
+/// Extract a string or object path from a `Properties.Get` reply variant.
+pub(crate) fn variant_to_string(v: &zbus::OwnedVariant) -> Option<String> {
+    fn inner_str(val: &zbus::Variant<'_>) -> Option<String> {
+        match val {
+            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
+            zbus::Variant::ObjectPath(p) => Some(p.as_str().to_string()),
+            zbus::Variant::Variant(inner) => inner_str(inner),
+            _ => None,
+        }
     }
-    // Object paths (`ao`/`o`) don't expose `.str()` on all gio versions;
-    // fall back to the printed form (e.g. "/org/freedesktop/...").
-    let printed = format!("{}", v.print(true));
-    let trimmed = printed.trim().trim_matches('\'').to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    inner_str(v.deref()).filter(|s| !s.is_empty())
 }
 
-fn get_dbus_property_string(
-    conn: &gio::DBusConnection,
+pub(crate) fn variant_to_objpath_list(v: &zbus::OwnedVariant) -> Option<Vec<String>> {
+    fn inner_arr(val: &zbus::Variant<'_>) -> Option<Vec<String>> {
+        match val {
+            zbus::Variant::Array(arr) => {
+                let mut list = Vec::new();
+                for item in arr.iter() {
+                    let s = match item {
+                        zbus::Variant::ObjectPath(p) => Some(p.as_str()),
+                        zbus::Variant::Str(st) => Some(st.as_str()),
+                        _ => None,
+                    };
+                    if let Some(s) = s {
+                        // Skip the null path "/" used by NM for "no primary connection".
+                        if s != "/" && !s.is_empty() {
+                            list.push(s.to_string());
+                        }
+                    }
+                }
+                Some(list)
+            }
+            zbus::Variant::Variant(inner) => inner_arr(inner),
+            _ => None,
+        }
+    }
+    inner_arr(v.deref())
+}
+
+async fn get_dbus_property_string(
+    conn: &zbus::Connection,
     dest: &str,
     path: &str,
     interface: &str,
     prop: &str,
 ) -> Option<String> {
-    let inner = dbus_get_variant(conn, dest, path, interface, prop)?;
+    let inner = dbus_get_property(conn, dest, path, interface, prop).await?;
     variant_to_string(&inner)
 }
 
-fn get_dbus_property_objpath(
-    conn: &gio::DBusConnection,
+async fn get_dbus_property_objpath(
+    conn: &zbus::Connection,
     dest: &str,
     path: &str,
     interface: &str,
     prop: &str,
 ) -> Option<String> {
-    // Object paths use the same wire container as strings here; share helper.
-    get_dbus_property_string(conn, dest, path, interface, prop)
+    get_dbus_property_string(conn, dest, path, interface, prop).await
 }
 
-fn get_dbus_property_objpath_list(
-    conn: &gio::DBusConnection,
+async fn get_dbus_property_objpath_list(
+    conn: &zbus::Connection,
     dest: &str,
     path: &str,
     interface: &str,
     prop: &str,
 ) -> Option<Vec<String>> {
-    let inner = dbus_get_variant(conn, dest, path, interface, prop)?;
-    let mut list = Vec::new();
-    for i in 0..inner.n_children() {
-        let item = inner.child_value(i);
-        if let Some(s) = variant_to_string(&item) {
-            // Skip the null path "/" used by NM for "no primary connection".
-            if s != "/" && !s.is_empty() {
-                list.push(s);
-            }
-        }
-    }
-    Some(list)
+    let inner = dbus_get_property(conn, dest, path, interface, prop).await?;
+    variant_to_objpath_list(&inner)
 }
 
 /// Virtual / container interfaces that must never count as physical Ethernet.
@@ -99,9 +116,9 @@ impl NetworkModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
-        // Single read at construction so `current_state` has real data immediately;
-        // afterwards the worker owns freshness and `current_state` is lock-only.
-        let (initial, initial_healthy) = Self::read_network_state_full();
+        // Fast non-blocking sysfs/procfs seed at construction so `current_state`
+        // has real data immediately without blocking startup on NM D-Bus I/O.
+        let (initial, _) = Self::read_network_state_sysfs();
         let last: Arc<Mutex<(NetworkType, Option<String>)>> = Arc::new(Mutex::new(initial.clone()));
         let last_worker = Arc::clone(&last);
 
@@ -114,18 +131,24 @@ impl NetworkModule {
                 return;
             }
             let mut last_cached = initial;
-            let mut fail_streak: u32 = u32::from(!initial_healthy);
+            let mut fail_streak: u32 = 0;
             let mut degraded_warned = false;
             let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
             let mut last_renew = std::time::Instant::now();
+            let mut first_pass = true;
 
             loop {
-                let wait = crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
-                if core_worker.wait_timeout_async(wait).await {
-                    break;
+                if first_pass {
+                    first_pass = false;
+                } else {
+                    let wait =
+                        crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
+                    if core_worker.wait_timeout_async(wait).await {
+                        break;
+                    }
                 }
 
-                let ((net_type, ssid), healthy) = NetworkModule::read_network_state_full();
+                let ((net_type, ssid), healthy) = NetworkModule::read_network_state_full().await;
 
                 if healthy {
                     if fail_streak > 0 {
@@ -163,35 +186,21 @@ impl NetworkModule {
 
     /// Subscribe to NetworkManager signals. Worker-owned: renewed periodically
     /// and unsubscribed automatically when `DbusSubscriptions` is dropped.
-    fn subscribe_triggers(core: &ModuleCore) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
-        let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
-        let mut ids = Vec::new();
-        let core_nm = core.clone();
-        ids.push(conn.signal_subscribe(
-            Some("org.freedesktop.NetworkManager"),
-            Some("org.freedesktop.DBus.Properties"),
-            Some("PropertiesChanged"),
-            None,
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, _params| {
-                core_nm.notify();
-            },
-        ));
-
-        let core_ac = core.clone();
-        ids.push(conn.signal_subscribe(
-            Some("org.freedesktop.NetworkManager"),
-            Some("org.freedesktop.NetworkManager.Connection.Active"),
-            Some("StateChanged"),
-            None,
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, _params| {
-                core_ac.notify();
-            },
-        ));
-        Some((conn, ids))
+    fn subscribe_triggers(core: &ModuleCore) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![
+            spawn_dbus_trigger(
+                core,
+                "org.freedesktop.NetworkManager",
+                "org.freedesktop.DBus.Properties",
+                Some("PropertiesChanged"),
+            ),
+            spawn_dbus_trigger(
+                core,
+                "org.freedesktop.NetworkManager",
+                "org.freedesktop.NetworkManager.Connection.Active",
+                Some("StateChanged"),
+            ),
+        ]
     }
 
     pub fn parse_nm_connection_type_and_id(conn_type: &str, id: &str) -> (NetworkType, Option<String>) {
@@ -204,8 +213,8 @@ impl NetworkModule {
         }
     }
 
-    fn read_network_state_dbus() -> Option<(NetworkType, Option<String>)> {
-        let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
+    async fn read_network_state_dbus() -> Option<(NetworkType, Option<String>)> {
+        let conn = system_bus().await?;
 
         // 1. Check PrimaryConnection
         let primary_path = get_dbus_property_objpath(
@@ -214,7 +223,8 @@ impl NetworkModule {
             "/org/freedesktop/NetworkManager",
             "org.freedesktop.NetworkManager",
             "PrimaryConnection",
-        );
+        )
+        .await;
 
         let mut candidate_paths = Vec::new();
         if let Some(ref path) = primary_path {
@@ -231,29 +241,32 @@ impl NetworkModule {
                 "/org/freedesktop/NetworkManager",
                 "org.freedesktop.NetworkManager",
                 "ActiveConnections",
-            ) {
+            )
+            .await
+            {
                 candidate_paths.extend(active_list);
             }
         }
 
         for path in candidate_paths {
-            let conn_type = get_dbus_property_string(
-                &conn,
-                "org.freedesktop.NetworkManager",
-                &path,
-                "org.freedesktop.NetworkManager.Connection.Active",
-                "Type",
-            )
-            .unwrap_or_default();
-
-            let id = get_dbus_property_string(
-                &conn,
-                "org.freedesktop.NetworkManager",
-                &path,
-                "org.freedesktop.NetworkManager.Connection.Active",
-                "Id",
-            )
-            .unwrap_or_default();
+            let (conn_type, id) = tokio::join!(
+                get_dbus_property_string(
+                    &conn,
+                    "org.freedesktop.NetworkManager",
+                    &path,
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "Type",
+                ),
+                get_dbus_property_string(
+                    &conn,
+                    "org.freedesktop.NetworkManager",
+                    &path,
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "Id",
+                ),
+            );
+            let conn_type = conn_type.unwrap_or_default();
+            let id = id.unwrap_or_default();
 
             let (ntype, ssid) = Self::parse_nm_connection_type_and_id(&conn_type, &id);
             if ntype != NetworkType::Disconnected {
@@ -311,11 +324,15 @@ impl NetworkModule {
     /// any `/sys`/`/proc` source is readable — a legitimately offline machine
     /// (cable pulled, NM fine, files fine) stays healthy so cable events
     /// keep their 3s responsiveness. Only "everything unreadable" backs off.
-    fn read_network_state_full() -> ((NetworkType, Option<String>), bool) {
-        if let Some(state) = Self::read_network_state_dbus() {
+    async fn read_network_state_full() -> ((NetworkType, Option<String>), bool) {
+        if let Some(state) = Self::read_network_state_dbus().await {
             return (state, true);
         }
 
+        Self::read_network_state_sysfs()
+    }
+
+    fn read_network_state_sysfs() -> ((NetworkType, Option<String>), bool) {
         // D-Bus path failed; sysfs fallbacks below are first-class.
         let sys_readable = fs::read_dir("/sys/class/net").is_ok()
             || fs::read_to_string("/proc/net/route").is_ok()
@@ -520,5 +537,30 @@ mod tests {
         // Route not UP (flags & 0x1 == 0) ignored even with lower metric
         NetworkModule::update_best_route(&mut best, "eth2", 0x2, 10);
         assert_eq!(best, Some(("wlan0".to_string(), 50)));
+    }
+
+    #[test]
+    fn test_extract_zbus_variant_strings_and_paths() {
+        let str_v = zbus::OwnedVariant::try_from(zbus::Variant::from("MyWiFi")).unwrap();
+        assert_eq!(variant_to_string(&str_v).as_deref(), Some("MyWiFi"));
+
+        let path_v = zbus::OwnedVariant::try_from(zbus::Variant::from(
+            zbus::ObjectPath::try_from("/org/freedesktop/NetworkManager/ActiveConnection/1").unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            variant_to_string(&path_v).as_deref(),
+            Some("/org/freedesktop/NetworkManager/ActiveConnection/1")
+        );
+
+        let paths_arr = zbus::OwnedVariant::try_from(zbus::Variant::from(vec![
+            zbus::ObjectPath::try_from("/").unwrap(),
+            zbus::ObjectPath::try_from("/org/freedesktop/NetworkManager/ActiveConnection/2").unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            variant_to_objpath_list(&paths_arr),
+            Some(vec!["/org/freedesktop/NetworkManager/ActiveConnection/2".to_string()])
+        );
     }
 }
