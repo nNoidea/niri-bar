@@ -7,6 +7,9 @@ build:
 
 install:
 	cargo install --path . --locked
+	-pkill -x niri-bar 2>/dev/null || true
+	@sleep 0.15
+	-niri msg action spawn -- niri-bar 2>/dev/null || true
 
 uninstall:
 	cargo uninstall niri-bar

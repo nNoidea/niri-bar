@@ -52,8 +52,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev pkg-config xvfb
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt || true
+          fi
+          sudo apt-get update -o Acquire::http::Timeout="15" -o Acquire::Retries="3"
+          sudo apt-get install -y -o Acquire::http::Timeout="20" -o Acquire::Retries="3" \
+            libgtk-4-dev libgtk4-layer-shell-dev pkg-config xvfb
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -81,8 +86,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev pkg-config rpm
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt || true
+          fi
+          sudo apt-get update -o Acquire::http::Timeout="15" -o Acquire::Retries="3"
+          sudo apt-get install -y -o Acquire::http::Timeout="20" -o Acquire::Retries="3" \
+            libgtk-4-dev libgtk4-layer-shell-dev pkg-config rpm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

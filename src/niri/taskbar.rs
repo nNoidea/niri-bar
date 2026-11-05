@@ -506,6 +506,7 @@ impl TaskbarWidget {
                         widget.button.remove_css_class("is-dragging");
                         widget.button.remove_css_class("drag-source-away");
                         widget.button.set_opacity(1.0);
+                        widget.button.set_cursor_from_name(Some("pointer"));
                     }
                 }
 
