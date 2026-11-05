@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{resolve_level, BatteryConfig};
-use crate::modules::{dbus_get_variant, BarModule, DbusSubscriptions, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{
+    dbus_get_property, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState,
+    ScrollDirection,
+};
 
 const UPOWER_DEST: &str = "org.freedesktop.UPower";
 const UPOWER_DISPLAY_DEV: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
@@ -23,9 +26,9 @@ impl BatteryModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
-        // Single read at construction so `current_state` has real data immediately;
-        // afterwards the worker owns freshness and `current_state` is lock-only.
-        let (initial, initial_healthy) = Self::read_battery_full();
+        // Fast non-blocking sysfs seed at construction so `current_state` has
+        // real data immediately without blocking startup on UPower D-Bus I/O.
+        let (initial, _) = Self::read_battery_sysfs();
         let last: Arc<Mutex<Option<(u8, String)>>> = Arc::new(Mutex::new(initial.clone()));
         let last_worker = Arc::clone(&last);
 
@@ -38,17 +41,23 @@ impl BatteryModule {
                 return;
             }
             let mut last_cached = initial;
-            let mut fail_streak: u32 = u32::from(!initial_healthy);
+            let mut fail_streak: u32 = 0;
             let mut degraded_warned = false;
             let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
             let mut last_renew = std::time::Instant::now();
+            let mut first_pass = true;
 
             loop {
-                let wait = crate::modules::poll_backoff(Duration::from_secs(10), fail_streak, Duration::from_secs(60));
-                if core_worker.wait_timeout_async(wait).await {
-                    break;
+                if first_pass {
+                    first_pass = false;
+                } else {
+                    let wait =
+                        crate::modules::poll_backoff(Duration::from_secs(10), fail_streak, Duration::from_secs(60));
+                    if core_worker.wait_timeout_async(wait).await {
+                        break;
+                    }
                 }
-                let (bat_opt, healthy) = Self::read_battery_full();
+                let (bat_opt, healthy) = Self::read_battery_full().await;
                 if healthy {
                     if fail_streak > 0 {
                         log_info!("battery", "Backend recovered");
@@ -91,21 +100,13 @@ impl BatteryModule {
 
     /// Subscribe to UPower signals. Worker-owned: renewed periodically and
     /// unsubscribed automatically when `DbusSubscriptions` is dropped.
-    fn subscribe_triggers(core: &ModuleCore) -> Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)> {
-        let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
-        let core_upower = core.clone();
-        let id = conn.signal_subscribe(
-            Some(UPOWER_DEST),
-            Some("org.freedesktop.DBus.Properties"),
+    fn subscribe_triggers(core: &ModuleCore) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![spawn_dbus_trigger(
+            core,
+            UPOWER_DEST,
+            "org.freedesktop.DBus.Properties",
             Some("PropertiesChanged"),
-            None,
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, _params| {
-                core_upower.notify();
-            },
-        );
-        Some((conn, vec![id]))
+        )]
     }
 
     pub fn parse_upower_state(state: u32) -> &'static str {
@@ -126,28 +127,25 @@ impl BatteryModule {
         is_present && (device_type == 2 || device_type == 3)
     }
 
-    fn read_battery_upower() -> Option<(u8, String)> {
-        let conn = match gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
-            Ok(c) => c,
-            Err(e) => {
-                log_debug!("battery", "System bus unavailable for UPower: {e}");
-                return None;
-            }
-        };
+    async fn read_battery_upower() -> Option<(u8, String)> {
+        let conn = system_bus().await?;
 
-        let is_present =
-            dbus_get_variant(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "IsPresent")?.get::<bool>()?;
-        let dev_type =
-            dbus_get_variant(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "Type")?.get::<u32>()?;
+        let (present_v, type_v, pct_v, state_v) = tokio::join!(
+            dbus_get_property(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "IsPresent"),
+            dbus_get_property(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "Type"),
+            dbus_get_property(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "Percentage"),
+            dbus_get_property(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "State"),
+        );
+
+        let is_present = bool::try_from(present_v?).ok()?;
+        let dev_type = u32::try_from(type_v?).ok()?;
 
         if !Self::is_valid_upower_battery(is_present, dev_type) {
             return None;
         }
 
-        let percentage = dbus_get_variant(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "Percentage")?
-            .get::<f64>()? as u8;
-        let state_u32 =
-            dbus_get_variant(&conn, UPOWER_DEST, UPOWER_DISPLAY_DEV, UPOWER_DEV_IFACE, "State")?.get::<u32>()?;
+        let percentage = f64::try_from(pct_v?).ok()? as u8;
+        let state_u32 = u32::try_from(state_v?).ok()?;
         let status = Self::parse_upower_state(state_u32).to_string();
 
         Some((percentage, status))
@@ -157,8 +155,8 @@ impl BatteryModule {
     /// present battery is readable via sysfs, or when no battery exists at
     /// all (desktops idle cheaply). Unhealthy only when a present battery is
     /// unreadable from every source.
-    fn read_battery_full() -> (Option<(u8, String)>, bool) {
-        if let Some(upower_bat) = Self::read_battery_upower() {
+    async fn read_battery_full() -> (Option<(u8, String)>, bool) {
+        if let Some(upower_bat) = Self::read_battery_upower().await {
             return (Some(upower_bat), true);
         }
 

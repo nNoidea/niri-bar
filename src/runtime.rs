@@ -31,7 +31,7 @@ pub fn handle() -> &'static Handle {
 }
 
 /// Spawns a future onto the shared Tokio runtime, even when called from outside
-/// a Tokio context (such as the GTK3 main thread or synchronous constructors).
+/// a Tokio context (such as the GTK4 main thread or synchronous constructors).
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,

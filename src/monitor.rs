@@ -1,5 +1,4 @@
-use gdk::prelude::MonitorExt;
-use glib::prelude::*;
+use gdk::prelude::*;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,6 +24,14 @@ pub struct ReconcileCtx {
     pub active_error: Rc<RefCell<ActiveError>>,
 }
 
+/// Enumerate all `gdk::Monitor` instances currently known to `display`.
+pub fn display_monitors(display: &gdk::Display) -> Vec<gdk::Monitor> {
+    let list = display.monitors();
+    (0..list.n_items())
+        .filter_map(|i| list.item(i).and_then(|obj| obj.downcast::<gdk::Monitor>().ok()))
+        .collect()
+}
+
 pub fn reconcile_monitors(
     display: &gdk::Display,
     bars: &Rc<RefCell<Vec<BarWindow>>>,
@@ -38,23 +45,22 @@ pub fn reconcile_monitors(
     // refetch without holding the state lock). Fetching synchronously would
     // stall the GTK main thread on Unix-socket round-trips per hotplug/wakeup.
     // 1. Discover all currently valid GDK monitors
-    let n_monitors = display.n_monitors();
+    let all_monitors = display_monitors(display);
+    let n_monitors = all_monitors.len();
     let mut current_monitors: Vec<gdk::Monitor> = Vec::new();
     let mut has_unready_monitors = false;
-    for i in 0..n_monitors {
-        if let Some(monitor) = display.monitor(i) {
-            if monitor.geometry().width() > 0 {
-                current_monitors.push(monitor);
-            } else {
-                has_unready_monitors = true;
-                log_warn!(
-                    "monitor",
-                    "Monitor {} has zero geometry (not yet configured by compositor), will retry [model: {:?}, manuf: {:?}]",
-                    i,
-                    monitor.model(),
-                    monitor.manufacturer()
-                );
-            }
+    for (i, monitor) in all_monitors.into_iter().enumerate() {
+        if monitor.geometry().width() > 0 {
+            current_monitors.push(monitor);
+        } else {
+            has_unready_monitors = true;
+            log_warn!(
+                "monitor",
+                "Monitor {} has zero geometry (not yet configured by compositor), will retry [model: {:?}, manuf: {:?}]",
+                i,
+                monitor.model(),
+                monitor.manufacturer()
+            );
         }
     }
 
@@ -229,83 +235,102 @@ pub fn connect_monitor_and_sleep_signals(
         Rc::new(move || niri.refresh_outputs_async())
     };
 
-    // System Sleep & Wakeup Listener (logind DBus)
-    if let Ok(conn) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
+    // System Sleep & Wakeup Listener (logind DBus via zbus)
+    {
+        let (wake_tx, wake_rx) = async_channel::unbounded::<bool>();
+        crate::runtime::spawn(async move {
+            use futures_util::StreamExt;
+            let Some(conn) = crate::modules::system_bus().await else {
+                return;
+            };
+            let Ok(rule) = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.login1")
+                .interface("org.freedesktop.login1.Manager")
+                .member("PrepareForSleep")
+                .path("/org/freedesktop/login1")
+                .build()
+            else {
+                return;
+            };
+            let Ok(mut stream) = zbus::MessageStream::for_match_rule(rule, &conn, None).await else {
+                return;
+            };
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Ok(entering_sleep) = msg.body().deserialize::<bool>() {
+                    if wake_tx.send(entering_sleep).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
         let sched_wake = Rc::clone(schedule_reconcile);
         let refresh_wake = Rc::clone(&refresh_niri_outputs);
-        conn.signal_subscribe(
-            Some("org.freedesktop.login1"),
-            Some("org.freedesktop.login1.Manager"),
-            Some("PrepareForSleep"),
-            Some("/org/freedesktop/login1"),
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |_conn, _sender, _path, _iface, _signal, params| {
-                if let Some(val) = params.child_value(0).get::<bool>() {
-                    if val {
-                        log_info!("power", "System is entering sleep / suspend...");
-                    } else {
-                        log_info!("power", "System resumed from sleep / wake up! Reconciling displays...");
-                        refresh_wake();
-                        sched_wake();
-                    }
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(entering_sleep) = wake_rx.recv().await {
+                if entering_sleep {
+                    log_info!("power", "System is entering sleep / suspend...");
+                } else {
+                    log_info!("power", "System resumed from sleep / wake up! Reconciling displays...");
+                    refresh_wake();
+                    sched_wake();
                 }
-            },
-        );
+            }
+        });
     }
 
-    // Monitor hotplug signals (idle debounced)
-    let sched_added = Rc::clone(schedule_reconcile);
-    let refresh_added = Rc::clone(&refresh_niri_outputs);
-    display.connect_monitor_added(move |_, monitor| {
-        log_info!("monitor", "Received GDK monitor_added signal");
-        refresh_added();
-        sched_added();
-
-        // GDK may fire monitor_added before the Wayland compositor has
-        // sent the monitor's geometry (width == 0). Subscribe to the
-        // GObject notify::geometry signal so we re-reconcile the instant
-        // the real geometry arrives — no polling or arbitrary delays.
-        // Disconnected after the first valid geometry to avoid handler
-        // accumulation on flapping monitors.
-        if monitor.geometry().width() == 0 {
+    // Monitor hotplug signals via GDK4's `display.monitors()` ListModel
+    let sched_hotplug = Rc::clone(schedule_reconcile);
+    let refresh_hotplug = Rc::clone(&refresh_niri_outputs);
+    display
+        .monitors()
+        .connect_items_changed(move |list, position, removed, added| {
             log_info!(
                 "monitor",
-                "New monitor has zero geometry, subscribing to notify::geometry"
+                "Received GDK monitors items_changed signal (pos={position}, removed={removed}, added={added})"
             );
-            let sched = Rc::clone(&sched_added);
-            let refresh = Rc::clone(&refresh_added);
-            let handler = std::rc::Rc::new(std::cell::Cell::new(None::<glib::SignalHandlerId>));
-            let handler_clone = Rc::clone(&handler);
-            let mon_weak = monitor.downgrade();
-            let id = monitor.connect_notify_local(Some("geometry"), move |mon, _| {
-                let geom = mon.geometry();
-                if geom.width() > 0 {
+            refresh_hotplug();
+            sched_hotplug();
+
+            // GDK may report a newly added monitor before the Wayland compositor has
+            // sent its geometry (width == 0). Subscribe to the GObject notify::geometry
+            // signal so we re-reconcile the instant the real geometry arrives.
+            for idx in position..position.saturating_add(added) {
+                let Some(monitor) = list.item(idx).and_then(|obj| obj.downcast::<gdk::Monitor>().ok()) else {
+                    continue;
+                };
+                if monitor.geometry().width() == 0 {
                     log_info!(
                         "monitor",
-                        "Monitor geometry now available ({}x{}), reconciling",
-                        geom.width(),
-                        geom.height()
+                        "New monitor has zero geometry, subscribing to notify::geometry"
                     );
-                    refresh();
-                    sched();
-                    // One-shot: disconnect to avoid accumulation.
-                    if let Some(mon_strong) = mon_weak.upgrade() {
-                        if let Some(hid) = handler_clone.take() {
-                            glib::signal_handler_disconnect(&mon_strong, hid);
+                    let sched = Rc::clone(&sched_hotplug);
+                    let refresh = Rc::clone(&refresh_hotplug);
+                    let handler = std::rc::Rc::new(std::cell::Cell::new(None::<glib::SignalHandlerId>));
+                    let handler_clone = Rc::clone(&handler);
+                    let mon_weak = monitor.downgrade();
+                    let id = monitor.connect_notify_local(Some("geometry"), move |mon, _| {
+                        let geom = mon.geometry();
+                        if geom.width() > 0 {
+                            log_info!(
+                                "monitor",
+                                "Monitor geometry now available ({}x{}), reconciling",
+                                geom.width(),
+                                geom.height()
+                            );
+                            refresh();
+                            sched();
+                            // One-shot: disconnect to avoid accumulation.
+                            if let Some(mon_strong) = mon_weak.upgrade() {
+                                if let Some(hid) = handler_clone.take() {
+                                    mon_strong.disconnect(hid);
+                                }
+                            }
                         }
-                    }
+                    });
+                    handler.set(Some(id));
                 }
-            });
-            handler.set(Some(id));
-        }
-    });
-
-    let sched_removed = Rc::clone(schedule_reconcile);
-    let refresh_removed = Rc::clone(&refresh_niri_outputs);
-    display.connect_monitor_removed(move |_, _| {
-        log_info!("monitor", "Received GDK monitor_removed signal");
-        refresh_removed();
-        sched_removed();
-    });
+            }
+        });
 }

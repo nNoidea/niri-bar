@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONTAINER_NAME="niri-bar-ci-test"
-IMAGE="ubuntu:24.04"
+IMAGE="${IMAGE:-ubuntu:latest}"
 
 # Check if distrobox is installed
 if ! command -v distrobox >/dev/null 2>&1; then
@@ -24,7 +24,7 @@ echo "==> Creating temporary distrobox container '${CONTAINER_NAME}' (${IMAGE}).
 distrobox create \
     --name "${CONTAINER_NAME}" \
     --image "${IMAGE}" \
-    --additional-packages "libgtk-3-dev libgtk-layer-shell-dev pkg-config build-essential curl git" \
+    --additional-packages "libgtk-4-dev libgtk4-layer-shell-dev pkg-config build-essential curl git" \
     --pull \
     --yes
 
@@ -39,8 +39,9 @@ distrobox enter "${CONTAINER_NAME}" -- bash -c "
 
     if ! command -v cargo >/dev/null 2>&1; then
         echo '==> Installing Rust toolchain inside container...'
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sudo -E sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt,clippy
+        sudo mkdir -p /usr/local/cargo /usr/local/rustup
         sudo chown -R \"\$(id -u):\$(id -g)\" /usr/local/cargo /usr/local/rustup
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt,clippy
     fi
 
     cd \"${REPO_DIR}\"

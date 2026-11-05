@@ -8,22 +8,6 @@ updates:
       dependencies:
         patterns:
           - "*"
-    ignore:
-      # GTK3 stack is intentionally locked to the 0.18 gtk-rs generation.
-      # For 0.x crates, Dependabot classifies 0.18 -> 0.19+ as semver-minor
-      # or semver-major depending on the updater, so block >= 0.19.0 explicitly.
-      - dependency-name: "glib"
-        versions: [">= 0.19.0"]
-      - dependency-name: "gio"
-        versions: [">= 0.19.0"]
-      - dependency-name: "gdk"
-        versions: [">= 0.19.0"]
-      - dependency-name: "gdk-pixbuf"
-        versions: [">= 0.19.0"]
-      - dependency-name: "gtk"
-        versions: [">= 0.19.0"]
-      - dependency-name: "cairo-rs"
-        versions: [">= 0.19.0"]
 
   - package-ecosystem: "github-actions"
     directory: "/"

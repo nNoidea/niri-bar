@@ -1,6 +1,7 @@
 use crate::niri::model::OutputInfo;
+use gdk::prelude::*;
 use gtk::prelude::*;
-use gtk::{Button, Window, WindowType};
+use gtk::{Button, Window};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -61,7 +62,7 @@ pub fn take_drag_cancel() -> Option<u64> {
 }
 
 /// IPC action decided at drag release. Pure decision (no I/O) so it is unit-testable;
-/// `finish_drag` below maps it to `gio::spawn_blocking` calls.
+/// `finish_drag` below dispatches it asynchronously on the shared Tokio runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragAction {
     None,
@@ -149,8 +150,8 @@ pub fn finish_drag(window_id: u64, click_to_focus: bool) {
     match action {
         DragAction::None => {}
         DragAction::MoveToMonitor { output, slot_1based } => {
-            gio::spawn_blocking(move || {
-                if let Err(e) = crate::niri::ipc::move_window_to_monitor(window_id, &output, slot_1based) {
+            crate::runtime::spawn(async move {
+                if let Err(e) = crate::niri::ipc::move_window_to_monitor(window_id, &output, slot_1based).await {
                     log_warn!(
                         "drag",
                         "Move window {window_id} to {output}:{slot_1based:?} failed: {e}"
@@ -159,15 +160,15 @@ pub fn finish_drag(window_id: u64, click_to_focus: bool) {
             });
         }
         DragAction::MoveToColumn { col_1based } => {
-            gio::spawn_blocking(move || {
-                if let Err(e) = crate::niri::ipc::move_window_to_column(window_id, col_1based) {
+            crate::runtime::spawn(async move {
+                if let Err(e) = crate::niri::ipc::move_window_to_column(window_id, col_1based).await {
                     log_warn!("drag", "Move window {window_id} to column {col_1based} failed: {e}");
                 }
             });
         }
         DragAction::Focus => {
-            gio::spawn_blocking(move || {
-                if let Err(e) = crate::niri::ipc::focus_window(window_id) {
+            crate::runtime::spawn(async move {
+                if let Err(e) = crate::niri::ipc::focus_window(window_id).await {
                     log_warn!("drag", "Focus window {window_id} failed: {e}");
                 }
             });
@@ -286,6 +287,38 @@ pub fn map_root_to_niri(
     ((global_x, global_y), hover)
 }
 
+/// Handle `GestureDrag::drag_end` on a taskbar source button.
+///
+/// When `spawn_monitor_overlays` maps a fullscreen `Layer::Overlay` window on
+/// top of the bar mid-drag (`is_dragging == true`), the Wayland compositor
+/// sends `wl_pointer.leave` to the bar window, which causes GTK4 to cancel
+/// the button's `GestureDrag` (`sequence_cancelled == true`) while the user
+/// is still holding the mouse button. In that case, we must NOT abort the
+/// drag—the fullscreen overlay window now owns tracking and release.
+///
+/// If `sequence_cancelled` is `false` (normal button release) or `is_dragging`
+/// is `false` (cancelled before crossing the drag threshold), we clean up
+/// cursors/overlays and finish the drag (focusing only on an uncancelled click).
+pub fn handle_source_gesture_end(
+    window_id: u64,
+    sequence_cancelled: bool,
+    source_button: Option<&Button>,
+    update_tx: &async_channel::Sender<()>,
+) -> bool {
+    if sequence_cancelled {
+        let is_actively_dragging = crate::util::lock(&GLOBAL_DRAG)
+            .as_ref()
+            .is_some_and(|d| d.window_id == window_id && d.is_dragging);
+        if is_actively_dragging {
+            return false;
+        }
+    }
+    reset_all_cursors_and_overlay(source_button);
+    finish_drag(window_id, !sequence_cancelled);
+    crate::util::nudge(update_tx);
+    true
+}
+
 /// Store a new pointer position + cross-monitor target for `window_id`.
 /// Main-thread only (touches the GTK-handler global drag). Invalidates the
 /// preview slot until the remote `reconcile` recomputes it.
@@ -334,29 +367,18 @@ pub fn spawn_monitor_overlays(
     let Some(display) = gdk::Display::default() else {
         return;
     };
-    let n_monitors = display.n_monitors();
-    for m_idx in 0..n_monitors {
-        let Some(mon) = display.monitor(m_idx) else {
-            continue;
-        };
-        let overlay = Window::new(WindowType::Toplevel);
-        overlay.set_app_paintable(true);
-        if let Some(screen) = gtk::prelude::WidgetExt::screen(&overlay) {
-            if let Some(visual) = screen.rgba_visual() {
-                overlay.set_visual(Some(&visual));
-            }
-        }
+    for mon in crate::monitor::display_monitors(&display) {
+        let overlay = Window::new();
+        overlay.add_css_class("drag-overlay");
         crate::layer_shell::setup_overlay_window(&overlay, Some(&mon));
-        overlay.add_events(
-            gdk::EventMask::POINTER_MOTION_MASK | gdk::EventMask::BUTTON_RELEASE_MASK | gdk::EventMask::KEY_PRESS_MASK,
-        );
 
         let state_overlay = Arc::clone(state);
         let tx_overlay = update_tx.clone();
         let wid_overlay = window_id;
         let mon_overlay = mon.clone();
 
-        overlay.connect_motion_notify_event(move |_, o_ev| {
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(move |_, ox, oy| {
             // Fixed lock order: snapshot drag identity, drop guard, THEN
             // lock state. Never hold GLOBAL_DRAG across a state lock.
             let (ours, src_out) = {
@@ -367,9 +389,8 @@ pub fn spawn_monitor_overlays(
                 }
             };
             if !ours {
-                return glib::Propagation::Proceed;
+                return;
             }
-            let (ox, oy) = o_ev.position();
 
             let st_outputs = {
                 let st = crate::util::lock(&state_overlay);
@@ -394,31 +415,55 @@ pub fn spawn_monitor_overlays(
             let (_, new_target) = decide_hover_target(hover, &src_out);
             store_drag_position(wid_overlay, cur_gx, cur_gy, new_target);
             crate::util::nudge(&tx_overlay);
+        });
+        overlay.add_controller(motion);
+
+        let b_overlay_legacy = source_button.clone();
+        let tx_overlay_legacy = update_tx.clone();
+        let legacy = gtk::EventControllerLegacy::new();
+        legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
+        legacy.connect_event(move |_, event| {
+            if matches!(
+                event.event_type(),
+                gdk::EventType::ButtonRelease | gdk::EventType::ButtonPress
+            ) {
+                reset_all_cursors_and_overlay(Some(&b_overlay_legacy));
+                // Overlay exists only mid-drag: never click-to-focus.
+                finish_drag(wid_overlay, false);
+                crate::util::nudge(&tx_overlay_legacy);
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
+        overlay.add_controller(legacy);
 
         let b_overlay_rel = source_button.clone();
         let tx_overlay_rel = update_tx.clone();
+        let b_overlay_unpaired = source_button.clone();
+        let tx_overlay_unpaired = update_tx.clone();
 
-        overlay.connect_button_release_event(move |_, o_ev| {
-            if o_ev.button() != 1 {
-                return glib::Propagation::Proceed;
-            }
-
+        let click = gtk::GestureClick::builder()
+            .button(0)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        click.connect_released(move |_, _, _, _| {
             reset_all_cursors_and_overlay(Some(&b_overlay_rel));
-            // Overlay exists only mid-drag: never click-to-focus.
             finish_drag(wid_overlay, false);
-
             crate::util::nudge(&tx_overlay_rel);
-
-            glib::Propagation::Stop
         });
+        click.connect_unpaired_release(move |_, _, _, _, _| {
+            reset_all_cursors_and_overlay(Some(&b_overlay_unpaired));
+            finish_drag(wid_overlay, false);
+            crate::util::nudge(&tx_overlay_unpaired);
+        });
+        overlay.add_controller(click);
 
         let b_overlay_esc = source_button.clone();
         let tx_overlay_esc = update_tx.clone();
 
-        overlay.connect_key_press_event(move |_, k_ev| {
-            if k_ev.keyval() == gdk::keys::constants::Escape {
+        let key_ctrl = gtk::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
                 // Only cancel our own drag; a stale overlay must not kill a
                 // newer drag started after this overlay was created.
                 let ours = crate::util::lock(&GLOBAL_DRAG)
@@ -434,97 +479,64 @@ pub fn spawn_monitor_overlays(
             }
             glib::Propagation::Proceed
         });
+        overlay.add_controller(key_ctrl);
 
-        overlay.show_all();
+        overlay.set_visible(true);
         OVERLAY_WINDOWS.with(|cell| cell.borrow_mut().push(overlay));
     }
 }
 
 thread_local! {
-    /// True while a drag holds a GDK seat grab to force its icon cursor.
+    /// True while a drag has applied its icon cursor across toplevels.
     pub static DRAG_CURSOR_GRAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether a drag currently holds the cursor seat grab (main thread).
+/// Whether a drag currently has its icon cursor active (main thread).
 #[cfg(test)]
 pub fn drag_cursor_grab_active() -> bool {
     DRAG_CURSOR_GRAB.with(|g| g.get())
 }
 
-/// Release the drag cursor grab if we hold one. Idempotent.
+/// Release the drag cursor state if active. Idempotent.
 fn release_drag_cursor_grab() {
-    if DRAG_CURSOR_GRAB.with(|g| g.replace(false)) {
-        if let Some(seat) = gdk::Display::default().and_then(|d| d.default_seat()) {
-            seat.ungrab();
-        }
-    }
+    DRAG_CURSOR_GRAB.with(|g| g.set(false));
 }
 
 pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Option<&Button>) {
     let size = if size <= 0 { 20 } else { size };
     if let Some(pixbuf) = crate::icon::load_pixbuf_at_size(icon_key, size) {
         if let Some(display) = gdk::Display::default() {
-            let cursor = gdk::Cursor::from_pixbuf(&display, &pixbuf, size / 2, size / 2);
-            if let Some(screen) = gdk::Screen::default() {
-                for win in screen.toplevel_windows() {
-                    win.set_cursor(Some(&cursor));
-                }
+            let texture = gdk::Texture::for_pixbuf(&pixbuf);
+            let cursor = gdk::Cursor::from_texture(&texture, size / 2, size / 2, None);
+            for win in gtk::Window::list_toplevels() {
+                win.set_cursor(Some(&cursor));
             }
             if let Some(b) = source_button {
-                if let Some(w) = b.window() {
-                    w.set_cursor(Some(&cursor));
-                }
-                // `set_cursor` above is silently ignored by GDK when it thinks
-                // the pointer is not over one of our windows (e.g. the drag
-                // started only after the pointer left the bar from an edge
-                // grab). A seat grab with a cursor sets it unconditionally.
-                // Grab the button's own event window with owner_events=false
-                // so motion/release keep going to the button exactly like the
-                // implicit press grab did.
-                if let (Some(ev_win), Some(seat)) = (b.event_window().or_else(|| b.window()), display.default_seat()) {
-                    let status = seat.grab(
-                        &ev_win,
-                        gdk::SeatCapabilities::POINTER,
-                        false,
-                        Some(&cursor),
-                        None,
-                        None,
-                    );
-                    if status == gdk::GrabStatus::Success {
-                        DRAG_CURSOR_GRAB.with(|g| g.set(true));
-                    } else {
-                        log_debug!("drag", "Drag cursor seat grab failed: {:?}", status);
-                    }
-                }
+                b.set_cursor(Some(&cursor));
             }
+            DRAG_CURSOR_GRAB.with(|g| g.set(true));
             display.flush();
         }
     }
 }
 
 pub fn reset_all_cursors_and_overlay(source_button: Option<&Button>) {
-    // Release first so the restored cursors below actually take effect.
     release_drag_cursor_grab();
 
     if let Some(display) = gdk::Display::default() {
-        if let Some(screen) = gdk::Screen::default() {
-            for win in screen.toplevel_windows() {
-                win.set_cursor(None);
-            }
+        for win in gtk::Window::list_toplevels() {
+            win.set_cursor(None);
         }
-        // NOTE: no `display.sync()` here. It blocks the UI thread on a
-        // round-trip for every drag release / Escape; `flush()` is enough.
         display.flush();
     }
 
     close_overlay_windows();
 
     if let Some(b) = source_button {
-        if let Some(w) = b.window() {
-            let display = w.display();
-            let pointer_cursor = gdk::Cursor::from_name(&display, "pointer");
-            w.set_cursor(pointer_cursor.as_ref());
-        }
+        b.remove_css_class("is-dragging");
+        b.remove_css_class("drag-placeholder");
+        b.remove_css_class("drag-source-away");
+        b.set_cursor_from_name(Some("pointer"));
     }
 
     if let Some(display) = gdk::Display::default() {
@@ -860,13 +872,16 @@ mod tests {
     fn test_create_surface_from_pixbuf_with_scale() {
         crate::util::run_gtk_test(|| {
             let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).unwrap();
-            let surface = pb.create_surface(2, Option::<&gdk::Window>::None);
-            assert!(surface.is_some());
-            let surf = surface.unwrap();
-            assert_eq!(surf.device_scale(), (2.0, 2.0));
+            let texture = gdk::Texture::for_pixbuf(&pb);
+            assert_eq!(texture.width(), 64);
+            assert_eq!(texture.height(), 64);
 
-            let img = gtk::Image::from_surface(Some(&surf));
-            assert_eq!(img.storage_type(), gtk::ImageType::Surface);
+            let cursor = gdk::Cursor::from_texture(&texture, 32, 32, None);
+            assert_eq!(cursor.hotspot_x(), 32);
+            assert_eq!(cursor.hotspot_y(), 32);
+
+            let img = gtk::Image::from_paintable(Some(&texture));
+            assert_eq!(img.storage_type(), gtk::ImageType::Paintable);
         });
     }
 
@@ -885,6 +900,143 @@ mod tests {
             // Idempotent: resetting with no grab is a no-op.
             reset_all_cursors_and_overlay(None);
             assert!(!drag_cursor_grab_active());
+        });
+    }
+
+    #[test]
+    fn test_source_gesture_end_preserves_active_drag_on_overlay_handoff() {
+        crate::util::run_gtk_test(|| {
+            let btn = gtk::Button::new();
+            btn.add_css_class("is-dragging");
+            let (tx, _rx) = async_channel::unbounded();
+
+            // 1. Active drag (is_dragging = true) + sequence cancelled (overlay mapped over bar):
+            // Must NOT abort GLOBAL_DRAG or strip .is-dragging; overlay now owns the drag.
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 77,
+                is_dragging: true,
+                ..test_drag()
+            });
+            let ended = handle_source_gesture_end(77, true, Some(&btn), &tx);
+            assert!(
+                !ended,
+                "Cancelled GestureDrag on BarWindow while is_dragging=true must hand off to overlay without aborting"
+            );
+            assert!(crate::util::lock(&GLOBAL_DRAG).is_some());
+            assert!(btn.has_css_class("is-dragging"));
+
+            // 2. Non-dragging press (is_dragging = false) + sequence cancelled:
+            // Must clean up GLOBAL_DRAG without focusing.
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 77,
+                is_dragging: false,
+                ..test_drag()
+            });
+            let ended_pre_drag = handle_source_gesture_end(77, true, Some(&btn), &tx);
+            assert!(ended_pre_drag);
+            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+            assert!(!btn.has_css_class("is-dragging"));
+
+            // 3. Normal plain click (is_dragging = false, sequence_cancelled = false):
+            // Completes drag cleanly and clears GLOBAL_DRAG.
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 77,
+                is_dragging: false,
+                ..test_drag()
+            });
+            let ended_click = handle_source_gesture_end(77, false, Some(&btn), &tx);
+            assert!(ended_click, "Plain click release must finish the drag");
+            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+
+            // 4. Local drag release on source button (is_dragging = true, sequence_cancelled = false):
+            // Drops locally and clears GLOBAL_DRAG.
+            btn.add_css_class("is-dragging");
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 77,
+                is_dragging: true,
+                current_target_slot: 2,
+                source_index: 0,
+                ..test_drag()
+            });
+            let ended_local = handle_source_gesture_end(77, false, Some(&btn), &tx);
+            assert!(ended_local, "Local drop on button must finish the drag");
+            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+            assert!(!btn.has_css_class("is-dragging"));
+        });
+    }
+
+    #[test]
+    fn test_overlay_creation_and_escape_teardown() {
+        crate::util::run_gtk_test(|| {
+            use crate::niri::AppState;
+            use std::sync::{Arc, Mutex};
+
+            struct DragGuard;
+            impl Drop for DragGuard {
+                fn drop(&mut self) {
+                    *crate::util::lock(&GLOBAL_DRAG) = None;
+                    close_overlay_windows();
+                }
+            }
+            let _guard = DragGuard;
+
+            let state = Arc::new(Mutex::new(AppState::default()));
+            let (tx, _rx) = async_channel::unbounded();
+            let source_btn = Button::new();
+            source_btn.add_css_class("is-dragging");
+
+            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+                window_id: 99,
+                is_dragging: true,
+                ..test_drag()
+            });
+
+            spawn_monitor_overlays(&state, &tx, 99, &source_btn);
+
+            // Overlays were spawned
+            let overlay_count = OVERLAY_WINDOWS.with(|cell| cell.borrow().len());
+            assert!(
+                overlay_count > 0,
+                "Expected at least one overlay window spawned across monitors"
+            );
+
+            // Verify overlay controllers
+            OVERLAY_WINDOWS.with(|cell| {
+                let windows = cell.borrow();
+                let overlay = &windows[0];
+                let controllers = overlay.observe_controllers();
+                let mut has_motion = false;
+                let mut has_legacy = false;
+                let mut has_click = false;
+                let mut has_key = false;
+
+                for i in 0..controllers.n_items() {
+                    let ctrl = controllers.item(i).unwrap();
+                    if ctrl.is::<gtk::EventControllerMotion>() {
+                        has_motion = true;
+                    } else if let Some(legacy) = ctrl.downcast_ref::<gtk::EventControllerLegacy>() {
+                        if legacy.propagation_phase() == gtk::PropagationPhase::Capture {
+                            has_legacy = true;
+                        }
+                    } else if let Some(click) = ctrl.downcast_ref::<gtk::GestureClick>() {
+                        if click.button() == 0 && click.propagation_phase() == gtk::PropagationPhase::Capture {
+                            has_click = true;
+                        }
+                    } else if ctrl.is::<gtk::EventControllerKey>() {
+                        has_key = true;
+                    }
+                }
+
+                assert!(has_motion, "Overlay must have EventControllerMotion");
+                assert!(has_legacy, "Overlay must have Capture-phase EventControllerLegacy");
+                assert!(has_click, "Overlay must have Capture-phase GestureClick on button 0");
+                assert!(has_key, "Overlay must have EventControllerKey for Escape");
+            });
+
+            // Teardown via close_overlay_windows
+            close_overlay_windows();
+            let remaining = OVERLAY_WINDOWS.with(|cell| cell.borrow().len());
+            assert_eq!(remaining, 0, "Overlay windows must be emptied on close");
         });
     }
 }

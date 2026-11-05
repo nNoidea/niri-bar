@@ -87,57 +87,120 @@ impl StopSignal {
     }
 }
 
-/// RAII guard for `gio::DBusConnection` signal subscriptions.
+/// Shared lazily-connected system D-Bus connection (`zbus`).
 ///
-/// `gio::bus_get_sync` returns a process-global singleton connection, so dropping
-/// a `SignalSubscriptionId` without calling `signal_unsubscribe` leaks the closure
-/// forever. This guard unsubscribes automatically on both periodic renewal and
-/// worker thread exit.
-pub struct DbusSubscriptions(Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>);
+/// Reuses a single connection across `battery`, `bluetooth`, `network`, and
+/// `monitor` sleep/wake listeners, reconnecting automatically if the system
+/// bus restarts.
+pub async fn system_bus() -> Option<zbus::Connection> {
+    static SYSTEM_BUS: std::sync::OnceLock<tokio::sync::Mutex<Option<zbus::Connection>>> = std::sync::OnceLock::new();
+    let cell = SYSTEM_BUS.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut guard = cell.lock().await;
+    if let Some(ref conn) = *guard {
+        if conn.unique_name().is_some() {
+            return Some(conn.clone());
+        }
+    }
+    match tokio::time::timeout(Duration::from_millis(500), zbus::Connection::system()).await {
+        Ok(Ok(conn)) => {
+            *guard = Some(conn.clone());
+            Some(conn)
+        }
+        Ok(Err(e)) => {
+            log_debug!("dbus", "System bus connect failed: {e}");
+            *guard = None;
+            None
+        }
+        Err(_) => {
+            log_debug!("dbus", "System bus connect timed out");
+            *guard = None;
+            None
+        }
+    }
+}
+
+/// RAII guard for `zbus` signal listener tasks.
+///
+/// Aborting the task drops its `zbus::MessageStream`, which automatically
+/// deregisters the D-Bus `MatchRule` from the bus.
+pub struct DbusSubscriptions(Vec<tokio::task::JoinHandle<()>>);
 
 impl DbusSubscriptions {
-    pub fn new(subs: Option<(gio::DBusConnection, Vec<gio::SignalSubscriptionId>)>) -> Self {
-        Self(subs)
+    pub fn new(handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self(handles)
     }
 }
 
 impl Drop for DbusSubscriptions {
     fn drop(&mut self) {
-        if let Some((conn, ids)) = self.0.take() {
-            for id in ids {
-                conn.signal_unsubscribe(id);
-            }
+        for h in self.0.drain(..) {
+            h.abort();
         }
     }
 }
 
+/// Spawn a lightweight `zbus` signal listener on the system bus that calls
+/// `core.notify()` whenever a matching signal arrives.
+pub fn spawn_dbus_trigger(
+    core: &ModuleCore,
+    sender: &'static str,
+    interface: &'static str,
+    member: Option<&'static str>,
+) -> tokio::task::JoinHandle<()> {
+    let core = core.clone();
+    crate::runtime::spawn(async move {
+        use futures_util::StreamExt;
+        let Some(conn) = system_bus().await else { return };
+        let mut builder = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(sender)
+            .interface(interface);
+        if let Some(m) = member {
+            builder = builder.member(m);
+        }
+        let Ok(rule) = builder.build() else { return };
+        let Ok(mut stream) = zbus::MessageStream::for_match_rule(rule, &conn, None).await else {
+            return;
+        };
+        while stream.next().await.is_some() {
+            if core.is_stopped() {
+                break;
+            }
+            core.notify();
+        }
+    })
+}
+
 /// Fetch a single `org.freedesktop.DBus.Properties.Get` property variant with a 500ms timeout.
-pub fn dbus_get_variant(
-    conn: &gio::DBusConnection,
+pub async fn dbus_get_property(
+    conn: &zbus::Connection,
     dest: &str,
     path: &str,
     interface: &str,
     prop: &str,
-) -> Option<glib::Variant> {
-    let params = (interface, prop).to_variant();
-    let res = match conn.call_sync(
-        Some(dest),
-        path,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        Some(&params),
-        None,
-        gio::DBusCallFlags::NONE,
-        500,
-        gio::Cancellable::NONE,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
+) -> Option<zbus::OwnedVariant> {
+    let res = tokio::time::timeout(
+        Duration::from_millis(500),
+        conn.call_method(
+            Some(dest),
+            path,
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &(interface, prop),
+        ),
+    )
+    .await;
+    match res {
+        Ok(Ok(msg)) => msg.body().deserialize::<zbus::OwnedVariant>().ok(),
+        Ok(Err(e)) => {
             log_debug!("dbus", "D-Bus Get failed {dest} {path} {interface}.{prop}: {e}");
-            return None;
+            None
         }
-    };
-    res.child_value(0).as_variant()
+        Err(_) => {
+            log_debug!("dbus", "D-Bus Get timed out {dest} {path} {interface}.{prop}");
+            None
+        }
+    }
 }
 
 /// Core subscription and lifecycle helper shared across modules.
@@ -414,32 +477,29 @@ pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
     });
 }
 
-pub fn enable_hover_cursor(button: &Button) {
-    button.add_events(gdk::EventMask::ENTER_NOTIFY_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
-    button.connect_enter_notify_event(|b, _| {
-        if let Some(w) = b.window() {
-            let ctx = b.style_context();
-            let is_disabled = ctx.has_class("no-pointer")
-                || ctx.has_class("no-hover")
-                || ctx.has_class("cursor-default")
-                || (ctx.has_class("non-clickable") && !ctx.has_class("clickable") && !ctx.has_class("cursor-pointer"));
+pub fn update_button_cursor(button: &Button) {
+    let is_disabled = button.has_css_class("no-pointer")
+        || button.has_css_class("no-hover")
+        || button.has_css_class("cursor-default")
+        || (button.has_css_class("non-clickable")
+            && !button.has_css_class("clickable")
+            && !button.has_css_class("cursor-pointer"));
 
-            if is_disabled {
-                w.set_cursor(None);
-            } else {
-                let display = w.display();
-                let pointer_cursor = gdk::Cursor::from_name(&display, "pointer");
-                w.set_cursor(pointer_cursor.as_ref());
-            }
-        }
-        Propagation::Proceed
+    if is_disabled {
+        button.set_cursor_from_name(None);
+    } else {
+        button.set_cursor_from_name(Some("pointer"));
+    }
+}
+
+pub fn enable_hover_cursor(button: &Button) {
+    update_button_cursor(button);
+    let motion = gtk::EventControllerMotion::new();
+    let btn_enter = button.clone();
+    motion.connect_enter(move |_, _, _| {
+        update_button_cursor(&btn_enter);
     });
-    button.connect_leave_notify_event(|b, _| {
-        if let Some(w) = b.window() {
-            w.set_cursor(None);
-        }
-        Propagation::Proceed
-    });
+    button.add_controller(motion);
 }
 
 pub struct ModuleWidget {
@@ -449,17 +509,11 @@ pub struct ModuleWidget {
 impl ModuleWidget {
     pub fn new(module: Arc<dyn BarModule>, orientation: Orientation) -> Self {
         let button = Button::new();
-        button.add_events(
-            gdk::EventMask::BUTTON_PRESS_MASK
-                | gdk::EventMask::BUTTON_RELEASE_MASK
-                | gdk::EventMask::SCROLL_MASK
-                | gdk::EventMask::SMOOTH_SCROLL_MASK,
-        );
+        button.set_has_frame(false);
+        button.set_focusable(false);
         button.set_halign(gtk::Align::Fill);
         button.set_valign(gtk::Align::Center);
         button.set_hexpand(true);
-
-        enable_hover_cursor(&button);
 
         let label = Label::new(None);
         label.set_justify(gtk::Justification::Center);
@@ -469,21 +523,21 @@ impl ModuleWidget {
         label.set_valign(gtk::Align::Center);
         label.set_hexpand(true);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        button.add(&label);
+        button.set_child(Some(&label));
 
         if module.name() == "spacer" {
-            label.set_no_show_all(true);
-            label.hide();
+            label.set_visible(false);
         }
 
-        let ctx = button.style_context();
-        ctx.add_class("module-item");
-        ctx.add_class(&format!("module-{}", module.name()));
+        button.add_css_class("module-item");
+        button.add_css_class(&format!("module-{}", module.name()));
         if module.is_clickable() {
-            ctx.add_class("clickable");
+            button.add_css_class("clickable");
         } else {
-            ctx.add_class("non-clickable");
+            button.add_css_class("non-clickable");
         }
+
+        enable_hover_cursor(&button);
 
         let initial = module.current_state(orientation);
         Self::apply_state(&button, &label, &initial, module.name(), orientation);
@@ -505,42 +559,39 @@ impl ModuleWidget {
             }
         });
 
-        // Mouse click bindings (ignore synthesized DoubleButtonPress / TripleButtonPress
-        // so rapid clicks within GTK's 400ms double-click window don't fire twice and cancel out).
+        // Mouse click bindings (ignore synthesized double/triple press counts `n_press != 1`
+        // so rapid clicks within GTK's double-click window don't fire twice and cancel out).
+        let click = gtk::GestureClick::builder()
+            .button(0)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
         let mod_click = Arc::clone(&module);
-        button.connect_button_press_event(move |_, ev| {
-            if let Some(btn) = Self::map_button_event(ev.event_type(), ev.button()) {
+        click.connect_pressed(move |gesture, n_press, _, _| {
+            if let Some(btn) = Self::map_button_press(n_press, gesture.current_button()) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
                 mod_click.handle_click(btn);
             }
-            Propagation::Proceed
         });
+        button.add_controller(click);
 
         // Mouse scroll bindings
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         let mod_scroll = Arc::clone(&module);
-        button.connect_scroll_event(move |_, ev| {
-            match ev.direction() {
-                gdk::ScrollDirection::Up => mod_scroll.handle_scroll(ScrollDirection::Up),
-                gdk::ScrollDirection::Down => mod_scroll.handle_scroll(ScrollDirection::Down),
-                gdk::ScrollDirection::Smooth => {
-                    let (_, dy) = ev.scroll_deltas().unwrap_or((0.0, 0.0));
-                    if dy < 0.0 {
-                        mod_scroll.handle_scroll(ScrollDirection::Up);
-                    } else if dy > 0.0 {
-                        mod_scroll.handle_scroll(ScrollDirection::Down);
-                    }
-                }
-                _ => {}
+        scroll.connect_scroll(move |_, _, dy| {
+            if dy < 0.0 {
+                mod_scroll.handle_scroll(ScrollDirection::Up);
+            } else if dy > 0.0 {
+                mod_scroll.handle_scroll(ScrollDirection::Down);
             }
             Propagation::Proceed
         });
-
-        button.show_all();
+        button.add_controller(scroll);
 
         Self { button }
     }
 
-    pub fn map_button_event(event_type: gdk::EventType, button_num: u32) -> Option<MouseButton> {
-        if event_type != gdk::EventType::ButtonPress {
+    pub fn map_button_press(n_press: i32, button_num: u32) -> Option<MouseButton> {
+        if n_press != 1 {
             return None;
         }
         match button_num {
@@ -582,22 +633,10 @@ impl ModuleWidget {
         let combined = Self::format_combined_label(state.icon.as_deref(), state.text.as_deref(), orientation);
 
         label.set_text(&combined);
-        if module_name == "spacer" || combined.is_empty() {
-            label.set_no_show_all(true);
-            label.hide();
-        } else {
-            label.set_no_show_all(false);
-            label.show();
-        }
+        label.set_visible(module_name != "spacer" && !combined.is_empty());
 
         if module_name != "spacer" {
-            if combined.is_empty() {
-                button.set_no_show_all(true);
-                button.hide();
-            } else {
-                button.set_no_show_all(false);
-                button.show();
-            }
+            button.set_visible(!combined.is_empty());
         }
 
         if let Some(ref tip) = state.tooltip {
@@ -606,9 +645,8 @@ impl ModuleWidget {
             button.set_tooltip_text(None);
         }
 
-        let ctx = button.style_context();
         let expected_module_class = format!("module-{module_name}");
-        for old_cls in ctx.list_classes() {
+        for old_cls in button.css_classes() {
             let s = old_cls.as_str();
             if s != "module-item"
                 && s != expected_module_class
@@ -620,12 +658,13 @@ impl ModuleWidget {
                 && s != "cursor-default"
                 && s != "cursor-pointer"
             {
-                ctx.remove_class(s);
+                button.remove_css_class(s);
             }
         }
         for cls in &state.css_classes {
-            ctx.add_class(cls);
+            button.add_css_class(cls);
         }
+        update_button_cursor(button);
     }
 }
 
@@ -672,7 +711,7 @@ mod tests {
         crate::util::run_gtk_test(|| {
             let button = Button::new();
             let label = Label::new(None);
-            button.add(&label);
+            button.set_child(Some(&label));
 
             let empty_state = ModuleState {
                 icon: None,
@@ -681,15 +720,11 @@ mod tests {
                 css_classes: Vec::new(),
             };
 
-            // Non-spacer module with empty state should hide button and set no_show_all
+            // Non-spacer module with empty state should hide button
             ModuleWidget::apply_state(&button, &label, &empty_state, "brightness", Orientation::Vertical);
-            assert!(
-                button.is_no_show_all(),
-                "Empty module button must have no_show_all true"
-            );
             assert!(!button.is_visible(), "Empty module button must be hidden");
 
-            // When populated with state, button should become visible and clear no_show_all
+            // When populated with state, button should become visible
             let populated_state = ModuleState {
                 icon: Some("󰃠".to_string()),
                 text: Some("50%".to_string()),
@@ -697,10 +732,6 @@ mod tests {
                 css_classes: Vec::new(),
             };
             ModuleWidget::apply_state(&button, &label, &populated_state, "brightness", Orientation::Vertical);
-            assert!(
-                !button.is_no_show_all(),
-                "Populated module button must not have no_show_all"
-            );
             assert!(button.is_visible(), "Populated module button must be visible");
         });
     }
@@ -713,27 +744,12 @@ mod tests {
     }
 
     #[test]
-    fn test_map_button_event_ignores_double_and_triple_press() {
-        assert_eq!(
-            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 1),
-            Some(MouseButton::Left)
-        );
-        assert_eq!(
-            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 2),
-            Some(MouseButton::Middle)
-        );
-        assert_eq!(
-            ModuleWidget::map_button_event(gdk::EventType::ButtonPress, 3),
-            Some(MouseButton::Right)
-        );
-        assert_eq!(
-            ModuleWidget::map_button_event(gdk::EventType::DoubleButtonPress, 1),
-            None
-        );
-        assert_eq!(
-            ModuleWidget::map_button_event(gdk::EventType::TripleButtonPress, 1),
-            None
-        );
+    fn test_map_button_press_ignores_double_and_triple_press() {
+        assert_eq!(ModuleWidget::map_button_press(1, 1), Some(MouseButton::Left));
+        assert_eq!(ModuleWidget::map_button_press(1, 2), Some(MouseButton::Middle));
+        assert_eq!(ModuleWidget::map_button_press(1, 3), Some(MouseButton::Right));
+        assert_eq!(ModuleWidget::map_button_press(2, 1), None);
+        assert_eq!(ModuleWidget::map_button_press(3, 1), None);
     }
 
     #[test]

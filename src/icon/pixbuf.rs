@@ -258,6 +258,29 @@ pub fn decode_png_bytes_to_pixbuf(png_bytes: &[u8], target_size: i32) -> Option<
     }
 }
 
+/// Render a clean, lightweight fallback application icon (`Pixbuf`) in-process
+/// without touching `GtkIconTheme` or `libglycin`.
+pub fn fallback_executable_pixbuf(target_size: i32) -> Option<Pixbuf> {
+    if let Some(png_path) = crate::icon::desktop::resolve_xdg_png_icon("application-x-executable") {
+        if let Ok(bytes) = fs::read(&png_path) {
+            if let Some(pb) = decode_png_bytes_to_pixbuf(&bytes, target_size) {
+                return Some(normalize_pixbuf_to_size(pb, target_size.clamp(1, 512)));
+            }
+        }
+    }
+    let size = if target_size <= 0 { 32 } else { target_size }.clamp(8, 512);
+    let pb = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, size, size)?;
+    pb.fill(0x00000000);
+    let pad = (size / 6).max(1);
+    let inner = (size - pad * 2).max(2);
+    if let Some(box_pb) = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, inner, inner) {
+        // Subtle slate-grey rounded square tile (RGBA 0x6c7086d8)
+        box_pb.fill(0x6c7086d8);
+        box_pb.copy_area(0, 0, inner, inner, &pb, pad, pad);
+    }
+    Some(pb)
+}
+
 /// Load a file into a `Pixbuf` at `target_size`, enforcing `MAX_ASAR_ICON_BYTES` (4 MB)
 /// and regular-file checks before loading. Uses fast in-process Cairo `libpng16`
 /// decoding for `.png` files so `libglycin` / `bwrap` is never spawned for trusted PNGs.
