@@ -559,8 +559,7 @@ impl ModuleWidget {
             }
         });
 
-        // Mouse click bindings (ignore synthesized double/triple press counts `n_press != 1`
-        // so rapid clicks within GTK's double-click window don't fire twice and cancel out).
+        // Mouse click bindings (handle every click press; GTK4 increments n_press for rapid clicks).
         let click = gtk::GestureClick::builder()
             .button(0)
             .propagation_phase(gtk::PropagationPhase::Capture)
@@ -574,16 +573,23 @@ impl ModuleWidget {
         });
         button.add_controller(click);
 
-        // Mouse scroll bindings
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        // Mouse scroll bindings (BOTH_AXES + DISCRETE so precision trackpads and mouse wheels
+        // emit single discrete steps instead of dozens of micro-deltas per flick).
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
         let mod_scroll = Arc::clone(&module);
-        scroll.connect_scroll(move |_, _, dy| {
-            if dy < 0.0 {
+        scroll.connect_scroll(move |_, dx, dy| {
+            let delta = if dy != 0.0 { dy } else { dx };
+            if delta < 0.0 {
                 mod_scroll.handle_scroll(ScrollDirection::Up);
-            } else if dy > 0.0 {
+                Propagation::Stop
+            } else if delta > 0.0 {
                 mod_scroll.handle_scroll(ScrollDirection::Down);
+                Propagation::Stop
+            } else {
+                Propagation::Proceed
             }
-            Propagation::Proceed
         });
         button.add_controller(scroll);
 
@@ -591,7 +597,7 @@ impl ModuleWidget {
     }
 
     pub fn map_button_press(n_press: i32, button_num: u32) -> Option<MouseButton> {
-        if n_press != 1 {
+        if n_press <= 0 {
             return None;
         }
         match button_num {
@@ -744,12 +750,52 @@ mod tests {
     }
 
     #[test]
-    fn test_map_button_press_ignores_double_and_triple_press() {
+    fn test_map_button_press_accepts_rapid_consecutive_clicks() {
+        // GTK4 GestureClick increments n_press on each rapid physical press (1, 2, 3, ...).
+        // Each press represents a distinct user click and must not be dropped.
         assert_eq!(ModuleWidget::map_button_press(1, 1), Some(MouseButton::Left));
+        assert_eq!(ModuleWidget::map_button_press(2, 1), Some(MouseButton::Left));
+        assert_eq!(ModuleWidget::map_button_press(3, 1), Some(MouseButton::Left));
+        assert_eq!(ModuleWidget::map_button_press(4, 1), Some(MouseButton::Left));
         assert_eq!(ModuleWidget::map_button_press(1, 2), Some(MouseButton::Middle));
+        assert_eq!(ModuleWidget::map_button_press(2, 2), Some(MouseButton::Middle));
         assert_eq!(ModuleWidget::map_button_press(1, 3), Some(MouseButton::Right));
-        assert_eq!(ModuleWidget::map_button_press(2, 1), None);
-        assert_eq!(ModuleWidget::map_button_press(3, 1), None);
+        assert_eq!(ModuleWidget::map_button_press(2, 3), Some(MouseButton::Right));
+        assert_eq!(ModuleWidget::map_button_press(0, 1), None);
+        assert_eq!(ModuleWidget::map_button_press(-1, 1), None);
+        assert_eq!(ModuleWidget::map_button_press(1, 4), None);
+    }
+
+    #[test]
+    fn test_module_widget_scroll_controller_uses_discrete_and_both_axes() {
+        crate::util::run_gtk_test(|| {
+            let config = crate::config::VolumeConfig::default();
+            let module: Arc<dyn BarModule> = Arc::new(crate::modules::volume::VolumeModule::new(config));
+            let widget = ModuleWidget::new(module, Orientation::Vertical);
+            let btn = widget.button;
+
+            let controllers = btn.observe_controllers();
+            let mut found_scroll = false;
+            for i in 0..controllers.n_items() {
+                if let Some(ctrl) = controllers
+                    .item(i)
+                    .and_then(|o| o.downcast::<gtk::EventControllerScroll>().ok())
+                {
+                    let flags = ctrl.flags();
+                    assert!(
+                        flags.contains(gtk::EventControllerScrollFlags::DISCRETE),
+                        "Module scroll controller must have DISCRETE flag to prevent trackpad smooth scrolling surges"
+                    );
+                    assert!(
+                        flags.contains(gtk::EventControllerScrollFlags::BOTH_AXES),
+                        "Module scroll controller must support BOTH_AXES"
+                    );
+                    found_scroll = true;
+                    break;
+                }
+            }
+            assert!(found_scroll, "Module button must have EventControllerScroll attached");
+        });
     }
 
     #[test]

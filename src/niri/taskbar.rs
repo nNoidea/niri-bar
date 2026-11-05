@@ -258,7 +258,9 @@ impl TaskbarWidget {
         let tx_clone = update_tx;
         let is_vert = orientation == Orientation::Vertical;
 
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
         scroll.connect_scroll(move |_, dx, dy| {
             let d = if is_vert {
                 dy
@@ -560,7 +562,7 @@ impl TaskbarWidget {
                     .propagation_phase(gtk::PropagationPhase::Capture)
                     .build();
                 middle_click.connect_pressed(move |gesture, n_press, _, _| {
-                    if n_press == 1 {
+                    if n_press >= 1 {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                         crate::runtime::spawn(async move {
                             if let Err(e) = ipc::close_window(window_id).await {

@@ -148,7 +148,7 @@ impl VolumeModule {
         let mut suppress_until: Option<tokio::time::Instant> = None;
         let mut pending_refresh = false;
 
-        loop {
+        'session_loop: loop {
             if core.is_stopped() {
                 break;
             }
@@ -187,7 +187,7 @@ impl VolumeModule {
                         cycled_sink |= matches!(more, PulseAction::CycleSink);
                         if let Err(e) = session.handle_action(more).await {
                             log_debug!("volume", "PulseAudio command failed: {e}");
-                            return;
+                            break 'session_loop;
                         }
                     }
                     if cycled_sink {

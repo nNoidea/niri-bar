@@ -154,7 +154,7 @@ impl TrayWidget {
             .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
         click.connect_pressed(move |gesture, n_press, x, y| {
-            if n_press != 1 {
+            if n_press <= 0 {
                 return;
             }
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -236,7 +236,9 @@ impl TrayWidget {
         // Scroll event support
         let svc_scroll = Arc::clone(service);
         let k_scroll = key.to_string();
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
         scroll.connect_scroll(move |_, dx, dy| {
             let (item_opt, _) = svc_scroll.get_item_and_menu(&k_scroll);
             if let Some(item) = item_opt {
@@ -269,6 +271,23 @@ impl TrayWidget {
     }
 
     fn popup_tray_menu(btn: &Button, popover: &Popover, position: BarPosition) {
+        // If an existing popover is currently visible on this button, toggle it closed.
+        let mut child = btn.first_child();
+        let mut had_open_popover = false;
+        while let Some(c) = child {
+            let next = c.next_sibling();
+            if let Some(existing_popover) = c.downcast_ref::<Popover>() {
+                if existing_popover.is_visible() {
+                    existing_popover.popdown();
+                    had_open_popover = true;
+                }
+            }
+            child = next;
+        }
+        if had_open_popover {
+            return;
+        }
+
         let toplevel_opt = btn.root().and_then(|w| w.downcast::<Window>().ok());
 
         let pos_type = match position {
@@ -548,5 +567,25 @@ mod tests {
                 "{name} must not apply the card background/border to both outer `popover.tray-menu` and inner `contents`"
             );
         }
+    }
+
+    #[test]
+    fn test_tray_popover_toggle_behavior() {
+        crate::util::run_gtk_test(|| {
+            let win = Window::new();
+            let btn = Button::new();
+            win.set_child(Some(&btn));
+            win.present();
+
+            let pop1 = Popover::new();
+            TrayWidget::popup_tray_menu(&btn, &pop1, BarPosition::Left);
+            assert!(pop1.is_visible());
+
+            // Second popup call on the same button while pop1 is visible should dismiss pop1 and not open pop2
+            let pop2 = Popover::new();
+            TrayWidget::popup_tray_menu(&btn, &pop2, BarPosition::Left);
+            assert!(!pop1.is_visible());
+            assert!(!pop2.is_visible());
+        });
     }
 }
