@@ -35,6 +35,10 @@ fn get_data_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from("/usr/share"));
         dirs.push(PathBuf::from("/var/lib/flatpak/exports/share"));
     }
+    let system_flatpak = PathBuf::from("/var/lib/flatpak/exports/share");
+    if !dirs.contains(&system_flatpak) && system_flatpak.is_dir() {
+        dirs.push(system_flatpak);
+    }
     dirs
 }
 
@@ -198,6 +202,124 @@ pub(crate) fn resolve_icon_path_or_name(icon: &str) -> Option<String> {
     Some(icon.to_string())
 }
 
+pub(crate) fn resolve_xdg_icon(name: &str) -> Option<PathBuf> {
+    let safe = crate::icon::sanitize_icon_name(name)?;
+    resolve_xdg_icon_in_dirs(&safe, &get_data_dirs())
+}
+
+/// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `Adwaita`, `pixmaps`) for an application icon.
+///
+/// 1. Searches for raster `.png` first across fixed sizes and pixmaps so it can be decoded
+///    directly in-process via `libpng16` with zero background threads.
+/// 2. If no raster PNG is found, searches `scalable/` (and fixed-size dirs / pixmaps) for vector
+///    `.svg` / `.svgz` icons (used by many Flatpak and modern desktop apps).
+/// 3. Falls back to case-insensitive (lowercased) match and symbolic icons.
+pub(crate) fn resolve_xdg_icon_in_dirs(safe_name: &str, data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    const HICOLOR_SIZES: &[&str] = &[
+        "64x64", "48x48", "128x128", "32x32", "256x256", "512x512", "24x24", "22x22", "16x16",
+    ];
+    const CATEGORIES: &[&str] = &[
+        "apps",
+        "status",
+        "devices",
+        "places",
+        "mimetypes",
+        "categories",
+        "legacy",
+    ];
+    const THEMES: &[&str] = &["hicolor", "AdwaitaLegacy", "Adwaita"];
+
+    let lower = safe_name.to_lowercase();
+    let names = if lower != safe_name {
+        vec![safe_name, lower.as_str()]
+    } else {
+        vec![safe_name]
+    };
+
+    // 1. Try raster PNG first (fast in-process decode via libpng16)
+    for name in &names {
+        if let Some(png) = resolve_xdg_png_icon_in_dirs(name, data_dirs) {
+            return Some(png);
+        }
+    }
+
+    // 2. Try scalable / vector SVG icons
+    for name in &names {
+        for data_dir in data_dirs {
+            let icons_dir = data_dir.join("icons");
+            if icons_dir.is_dir() {
+                for theme in THEMES {
+                    let theme_dir = icons_dir.join(theme);
+                    if !theme_dir.is_dir() {
+                        continue;
+                    }
+                    // Check scalable/<cat>/<name>.{svg,svgz,png}
+                    let scalable_dir = theme_dir.join("scalable");
+                    if scalable_dir.is_dir() {
+                        for cat in CATEGORIES {
+                            let cat_dir = scalable_dir.join(cat);
+                            for ext in &["svg", "svgz", "png"] {
+                                let candidate = cat_dir.join(format!("{name}.{ext}"));
+                                if candidate.is_file() {
+                                    return Some(candidate);
+                                }
+                            }
+                        }
+                    }
+                    // Check fixed-size dirs for .svg (some themes store .svg in 48x48 etc.)
+                    for sz in HICOLOR_SIZES {
+                        let sz_dir = theme_dir.join(sz);
+                        if !sz_dir.is_dir() {
+                            continue;
+                        }
+                        for cat in CATEGORIES {
+                            let candidate = sz_dir.join(cat).join(format!("{name}.svg"));
+                            if candidate.is_file() {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+            // Check data_dir/pixmaps/<name>.svg
+            let pixmap_svg = data_dir.join("pixmaps").join(format!("{name}.svg"));
+            if pixmap_svg.is_file() {
+                return Some(pixmap_svg);
+            }
+        }
+    }
+
+    // 3. Fallback: symbolic icons
+    for name in &names {
+        for data_dir in data_dirs {
+            let icons_dir = data_dir.join("icons");
+            if !icons_dir.is_dir() {
+                continue;
+            }
+            for theme in THEMES {
+                let theme_dir = icons_dir.join(theme);
+                if !theme_dir.is_dir() {
+                    continue;
+                }
+                let sym_dir = theme_dir.join("symbolic");
+                if sym_dir.is_dir() {
+                    for cat in CATEGORIES {
+                        let cat_dir = sym_dir.join(cat);
+                        for suffix in &[format!("{name}-symbolic.svg"), format!("{name}.svg")] {
+                            let candidate = cat_dir.join(suffix);
+                            if candidate.is_file() {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `pixmaps`) for a raster `.png` icon
 /// matching `name` so it can be decoded directly in-process via `libpng16` without
 /// initializing `GtkIconTheme` or `libglycin`.
@@ -325,5 +447,45 @@ Icon=list-add
 
         let found = resolve_xdg_png_icon_in_dirs("org.example.App", &[dir.to_path_buf()]);
         assert_eq!(found, Some(png_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_finds_scalable_svg() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_svg");
+        let apps_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let svg_path = apps_dir.join("org.example.ScalableApp.svg");
+        fs::write(&svg_path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="16" fill="blue"/></svg>"#).unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("org.example.ScalableApp", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(svg_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_prefers_raster_png_over_svg() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_pref");
+        let png_dir = dir.join("icons/hicolor/48x48/apps");
+        let svg_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&png_dir).unwrap();
+        fs::create_dir_all(&svg_dir).unwrap();
+        let png_path = png_dir.join("org.example.App.png");
+        let svg_path = svg_dir.join("org.example.App.svg");
+        crate::icon::tests_common::write_test_png(&png_path, 48, 48);
+        fs::write(&svg_path, "<svg></svg>").unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("org.example.App", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(png_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_case_fallback() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_case");
+        let svg_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&svg_dir).unwrap();
+        let svg_path = svg_dir.join("com.example.app.svg");
+        fs::write(&svg_path, "<svg></svg>").unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("com.example.App", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(svg_path));
     }
 }

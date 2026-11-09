@@ -50,60 +50,170 @@ fn lookup_cached_exe_pixbuf(safe_key: &str, size: i32) -> Option<Pixbuf> {
     None
 }
 
-/// Load an unnormalized pixbuf at a target size from desktop entries, XDG icon dirs, or exe cache.
-/// Never initializes `GtkIconTheme` or `libglycin`, avoiding ~12 MB RSS and 14 background threads.
-fn load_raw_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
+/// Unified icon request describing the target asset and resolution context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IconRequest<'a> {
+    /// Window on the taskbar or drag preview
+    Window { app_id: &'a str, pid: Option<u32> },
+    /// StatusNotifierItem system tray item
+    Tray {
+        name: Option<&'a str>,
+        pixmap: Option<&'a [RawIconPixmap]>,
+        theme_path: Option<&'a str>,
+        id: &'a str,
+    },
+    /// Simple app or icon name / path
+    Named(&'a str),
+}
+
+/// Single Source of Truth (SSOT) for resolving any icon request (Taskbar Window, Tray item, or Named asset)
+/// to a normalized square `Pixbuf` without spawning `GtkIconTheme` or `libglycin`.
+pub fn resolve_icon_pixbuf(req: &IconRequest, target_size: i32) -> Option<Pixbuf> {
     let size = if target_size <= 0 { 32 } else { target_size }.min(512);
 
-    // 1. Direct absolute path (only from trusted taskbar app_ids; tray
-    // callers must sanitize first — absolute tray paths are rejected).
-    if Path::new(icon_key).is_absolute() {
-        return load_file_pixbuf_fast(Path::new(icon_key), size);
+    // 1. Direct ARGB32 pixmap stream from D-Bus StatusNotifierItem
+    if let IconRequest::Tray {
+        pixmap: Some(pixmaps), ..
+    } = req
+    {
+        if let Some(pb) = pixmap_to_pixbuf(pixmaps) {
+            return Some(normalize_pixbuf_to_size(pb, size));
+        }
     }
-    let safe_key = sanitize_icon_name(icon_key)?;
 
-    // 2. Resolve via desktop entries
-    if let Some(resolved) = find_app_icon(&safe_key) {
-        if Path::new(&resolved).is_absolute() {
-            if let Some(pb) = load_file_pixbuf_fast(Path::new(&resolved), size) {
-                return Some(pb);
+    // 2. Direct absolute file path check
+    let direct_path = match req {
+        IconRequest::Window { app_id, .. } => Some(Path::new(*app_id)),
+        IconRequest::Named(name) => Some(Path::new(*name)),
+        IconRequest::Tray { name: Some(n), .. } => {
+            let p = Path::new(*n);
+            if p.is_absolute() && !n.contains("..") && !n.contains('\0') {
+                Some(p)
+            } else {
+                None
             }
-        } else if let Some(png_path) = desktop::resolve_xdg_png_icon(&resolved) {
-            if let Some(pb) = load_file_pixbuf_fast(&png_path, size) {
-                return Some(pb);
+        }
+        _ => None,
+    };
+    if let Some(p) = direct_path {
+        if p.is_absolute() && p.is_file() {
+            if let Some(pb) = load_file_pixbuf_fast(p, size) {
+                return Some(normalize_pixbuf_to_size(pb, size));
             }
         }
     }
 
-    // 3. Direct XDG raster `.png` lookup (bypasses GtkIconTheme + libglycin)
-    let lower = safe_key.to_lowercase();
-    for candidate in [safe_key.as_str(), lower.as_str()] {
-        if let Some(png_path) = desktop::resolve_xdg_png_icon(candidate) {
-            if let Some(pb) = load_file_pixbuf_fast(&png_path, size) {
-                return Some(pb);
+    // 3. Extract resolution parameters
+    let (primary_key, fallback_key, pid, theme_path) = match req {
+        IconRequest::Window { app_id, pid } => (sanitize_icon_name(app_id), None, *pid, None),
+        IconRequest::Named(name) => (sanitize_icon_name(name), None, None, None),
+        IconRequest::Tray {
+            name, theme_path, id, ..
+        } => {
+            let primary = name
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(sanitize_icon_name);
+            let fallback = sanitize_icon_name(id.trim());
+            let tp = theme_path.map(str::trim).filter(|p| !p.is_empty());
+            (primary, fallback, None, tp)
+        }
+    };
+
+    let resolve_key = |safe_key: &str| -> Option<Pixbuf> {
+        // 3a. Custom theme directory search (for tray items)
+        if let Some(tp) = theme_path {
+            let dir = Path::new(tp);
+            for ext in &["", ".png", ".svg", ".ico", ".xpm", ".tga"] {
+                let candidate = dir.join(format!("{safe_key}{ext}"));
+                if candidate.is_file() {
+                    if let Some(pb) = load_file_pixbuf_fast(&candidate, size) {
+                        return Some(normalize_pixbuf_to_size(pb, size));
+                    }
+                }
             }
+            let xdg_dirs = [dir.to_path_buf(), dir.join("icons")];
+            if let Some(cand) = desktop::resolve_xdg_icon_in_dirs(safe_key, &xdg_dirs) {
+                if let Some(pb) = load_file_pixbuf_fast(&cand, size) {
+                    return Some(normalize_pixbuf_to_size(pb, size));
+                }
+            }
+        }
+
+        // 3b. Resolve via desktop entries
+        if let Some(resolved) = find_app_icon(safe_key) {
+            let res_path = Path::new(&resolved);
+            if res_path.is_absolute() && res_path.is_file() {
+                if let Some(pb) = load_file_pixbuf_fast(res_path, size) {
+                    return Some(normalize_pixbuf_to_size(pb, size));
+                }
+            } else if let Some(icon_path) = desktop::resolve_xdg_icon(&resolved) {
+                if let Some(pb) = load_file_pixbuf_fast(&icon_path, size) {
+                    return Some(normalize_pixbuf_to_size(pb, size));
+                }
+            }
+        }
+
+        // 3c. Direct XDG icon lookup (raster PNG first, then scalable SVG)
+        let lower = safe_key.to_lowercase();
+        let candidates = if lower != safe_key {
+            vec![safe_key, lower.as_str()]
+        } else {
+            vec![safe_key]
+        };
+        for candidate in candidates {
+            if let Some(icon_path) = desktop::resolve_xdg_icon(candidate) {
+                if let Some(pb) = load_file_pixbuf_fast(&icon_path, size) {
+                    return Some(normalize_pixbuf_to_size(pb, size));
+                }
+            }
+        }
+
+        // 3d. Process executable directory / Electron .asar heuristic
+        if let Some(p) = pid {
+            if let Some(square) = load_pixbuf_from_pid(p, safe_key, size) {
+                return Some(square);
+            }
+        } else if let Some(square) = lookup_cached_exe_pixbuf(safe_key, size) {
+            return Some(square);
+        }
+
+        None
+    };
+
+    if let Some(ref k) = primary_key {
+        if let Some(pb) = resolve_key(k) {
+            return Some(pb);
+        }
+    }
+    if let Some(ref fk) = fallback_key {
+        if let Some(pb) = resolve_key(fk) {
+            return Some(pb);
         }
     }
 
-    // 4. Check if `app_id` (or tray prefix like `Antigravity_status_icon_1`) was mapped to an executable path via PID
-    if let Some(pb) = lookup_cached_exe_pixbuf(&safe_key, size) {
-        return Some(pb);
-    }
-
-    // 5. Generic executable fallback (in-process, no libglycin)
-    pixbuf::fallback_executable_pixbuf(size)
+    None
 }
 
-/// Load a normalized square pixbuf directly at a target size from desktop entries, theme, or path.
-pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
-    let size = if target_size <= 0 { 32 } else { target_size }.min(512);
-    load_raw_pixbuf_at_size(icon_key, size).map(|pb| normalize_pixbuf_to_size(pb, size))
-}
-
-fn apply_pixbuf_to_image(img: &Image, pixbuf: &Pixbuf, logical_size: i32, _scale: i32) {
+/// Apply a normalized `Pixbuf` texture to a `gtk::Image` widget at `logical_size`.
+pub fn apply_pixbuf_to_image(img: &Image, pixbuf: &Pixbuf, logical_size: i32) {
     let texture = gdk::Texture::for_pixbuf(pixbuf);
     img.set_paintable(Some(&texture));
     img.set_pixel_size(logical_size);
+}
+
+/// Update an existing `gtk::Image` widget for any `IconRequest` with proper HiDPI scaling
+/// and generic fallback handling.
+pub fn update_image(img: &Image, req: &IconRequest, logical_size: i32, scale_factor: i32) {
+    let size = if logical_size <= 0 { 32 } else { logical_size };
+    let scale = scale_factor.max(1);
+    let target_size = size * scale;
+
+    let pb = resolve_icon_pixbuf(req, target_size).or_else(|| pixbuf::fallback_executable_pixbuf(target_size));
+
+    if let Some(ref square) = pb {
+        apply_pixbuf_to_image(img, square, size);
+    }
 }
 
 /// Create a new `gtk::Image` representing an application, properly scaled for HiDPI.
@@ -123,137 +233,13 @@ pub fn create_app_image_with_pid(app_id: &str, pid: Option<u32>, logical_size: i
 
 /// Update an existing `gtk::Image` widget for an application with optional process `pid` fallback.
 pub fn update_app_image_with_pid(img: &Image, app_id: &str, pid: Option<u32>, logical_size: i32, scale_factor: i32) {
-    let size = if logical_size <= 0 { 32 } else { logical_size };
-    let scale = scale_factor.max(1);
-    let load_size = size * scale;
-
-    let set_pixbuf_from_file = |path: &Path| -> bool {
-        if let Some(pixbuf) = load_file_pixbuf_fast(path, load_size) {
-            let square = normalize_pixbuf_to_size(pixbuf, load_size);
-            apply_pixbuf_to_image(img, &square, size, scale);
-            return true;
-        }
-        false
-    };
-
-    // 1. Direct absolute file path
-    let app_path = Path::new(app_id);
-    if app_path.is_absolute() && app_path.exists() && set_pixbuf_from_file(app_path) {
-        return;
-    }
-
-    // 2. Resolve via desktop entry cache + direct XDG raster `.png` lookup (zero GtkIconTheme/libglycin overhead)
-    let resolved_opt = find_app_icon(app_id);
-    if let Some(ref resolved) = resolved_opt {
-        let res_path = Path::new(resolved);
-        if res_path.is_absolute() && res_path.exists() && set_pixbuf_from_file(res_path) {
-            return;
-        }
-        if let Some(png_path) = desktop::resolve_xdg_png_icon(resolved) {
-            if set_pixbuf_from_file(&png_path) {
-                return;
-            }
-        }
-    }
-    let lower = app_id.to_lowercase();
-    for candidate in [app_id, lower.as_str()] {
-        if let Some(png_path) = desktop::resolve_xdg_png_icon(candidate) {
-            if set_pixbuf_from_file(&png_path) {
-                return;
-            }
-        }
-    }
-
-    // 3. Inspect process executable directory (`PID` -> `/proc/<pid>/exe`) for portable apps / Electron `.asar`
-    if let Some(p) = pid {
-        if let Some(square) = load_pixbuf_from_pid(p, app_id, load_size) {
-            apply_pixbuf_to_image(img, &square, size, scale);
-            return;
-        }
-    } else if let Some(safe_key) = sanitize_icon_name(app_id) {
-        if let Some(square) = lookup_cached_exe_pixbuf(&safe_key, load_size) {
-            apply_pixbuf_to_image(img, &square, size, scale);
-            return;
-        }
-    }
-
-    // 4. Generic executable fallback (in-process memory texture, never triggers GtkIconTheme/libglycin)
-    if let Some(fallback) = pixbuf::fallback_executable_pixbuf(load_size) {
-        apply_pixbuf_to_image(img, &fallback, size, scale);
-    }
+    update_image(img, &IconRequest::Window { app_id, pid }, logical_size, scale_factor);
 }
 
-/// Resolve tray icon pixbuf from all StatusNotifierItem sources.
-pub fn resolve_tray_pixbuf_scaled(
-    icon_name: Option<&str>,
-    icon_pixmap: Option<&[RawIconPixmap]>,
-    icon_theme_path: Option<&str>,
-    id: &str,
-    target_size: i32,
-) -> Option<Pixbuf> {
-    let unscaled: Option<Pixbuf> = (|| {
-        // 1. Direct ARGB32 pixmap stream from D-Bus
-        if let Some(pixmaps) = icon_pixmap {
-            if let Some(pb) = pixmap_to_pixbuf(pixmaps) {
-                return Some(pb);
-            }
-        }
-
-        // 2. Named icon lookup
-        if let Some(name) = icon_name.map(str::trim).filter(|n| !n.is_empty()) {
-            // 2a. Check icon_theme_path directory directly (must be a safe basename)
-            if let Some(safe_name) = sanitize_icon_name(name) {
-                if let Some(theme_path) = icon_theme_path.map(str::trim).filter(|p| !p.is_empty()) {
-                    let dir = Path::new(theme_path);
-                    for ext in &["", ".png", ".svg", ".ico", ".xpm", ".tga"] {
-                        let filename = format!("{safe_name}{ext}");
-                        let candidates = [
-                            dir.join(&filename),
-                            dir.join("hicolor").join("scalable").join("apps").join(&filename),
-                            dir.join("hicolor").join("48x48").join("apps").join(&filename),
-                            dir.join("hicolor").join("32x32").join("apps").join(&filename),
-                            dir.join("hicolor").join("24x24").join("apps").join(&filename),
-                            dir.join("hicolor").join("22x22").join("apps").join(&filename),
-                            dir.join("hicolor").join("16x16").join("apps").join(&filename),
-                        ];
-                        for candidate in &candidates {
-                            if candidate.exists() {
-                                if let Some(pb) = load_file_pixbuf_fast(candidate, target_size) {
-                                    return Some(pb);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2b. Check if icon_name itself is an absolute path (without traversal)
-            let path = Path::new(name);
-            if path.is_absolute() && !name.contains("..") && !name.contains('\0') && path.exists() {
-                if let Some(pb) = load_file_pixbuf_fast(path, target_size) {
-                    return Some(pb);
-                }
-            }
-
-            // 2c. Standard GTK icon theme & search paths
-            if let Some(safe_name) = sanitize_icon_name(name) {
-                if let Some(pb) = load_raw_pixbuf_at_size(&safe_name, target_size) {
-                    return Some(pb);
-                }
-            }
-        }
-
-        // 3. Fallback: Check item.id as icon name
-        if let Some(safe_id) = sanitize_icon_name(id.trim()) {
-            if let Some(pb) = load_raw_pixbuf_at_size(&safe_id, target_size) {
-                return Some(pb);
-            }
-        }
-
-        None
-    })();
-
-    unscaled.map(|pb| normalize_pixbuf_to_size(pb, target_size))
+/// Load a normalized square pixbuf directly at a target size from desktop entries, theme, or path.
+pub fn load_pixbuf_at_size(icon_key: &str, target_size: i32) -> Option<Pixbuf> {
+    let size = if target_size <= 0 { 32 } else { target_size }.min(512);
+    resolve_icon_pixbuf(&IconRequest::Named(icon_key), size).or_else(|| pixbuf::fallback_executable_pixbuf(size))
 }
 
 /// Update an existing `gtk::Image` widget for a StatusNotifierItem tray item.
@@ -266,15 +252,38 @@ pub fn update_tray_image(
     icon_size: i32,
     scale_factor: i32,
 ) {
-    let scale = scale_factor.max(1);
-    let size = if icon_size <= 0 { 22 } else { icon_size };
-    let target_size = size * scale;
+    update_image(
+        image,
+        &IconRequest::Tray {
+            name: icon_name,
+            pixmap: icon_pixmap,
+            theme_path: icon_theme_path,
+            id,
+        },
+        icon_size,
+        scale_factor,
+    );
+}
 
-    if let Some(pb) = resolve_tray_pixbuf_scaled(icon_name, icon_pixmap, icon_theme_path, id, target_size) {
-        apply_pixbuf_to_image(image, &pb, size, scale);
-    } else if let Some(fallback) = pixbuf::fallback_executable_pixbuf(target_size) {
-        apply_pixbuf_to_image(image, &fallback, size, scale);
-    }
+/// Resolve tray icon pixbuf from all StatusNotifierItem sources.
+#[cfg(test)]
+pub fn resolve_tray_pixbuf_scaled(
+    icon_name: Option<&str>,
+    icon_pixmap: Option<&[RawIconPixmap]>,
+    icon_theme_path: Option<&str>,
+    id: &str,
+    target_size: i32,
+) -> Option<Pixbuf> {
+    let size = if target_size <= 0 { 22 } else { target_size }.min(512);
+    resolve_icon_pixbuf(
+        &IconRequest::Tray {
+            name: icon_name,
+            pixmap: icon_pixmap,
+            theme_path: icon_theme_path,
+            id,
+        },
+        size,
+    )
 }
 
 #[cfg(test)]
@@ -416,5 +425,60 @@ mod tests {
                 img.storage_type()
             );
         });
+    }
+
+    #[test]
+    fn test_load_pixbuf_for_scalable_svg_app() {
+        let dir = TestTempDir::new("svg_app");
+        let svg_dir = dir.join("icons/hicolor/scalable/apps");
+        std::fs::create_dir_all(&svg_dir).unwrap();
+        let svg_path = svg_dir.join("org.example.ScalableApp.svg");
+        std::fs::write(
+            &svg_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="16" fill="purple"/></svg>"#,
+        )
+        .unwrap();
+
+        let found = desktop::resolve_xdg_icon_in_dirs("org.example.ScalableApp", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(svg_path.clone()));
+
+        let pb = pixbuf::load_file_pixbuf_fast(&svg_path, 32);
+        assert!(pb.is_some(), "Pixbuf should successfully load SVG at 32x32");
+        let square = pixbuf::normalize_pixbuf_to_size(pb.unwrap(), 32);
+        assert_eq!(square.width(), 32);
+        assert_eq!(square.height(), 32);
+    }
+
+    #[test]
+    fn test_resolve_icon_pixbuf_unified_pipeline() {
+        let dir = TestTempDir::new("ssot_test");
+        let apps_dir = dir.join("icons/hicolor/scalable/apps");
+        std::fs::create_dir_all(&apps_dir).unwrap();
+        let svg_path = apps_dir.join("test.ssot.App.svg");
+        std::fs::write(
+            &svg_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="yellow"/></svg>"#,
+        )
+        .unwrap();
+
+        // 1. Direct path request
+        let req_direct = IconRequest::Named(svg_path.to_str().unwrap());
+        let pb_direct = resolve_icon_pixbuf(&req_direct, 32);
+        assert!(pb_direct.is_some(), "SSOT should resolve direct file path");
+
+        // 2. Tray pixmap request
+        let pixmaps = vec![RawIconPixmap {
+            width: 16,
+            height: 16,
+            pixels: vec![255; 16 * 16 * 4],
+        }];
+        let req_tray = IconRequest::Tray {
+            name: None,
+            pixmap: Some(&pixmaps),
+            theme_path: None,
+            id: "tray-app",
+        };
+        let pb_tray = resolve_icon_pixbuf(&req_tray, 24);
+        assert!(pb_tray.is_some(), "SSOT should resolve tray ARGB32 pixmaps");
     }
 }

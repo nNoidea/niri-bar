@@ -362,21 +362,28 @@ mod tests {
         let mut png_bytes = Vec::new();
         surf.write_to_png(&mut png_bytes).unwrap();
 
-        let before = crate::runtime::min_thread_count();
+        let gly_before = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("comm")).ok())
+            .filter(|name| name.starts_with("gly-"))
+            .count();
+
         let pb = decode_png_bytes_to_pixbuf(&png_bytes, 24);
         assert!(pb.is_some(), "Should decode PNG via cairo in-process");
         let pb = pb.unwrap();
         assert_eq!(pb.width(), 24);
         assert_eq!(pb.height(), 24);
 
-        let has_glycin_thread = std::fs::read_dir("/proc/self/task")
+        let gly_after = std::fs::read_dir("/proc/self/task")
             .unwrap()
             .flatten()
             .filter_map(|e| std::fs::read_to_string(e.path().join("comm")).ok())
-            .any(|name| name.starts_with("gly-"));
-        assert!(
-            !has_glycin_thread,
-            "Decoding PNG via cairo must not spawn any glycin threads (threads before: {before})"
+            .filter(|name| name.starts_with("gly-"))
+            .count();
+        assert_eq!(
+            gly_after, gly_before,
+            "Decoding PNG via cairo must not spawn any new glycin threads (before: {gly_before}, after: {gly_after})"
         );
     }
 
