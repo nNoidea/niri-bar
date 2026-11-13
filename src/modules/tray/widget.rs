@@ -1,7 +1,9 @@
+use futures_util::future::{select, Either};
 use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Button, Image, Label, Orientation, Popover, Separator, Window};
 use std::collections::HashMap;
+use std::pin::pin;
 use std::sync::Arc;
 
 use super::protocol::clean_menu_label;
@@ -14,6 +16,13 @@ use crate::modules::enable_hover_cursor;
 
 pub struct TrayWidget {
     pub container: GtkBox,
+    #[cfg(test)]
+    scale_tx: async_channel::Sender<i32>,
+}
+
+enum TrayLoopEvent {
+    Service(TrayEvent),
+    Scale(i32),
 }
 
 impl TrayWidget {
@@ -23,6 +32,7 @@ impl TrayWidget {
         position: BarPosition,
         icon_size: i32,
         spacing: i32,
+        initial_scale: i32,
     ) -> Self {
         let container = GtkBox::new(orientation, spacing);
         container.add_css_class("tray");
@@ -30,54 +40,110 @@ impl TrayWidget {
         container.set_valign(gtk::Align::Center);
 
         let icon_sz = if icon_size <= 0 { 22 } else { icon_size };
+        let mut current_scale = initial_scale.max(1);
         let (rx, initial_items) = tray_service.subscribe();
+        let (scale_tx, scale_rx) = async_channel::unbounded::<i32>();
         let service = Arc::clone(tray_service);
-        let container_clone = container.clone();
 
         let mut buttons: HashMap<String, (Button, Image)> = HashMap::new();
 
         // Add all existing items from the service snapshot for this monitor
         for (key, item, _) in initial_items {
-            let (btn, img) = Self::create_button(&key, &item, icon_sz, &service, position);
-            container_clone.append(&btn);
+            let (btn, img) = Self::create_button(&key, &item, icon_sz, current_scale, &service, position);
+            container.append(&btn);
             buttons.insert(key, (btn, img));
         }
 
-        // Listen for live tray events for this specific bar/monitor
-        let service_events = Arc::clone(&service);
-        let rx_for_destroy = rx.clone();
-        container.connect_destroy(move |_| {
-            rx_for_destroy.close();
+        #[cfg(test)]
+        let scale_tx_notify = scale_tx.clone();
+        #[cfg(not(test))]
+        let scale_tx_notify = scale_tx;
+        container.connect_scale_factor_notify(move |c| {
+            let _ = scale_tx_notify.try_send(c.scale_factor().max(1));
         });
 
+        // Listen for live tray events and dynamic scale changes for this specific bar/monitor
+        let service_events = Arc::clone(&service);
+        let rx_for_destroy = rx.clone();
+        let scale_rx_for_destroy = scale_rx.clone();
+        container.connect_destroy(move |_| {
+            rx_for_destroy.close();
+            scale_rx_for_destroy.close();
+        });
+
+        let container_weak = container.downgrade();
         glib::MainContext::default().spawn_local(async move {
-            while let Ok(msg) = rx.recv().await {
-                match msg {
-                    TrayEvent::Add(key, item) => {
+            loop {
+                let next = {
+                    let svc_fut = pin!(rx.recv());
+                    let scale_fut = pin!(scale_rx.recv());
+                    match select(svc_fut, scale_fut).await {
+                        Either::Left((res, _)) => match res {
+                            Ok(ev) => Some(TrayLoopEvent::Service(ev)),
+                            Err(_) => None,
+                        },
+                        Either::Right((res, _)) => match res {
+                            Ok(s) => Some(TrayLoopEvent::Scale(s)),
+                            Err(_) => None,
+                        },
+                    }
+                };
+                let Some(ev) = next else {
+                    break;
+                };
+                let Some(cont) = container_weak.upgrade() else {
+                    break;
+                };
+                match ev {
+                    TrayLoopEvent::Service(TrayEvent::Add(key, item)) => {
                         if let Some((old_btn, _)) = buttons.remove(&key) {
-                            container_clone.remove(&old_btn);
+                            cont.remove(&old_btn);
                         }
-                        let (btn, img) = Self::create_button(&key, &item, icon_sz, &service_events, position);
-                        container_clone.append(&btn);
+                        let (btn, img) =
+                            Self::create_button(&key, &item, icon_sz, current_scale, &service_events, position);
+                        cont.append(&btn);
                         buttons.insert(key, (btn, img));
                     }
-                    TrayEvent::Update(key, item) => {
+                    TrayLoopEvent::Service(TrayEvent::Update(key, item)) => {
                         if let Some((button, image)) = buttons.get(&key) {
-                            Self::update_item_icon(image, &item, icon_sz);
+                            Self::update_item_icon(image, &item, icon_sz, current_scale);
                             let tooltip_text = Self::compute_tooltip(item.title.as_deref(), item.tool_tip.as_ref());
                             button.set_tooltip_text(tooltip_text.as_deref());
                         }
                     }
-                    TrayEvent::Remove(key) => {
+                    TrayLoopEvent::Service(TrayEvent::Remove(key)) => {
                         if let Some((btn, _)) = buttons.remove(&key) {
-                            container_clone.remove(&btn);
+                            cont.remove(&btn);
+                        }
+                    }
+                    TrayLoopEvent::Scale(new_scale) => {
+                        let clamped = new_scale.max(1);
+                        if clamped != current_scale {
+                            current_scale = clamped;
+                            for (key, (_, image)) in &buttons {
+                                if let (Some(item), _) = service_events.get_item_and_menu(key) {
+                                    Self::update_item_icon(image, &item, icon_sz, current_scale);
+                                }
+                            }
                         }
                     }
                 }
             }
+            rx.close();
+            scale_rx.close();
         });
 
-        Self { container }
+        Self {
+            container,
+            #[cfg(test)]
+            scale_tx,
+        }
+    }
+
+    /// Update the active HiDPI scale factor used for tray icon rendering.
+    #[cfg(test)]
+    pub fn set_scale_factor(&self, scale: i32) {
+        let _ = self.scale_tx.try_send(scale.max(1));
     }
 
     pub fn compute_tooltip(title: Option<&str>, tooltip: Option<&TrayTooltip>) -> Option<String> {
@@ -120,6 +186,7 @@ impl TrayWidget {
         key: &str,
         item: &TrayItem,
         icon_size: i32,
+        scale_factor: i32,
         service: &Arc<TrayService>,
         position: BarPosition,
     ) -> (Button, Image) {
@@ -138,7 +205,7 @@ impl TrayWidget {
         image.set_valign(gtk::Align::Center);
         image.set_pixel_size(icon_size);
         image.set_size_request(icon_size, icon_size);
-        Self::update_item_icon(&image, item, icon_size);
+        Self::update_item_icon(&image, item, icon_size, scale_factor);
 
         let tooltip_text = Self::compute_tooltip(item.title.as_deref(), item.tool_tip.as_ref());
         button.set_tooltip_text(tooltip_text.as_deref());
@@ -319,8 +386,7 @@ impl TrayWidget {
         popover.popup();
     }
 
-    fn update_item_icon(image: &Image, item: &TrayItem, icon_size: i32) {
-        let scale = image.scale_factor().max(1);
+    fn update_item_icon(image: &Image, item: &TrayItem, icon_size: i32, scale_factor: i32) {
         update_tray_image(
             image,
             item.icon_name.as_deref(),
@@ -328,7 +394,7 @@ impl TrayWidget {
             item.icon_theme_path.as_deref(),
             &item.id,
             icon_size,
-            scale,
+            scale_factor.max(1),
         );
     }
 }
@@ -594,6 +660,165 @@ mod tests {
             TrayWidget::popup_tray_menu(&btn, &pop2, BarPosition::Left);
             assert!(!pop1.is_visible());
             assert!(!pop2.is_visible());
+        });
+    }
+
+    #[test]
+    fn test_tray_widget_destroys_and_unsubscribes_on_window_close() {
+        crate::util::run_gtk_test(|| {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let svc = Arc::new(TrayService::new_for_test());
+            svc.insert_test_item(
+                "org.example.TrayApp/StatusNotifierItem".to_string(),
+                TrayItem {
+                    bus_name: "org.example.TrayApp".to_string(),
+                    object_path: "/StatusNotifierItem".to_string(),
+                    id: "org.example.TrayApp".to_string(),
+                    title: Some("Example".to_string()),
+                    icon_name: None,
+                    icon_pixmap: None,
+                    icon_theme_path: None,
+                    tool_tip: None,
+                    item_is_menu: false,
+                    menu_path: None,
+                },
+            );
+
+            let tray = TrayWidget::new(&svc, Orientation::Vertical, BarPosition::Left, 22, 4, 1);
+            assert_eq!(svc.subscriber_count(), 1);
+            let children = crate::util::widget_children(&tray.container);
+            assert_eq!(children.len(), 1);
+
+            let container_destroyed = Rc::new(Cell::new(false));
+            let btn_destroyed = Rc::new(Cell::new(false));
+            let c_flag = Rc::clone(&container_destroyed);
+            let b_flag = Rc::clone(&btn_destroyed);
+            tray.container.connect_destroy(move |_| c_flag.set(true));
+            children[0].connect_destroy(move |_| b_flag.set(true));
+            drop(children);
+
+            let win = Window::new();
+            win.set_child(Some(&tray.container));
+            drop(tray);
+            win.set_visible(true);
+            win.close();
+            drop(win);
+
+            let ctx = glib::MainContext::default();
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
+
+            assert!(container_destroyed.get(), "Tray container must emit destroy on close");
+            assert!(btn_destroyed.get(), "Tray button must emit destroy without ref cycle");
+            assert_eq!(
+                svc.subscriber_count(),
+                0,
+                "TrayWidget subscriber channel must close when container is destroyed"
+            );
+        });
+    }
+
+    #[test]
+    fn test_tray_widget_uses_explicit_scale_and_updates_on_scale_change() {
+        crate::util::run_gtk_test(|| {
+            let svc = Arc::new(TrayService::new_for_test());
+            let pixmap = crate::icon::RawIconPixmap {
+                width: 44,
+                height: 44,
+                pixels: vec![255; 44 * 44 * 4],
+            };
+            svc.insert_test_item(
+                "org.example.ScaleTray/StatusNotifierItem".to_string(),
+                TrayItem {
+                    bus_name: "org.example.ScaleTray".to_string(),
+                    object_path: "/StatusNotifierItem".to_string(),
+                    id: "org.example.ScaleTray".to_string(),
+                    title: Some("Scale Tray".to_string()),
+                    icon_name: None,
+                    icon_pixmap: Some(vec![pixmap]),
+                    icon_theme_path: None,
+                    tool_tip: None,
+                    item_is_menu: false,
+                    menu_path: None,
+                },
+            );
+
+            let tray_1x = TrayWidget::new(&svc, Orientation::Vertical, BarPosition::Left, 22, 4, 1);
+            let btn_1x = crate::util::widget_children(&tray_1x.container)
+                .into_iter()
+                .next()
+                .unwrap()
+                .downcast::<Button>()
+                .unwrap();
+            let img_1x = btn_1x.child().unwrap().downcast::<Image>().unwrap();
+            assert_eq!(img_1x.pixel_size(), 22);
+            assert_eq!(
+                img_1x.paintable().unwrap().intrinsic_width(),
+                22,
+                "TrayWidget initialized with scale 1 must render 22px icon buffer even before map"
+            );
+
+            let tray_2x = TrayWidget::new(&svc, Orientation::Vertical, BarPosition::Left, 22, 4, 2);
+            let btn_2x = crate::util::widget_children(&tray_2x.container)
+                .into_iter()
+                .next()
+                .unwrap()
+                .downcast::<Button>()
+                .unwrap();
+            let img_2x = btn_2x.child().unwrap().downcast::<Image>().unwrap();
+            assert_eq!(img_2x.pixel_size(), 22);
+            assert_eq!(
+                img_2x.paintable().unwrap().intrinsic_width(),
+                44,
+                "TrayWidget initialized with scale 2 must render 44px icon buffer even before map"
+            );
+
+            // Attach containers so window close emits destroy and closes async channels cleanly.
+            let win_1x = Window::new();
+            win_1x.set_child(Some(&tray_1x.container));
+            let win_2x = Window::new();
+            win_2x.set_child(Some(&tray_2x.container));
+
+            // Dynamic scale transition 1 -> 2 must re-render existing tray buttons at 44px
+            tray_1x.set_scale_factor(2);
+            let ctx = glib::MainContext::default();
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
+            assert_eq!(img_1x.pixel_size(), 22);
+            assert_eq!(
+                img_1x.paintable().unwrap().intrinsic_width(),
+                44,
+                "TrayWidget scale transition 1 -> 2 must refresh existing icon buffer to 44px"
+            );
+
+            // Dynamic scale transition 2 -> 1 must re-render back down to 22px
+            tray_1x.set_scale_factor(1);
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
+            assert_eq!(
+                img_1x.paintable().unwrap().intrinsic_width(),
+                22,
+                "TrayWidget scale transition 2 -> 1 must refresh existing icon buffer back to 22px"
+            );
+
+            win_1x.close();
+            win_2x.close();
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
         });
     }
 }

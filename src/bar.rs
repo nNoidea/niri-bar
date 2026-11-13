@@ -227,15 +227,19 @@ impl ErrorBadge {
         button.set_child(Some(&label));
 
         let err_clone = std::rc::Rc::clone(&current_error);
-        let err_lbl_clone = label.clone();
+        let err_lbl_weak = label.downgrade();
         button.connect_clicked(move |_| {
             if let Some(err) = err_clone.borrow().as_ref() {
                 copy_to_clipboard(err);
-                err_lbl_clone.set_markup(ERROR_LABEL_COPIED_MARKUP);
-                let lbl = err_lbl_clone.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-                    lbl.set_markup(ERROR_LABEL_MARKUP);
-                });
+                if let Some(err_lbl) = err_lbl_weak.upgrade() {
+                    err_lbl.set_markup(ERROR_LABEL_COPIED_MARKUP);
+                    let lbl_weak = err_lbl.downgrade();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                        if let Some(lbl) = lbl_weak.upgrade() {
+                            lbl.set_markup(ERROR_LABEL_MARKUP);
+                        }
+                    });
+                }
             }
         });
 
@@ -333,12 +337,14 @@ impl BarWindow {
             start_box.set_halign(gtk::Align::Start);
             start_box.set_valign(gtk::Align::Fill);
         }
+        let initial_scale = monitor.scale_factor().max(1);
         let taskbar = TaskbarWidget::new(
             box_orient,
             config.spacing,
             config.position,
             config.size,
             niri.update_tx.clone(),
+            initial_scale,
         );
         overlay.set_child(Some(&start_box));
 
@@ -367,6 +373,7 @@ impl BarWindow {
                     config.position,
                     config.tray.icon_size,
                     config.tray.spacing,
+                    initial_scale,
                 );
                 container.append(&tray_w.container);
             }

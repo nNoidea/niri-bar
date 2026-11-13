@@ -503,6 +503,44 @@ fn release_drag_cursor_grab() {
     DRAG_CURSOR_GRAB.with(|g| g.set(false));
 }
 
+/// Scale an existing `gdk::Texture` to an exact square `(size, size)` logical
+/// cursor texture so HiDPI (`scale_factor >= 2`) button textures are not
+/// rendered oversized by `gdk::Cursor::from_texture`.
+fn scale_texture_to_square(texture: &gdk::Texture, size: i32) -> Option<gdk::Texture> {
+    if size <= 0 {
+        return None;
+    }
+    let w = texture.width();
+    let h = texture.height();
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    if w == size && h == size {
+        return Some(texture.clone());
+    }
+
+    let src_stride = cairo::Format::ARgb32.stride_for_width(w as u32).ok()? as usize;
+    let src_len = src_stride.checked_mul(h as usize)?;
+    let mut src_bytes = vec![0u8; src_len];
+    texture.download(&mut src_bytes, src_stride);
+
+    let src_surface =
+        cairo::ImageSurface::create_for_data(src_bytes, cairo::Format::ARgb32, w, h, src_stride as i32).ok()?;
+    let dst_surface = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size).ok()?;
+    {
+        let cr = cairo::Context::new(&dst_surface).ok()?;
+        cr.scale(f64::from(size) / f64::from(w), f64::from(size) / f64::from(h));
+        cr.set_source_surface(&src_surface, 0.0, 0.0).ok()?;
+        cr.source().set_filter(cairo::Filter::Bilinear);
+        cr.paint().ok()?;
+    }
+    dst_surface.flush();
+    let dst_stride = dst_surface.stride() as usize;
+    let dst_data = dst_surface.take_data().ok()?;
+    let bytes = glib::Bytes::from(&*dst_data);
+    Some(gdk::MemoryTexture::new(size, size, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, dst_stride).upcast())
+}
+
 pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Option<&Button>) {
     let size = if size <= 0 { 20 } else { size };
     let texture_opt = source_button
@@ -510,6 +548,7 @@ pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Opti
         .and_then(|c| c.downcast::<gtk::Image>().ok())
         .and_then(|img| img.paintable())
         .and_then(|p| p.downcast::<gdk::Texture>().ok())
+        .and_then(|tex| scale_texture_to_square(&tex, size))
         .or_else(|| crate::icon::load_pixbuf_at_size(icon_key, size).map(|pb| gdk::Texture::for_pixbuf(&pb)));
 
     if let Some(texture) = texture_opt {
@@ -1139,6 +1178,14 @@ mod tests {
                 assert!(has_legacy, "Overlay must have Capture-phase EventControllerLegacy");
                 assert!(has_click, "Overlay must have Capture-phase GestureClick on button 0");
                 assert!(has_key, "Overlay must have EventControllerKey for Escape");
+                if crate::layer_shell::is_available() {
+                    use crate::layer_shell::LayerShell;
+                    assert_eq!(
+                        overlay.keyboard_mode(),
+                        crate::layer_shell::KeyboardMode::Exclusive,
+                        "Drag overlay must request Exclusive keyboard mode so Escape cancels active drags"
+                    );
+                }
             });
 
             // Verify that applying drag cursor sets cursor on overlay window and its surface
@@ -1158,6 +1205,50 @@ mod tests {
             close_overlay_windows();
             let remaining = OVERLAY_WINDOWS.with(|cell| cell.borrow().len());
             assert_eq!(remaining, 0, "Overlay windows must be emptied on close");
+        });
+    }
+
+    #[test]
+    fn test_drag_cursor_downsamples_hidpi_button_texture() {
+        crate::util::run_gtk_test(|| {
+            struct Teardown;
+            impl Drop for Teardown {
+                fn drop(&mut self) {
+                    reset_all_cursors_and_overlay(None);
+                }
+            }
+            let _guard = Teardown;
+
+            let win = Window::new();
+            let source_btn = Button::new();
+            // Simulate a 2x HiDPI icon texture (48x48 pixels for a 24px logical icon size)
+            // with distinct RGBA channels (R=0xE0, G=0x20, B=0x10, A=0xFF) to verify zero B/R swap.
+            let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 48, 48).unwrap();
+            pb.fill(0xE020_10FF);
+            let texture = gdk::Texture::for_pixbuf(&pb);
+            let img = gtk::Image::from_paintable(Some(&texture));
+            source_btn.set_child(Some(&img));
+            win.set_child(Some(&source_btn));
+            win.set_visible(true);
+            gtk::prelude::WidgetExt::realize(&win);
+
+            apply_drag_cursor_globally("org.example.App", 24, Some(&source_btn));
+
+            let cursor = source_btn.cursor().expect("Drag cursor must be set");
+            assert_eq!(
+                (cursor.hotspot_x(), cursor.hotspot_y()),
+                (12, 12),
+                "Drag cursor from 2x HiDPI button texture must scale to 24x24 logical px (hotspot 12,12)"
+            );
+            if let Some(tex) = cursor.texture() {
+                assert_eq!((tex.width(), tex.height()), (24, 24));
+                let mut bgra = vec![0u8; 24 * 24 * 4];
+                tex.download(&mut bgra, 24 * 4);
+                // B8G8R8A8_PREMULTIPLIED center pixel: B=0x10, G=0x20, R=0xE0, A=0xFF
+                let idx = (12 * 24 + 12) * 4;
+                assert_eq!(&bgra[idx..idx + 4], &[0x10, 0x20, 0xE0, 0xFF]);
+            }
+            win.close();
         });
     }
 }

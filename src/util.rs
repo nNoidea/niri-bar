@@ -95,13 +95,45 @@ pub fn reorder_box_child(container: &gtk::Box, child: &impl gtk::prelude::IsA<gt
     }
 }
 
+/// Translate `(x, y)` from `from` widget coordinates into `to` widget coordinates.
+pub fn widget_translate_coords(
+    from: &impl gtk::prelude::WidgetExt,
+    to: &impl gtk::prelude::WidgetExt,
+    x: f64,
+    y: f64,
+) -> Option<(f64, f64)> {
+    let pt = gtk::graphene::Point::new(x as f32, y as f32);
+    from.compute_point(to, &pt)
+        .map(|p| (f64::from(p.x()), f64::from(p.y())))
+}
+
 /// Translate widget-local `(x, y)` coordinates into the widget's toplevel (`root`) surface space.
 pub fn widget_to_toplevel_coords(widget: &impl gtk::prelude::WidgetExt, x: f64, y: f64) -> (f64, f64) {
     if let Some(root) = widget.root() {
-        widget.translate_coordinates(&root, x, y).unwrap_or((x, y))
+        widget_translate_coords(widget, &root, x, y).unwrap_or((x, y))
     } else {
         (x, y)
     }
+}
+
+/// Compute `(x, y, width, height)` bounds of `widget` relative to `target`.
+/// Returns `None` if `widget` has not been allocated (`width <= 0 && height <= 0`)
+/// or shares no ancestor with `target`.
+pub fn widget_bounds_in(
+    widget: &impl gtk::prelude::WidgetExt,
+    target: &impl gtk::prelude::WidgetExt,
+) -> Option<(i32, i32, i32, i32)> {
+    if widget.width() <= 0 && widget.height() <= 0 {
+        return None;
+    }
+    widget.compute_bounds(target).map(|r| {
+        (
+            r.x().round() as i32,
+            r.y().round() as i32,
+            r.width().round() as i32,
+            r.height().round() as i32,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -177,8 +209,32 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestoreGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.vars.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_ensure_cairo_renderer_defaults_to_cairo() {
+        let _lock = lock(&ENV_TEST_LOCK);
+        let _restore = EnvRestoreGuard {
+            vars: vec![
+                ("GSK_RENDERER", std::env::var_os("GSK_RENDERER")),
+                ("GTK_A11Y", std::env::var_os("GTK_A11Y")),
+            ],
+        };
         ensure_cairo_renderer();
         let val = std::env::var("GSK_RENDERER").unwrap_or_default();
         assert!(!val.is_empty());
@@ -245,11 +301,74 @@ mod tests {
 
     #[test]
     fn test_ensure_cairo_renderer_sets_defaults() {
+        let _lock = lock(&ENV_TEST_LOCK);
+        let _restore = EnvRestoreGuard {
+            vars: vec![
+                ("GSK_RENDERER", std::env::var_os("GSK_RENDERER")),
+                ("GTK_A11Y", std::env::var_os("GTK_A11Y")),
+            ],
+        };
         std::env::remove_var("GSK_RENDERER");
         std::env::remove_var("GTK_A11Y");
         ensure_cairo_renderer();
         assert_eq!(std::env::var("GSK_RENDERER").as_deref(), Ok("cairo"));
         assert_eq!(std::env::var("GTK_A11Y").as_deref(), Ok("none"));
+    }
+
+    #[test]
+    fn test_widget_bounds_and_translate_coords() {
+        run_gtk_test(|| {
+            use gtk::prelude::*;
+
+            let win = gtk::Window::new();
+            win.set_default_size(200, 300);
+            let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            spacer.set_size_request(40, 50);
+            let inner = gtk::Box::new(gtk::Orientation::Vertical, 10);
+            let b1 = gtk::Button::new();
+            b1.set_size_request(40, 30);
+            let b2 = gtk::Button::new();
+            b2.set_size_request(40, 30);
+
+            inner.append(&b1);
+            inner.append(&b2);
+            outer.append(&spacer);
+            outer.append(&inner);
+            win.set_child(Some(&outer));
+            // Before layout/map, unallocated child reports None rather than GTK's (-5,-5,10,10) stub.
+            assert_eq!(widget_bounds_in(&b1, &inner), None);
+
+            win.present();
+
+            let ctx = glib::MainContext::default();
+            for _ in 0..50 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+                if b1.height() > 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let (_, y1, _, h1) = widget_bounds_in(&b1, &inner).expect("b1 bounds in inner");
+            let (_, y2, _, h2) = widget_bounds_in(&b2, &inner).expect("b2 bounds in inner");
+            assert_eq!(y1, 0);
+            assert!(h1 >= 30);
+            assert_eq!(y2, y1 + h1 + 10);
+            assert!(h2 >= 30);
+
+            let (_, inner_top_in_win) = widget_to_toplevel_coords(&inner, 0.0, 0.0);
+            let (bx0, by0) = widget_translate_coords(&b2, &inner, 0.0, 0.0).expect("b2 origin in inner");
+            let (bx5, by5) = widget_translate_coords(&b2, &inner, 0.0, 5.0).expect("b2 +5 in inner");
+            assert!((bx5 - bx0).abs() < 0.5);
+            assert!((by5 - (by0 + 5.0)).abs() < 0.5);
+            assert!(by0 >= f64::from(y2));
+            assert!(inner_top_in_win >= 50.0);
+
+            win.close();
+        });
     }
 
     #[test]

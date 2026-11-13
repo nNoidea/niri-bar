@@ -171,7 +171,7 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
 
                         if let Ok(mut bars) = ctx.bars.try_borrow_mut() {
                             for b in bars.drain(..) {
-                                b.window.hide();
+                                b.window.set_visible(false);
                                 b.window.close();
                             }
                         }

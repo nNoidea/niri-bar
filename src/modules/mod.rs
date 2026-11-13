@@ -234,6 +234,7 @@ impl ModuleCore {
 
     pub fn shutdown(&self) {
         self.stop_signal.stop();
+        crate::util::lock(&self.subscribers).clear();
     }
 
     pub fn notify(&self) {
@@ -242,6 +243,14 @@ impl ModuleCore {
 
     pub fn is_stopped(&self) -> bool {
         self.stop_signal.is_stopped()
+    }
+
+    #[cfg(test)]
+    pub fn subscriber_count(&self) -> usize {
+        crate::util::lock(&self.subscribers)
+            .iter()
+            .filter(|(tx, _)| !tx.is_closed())
+            .count()
     }
 
     pub async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
@@ -495,9 +504,11 @@ pub fn update_button_cursor(button: &Button) {
 pub fn enable_hover_cursor(button: &Button) {
     update_button_cursor(button);
     let motion = gtk::EventControllerMotion::new();
-    let btn_enter = button.clone();
+    let btn_weak = button.downgrade();
     motion.connect_enter(move |_, _, _| {
-        update_button_cursor(&btn_enter);
+        if let Some(btn) = btn_weak.upgrade() {
+            update_button_cursor(&btn);
+        }
     });
     button.add_controller(motion);
 }
@@ -549,13 +560,17 @@ impl ModuleWidget {
             rx_destroy.close();
         });
 
-        let label_clone = label;
-        let button_clone = button.clone();
+        let label_weak = label.downgrade();
+        let button_weak = button.downgrade();
         let module_name = module.name();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(state) = rx.recv().await {
-                Self::apply_state(&button_clone, &label_clone, &state, module_name, orientation);
+                let (Some(btn), Some(lbl)) = (button_weak.upgrade(), label_weak.upgrade()) else {
+                    rx.close();
+                    break;
+                };
+                Self::apply_state(&btn, &lbl, &state, module_name, orientation);
             }
         });
 
@@ -1057,5 +1072,110 @@ mod tests {
             final_rss,
             diff_kb
         );
+    }
+
+    #[test]
+    fn test_enable_hover_cursor_no_ref_cycle() {
+        crate::util::run_gtk_test(|| {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let destroyed = Rc::new(Cell::new(false));
+            let win = gtk::Window::new();
+            let bx = gtk::Box::new(Orientation::Horizontal, 0);
+            let btn = Button::new();
+            enable_hover_cursor(&btn);
+
+            let d_flag = Rc::clone(&destroyed);
+            btn.connect_destroy(move |_| d_flag.set(true));
+
+            bx.append(&btn);
+            win.set_child(Some(&bx));
+            win.set_visible(true);
+
+            drop(btn);
+            drop(bx);
+            win.close();
+            drop(win);
+
+            let ctx = glib::MainContext::default();
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
+
+            assert!(
+                destroyed.get(),
+                "Button with enable_hover_cursor must emit destroy on window close without a reference cycle"
+            );
+        });
+    }
+
+    struct DummyModule {
+        core: ModuleCore,
+    }
+
+    impl BarModule for DummyModule {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+        fn current_state(&self, _orientation: Orientation) -> ModuleState {
+            ModuleState {
+                icon: None,
+                text: Some("ok".to_string()),
+                tooltip: None,
+                css_classes: Vec::new(),
+            }
+        }
+        fn core(&self) -> &ModuleCore {
+            &self.core
+        }
+        fn handle_scroll(&self, _direction: ScrollDirection) {}
+    }
+
+    #[test]
+    fn test_module_widget_destroys_and_unsubscribes_on_window_close() {
+        crate::util::run_gtk_test(|| {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let module = Arc::new(DummyModule {
+                core: ModuleCore::new(),
+            });
+            let destroyed = Rc::new(Cell::new(false));
+
+            let win = gtk::Window::new();
+            let bx = gtk::Box::new(Orientation::Horizontal, 0);
+            let widget = ModuleWidget::new(Arc::clone(&module) as Arc<dyn BarModule>, Orientation::Vertical);
+            let d_flag = Rc::clone(&destroyed);
+            widget.button.connect_destroy(move |_| d_flag.set(true));
+
+            assert_eq!(module.core.subscriber_count(), 1);
+
+            bx.append(&widget.button);
+            drop(widget);
+            win.set_child(Some(&bx));
+            win.set_visible(true);
+            drop(bx);
+
+            win.close();
+            drop(win);
+
+            let ctx = glib::MainContext::default();
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
+
+            assert!(
+                destroyed.get(),
+                "ModuleWidget button must emit destroy when its bar window closes"
+            );
+            assert_eq!(
+                module.core.subscriber_count(),
+                0,
+                "ModuleWidget subscriber channel must close when widget is destroyed"
+            );
+        });
     }
 }

@@ -314,30 +314,13 @@ popover.tray-menu:backdrop {
     color: #585b70;
 }
 
-separator,
-separator.horizontal,
+.tray-menu separator,
+.tray-menu separator.horizontal,
 .tray-menu-separator {
     background-color: #45475a;
     min-height: 1px;
     margin: 2px 4px;
     padding: 0;
-}
-
-checkbutton.tray-menu-check check {
-    min-width: 10px;
-    min-height: 10px;
-    border: 1px solid #585b70;
-    border-radius: 2px;
-    background-color: #313244;
-    color: transparent;
-    margin-right: 5px;
-    padding: 0;
-}
-
-checkbutton.tray-menu-check check:checked {
-    background-color: #89b4fa;
-    border-color: #89b4fa;
-    color: #1e1e2e;
 }
 
 @keyframes blink {

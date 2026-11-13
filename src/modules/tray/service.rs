@@ -126,6 +126,29 @@ impl TrayService {
             (None, None)
         }
     }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let (act_tx, _act_rx) = tokio::sync::mpsc::channel::<ActivateRequest>(16);
+        Self {
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            act_tx,
+            items: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn insert_test_item(&self, key: String, item: TrayItem) {
+        crate::util::lock(&self.items).insert(key, (item, None));
+    }
+
+    #[cfg(test)]
+    pub fn subscriber_count(&self) -> usize {
+        crate::util::lock(&self.subscribers)
+            .iter()
+            .filter(|tx| !tx.is_closed())
+            .count()
+    }
 }
 
 /// One live session-bus connection: watcher, probes, NameOwnerChanged.

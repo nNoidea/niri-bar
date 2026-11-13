@@ -27,6 +27,16 @@ pub struct TaskbarWidget {
     pub bar_position: crate::config::BarPosition,
     pub bar_size: i32,
     pub viewport: Rc<RefCell<TaskbarViewport>>,
+    effective_scale: Rc<Cell<i32>>,
+    #[cfg(test)]
+    update_tx: async_channel::Sender<()>,
+}
+
+fn apply_effective_scale(effective_scale: &Cell<i32>, update_tx: &async_channel::Sender<()>, scale: i32) {
+    let clamped = scale.max(1);
+    if effective_scale.replace(clamped) != clamped {
+        crate::util::nudge(update_tx);
+    }
 }
 
 /// Active workspace per output: focused > active > any. Pure for testing.
@@ -248,6 +258,7 @@ impl TaskbarWidget {
         bar_position: crate::config::BarPosition,
         bar_size: i32,
         update_tx: async_channel::Sender<()>,
+        initial_scale: i32,
     ) -> Self {
         let container = GtkBox::new(orientation, spacing);
         container.add_css_class("taskbar");
@@ -255,7 +266,7 @@ impl TaskbarWidget {
         let viewport = Rc::new(RefCell::new(TaskbarViewport::new()));
 
         let vp_scroll = Rc::clone(&viewport);
-        let tx_clone = update_tx;
+        let tx_clone = update_tx.clone();
         let is_vert = orientation == Orientation::Vertical;
 
         let scroll = gtk::EventControllerScroll::new(
@@ -287,6 +298,16 @@ impl TaskbarWidget {
         });
         container.add_controller(scroll);
 
+        let effective_scale = Rc::new(Cell::new(initial_scale.max(1)));
+        let scale_cell = Rc::clone(&effective_scale);
+        #[cfg(test)]
+        let tx_scale = update_tx.clone();
+        #[cfg(not(test))]
+        let tx_scale = update_tx;
+        container.connect_scale_factor_notify(move |c| {
+            apply_effective_scale(&scale_cell, &tx_scale, c.scale_factor());
+        });
+
         Self {
             container,
             active_widgets,
@@ -294,7 +315,16 @@ impl TaskbarWidget {
             bar_position,
             bar_size,
             viewport,
+            effective_scale,
+            #[cfg(test)]
+            update_tx,
         }
+    }
+
+    /// Update the active HiDPI scale factor and nudge the reconcile loop when changed.
+    #[cfg(test)]
+    pub fn set_scale_factor(&self, scale: i32) {
+        apply_effective_scale(&self.effective_scale, &self.update_tx, scale);
     }
 
     pub fn reconcile(
@@ -352,8 +382,7 @@ impl TaskbarWidget {
                             let rel_mon_y = drag.current_global_y - mon_y;
 
                             let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
-                                self.container
-                                    .translate_coordinates(&root, 0.0, 0.0)
+                                crate::util::widget_translate_coords(&self.container, &root, 0.0, 0.0)
                                     .unwrap_or((0.0, 0.0))
                             } else {
                                 (0.0, 0.0)
@@ -370,14 +399,15 @@ impl TaskbarWidget {
 
                             let mut slot = non_preview.len();
                             for (i, child) in non_preview.iter().enumerate() {
-                                let alloc = child.allocation();
+                                let (ax, ay, aw, ah) =
+                                    crate::util::widget_bounds_in(*child, &self.container).unwrap_or((0, 0, 0, 0));
                                 if is_vertical {
-                                    if rel_container_y < (alloc.y() + alloc.height()) as f64 {
+                                    if rel_container_y < (ay + ah) as f64 {
                                         slot = i;
                                         break;
                                     }
                                 } else {
-                                    if rel_container_x < (alloc.x() + alloc.width()) as f64 {
+                                    if rel_container_x < (ax + aw) as f64 {
                                         slot = i;
                                         break;
                                     }
@@ -452,7 +482,7 @@ impl TaskbarWidget {
         let any_locally_dragging = drag_snapshot
             .as_ref()
             .is_some_and(|d| d.is_dragging && d.source_output == *current_output && d.target_output.is_none());
-        let scale_factor = self.container.scale_factor().max(1);
+        let scale_factor = self.effective_scale.get().max(1);
         for (idx, window) in visible_windows.iter().enumerate() {
             let win_id = window.id;
             let icon_key = window
@@ -722,7 +752,8 @@ impl TaskbarWidget {
                                 if !is_cross_monitor {
                                     if let Some(parent) = b.parent().and_then(|p| p.downcast::<GtkBox>().ok()) {
                                         let (rel_x, rel_y) =
-                                            b.translate_coordinates(&parent, evt_x, evt_y).unwrap_or((0.0, 0.0));
+                                            crate::util::widget_translate_coords(&b, &parent, evt_x, evt_y)
+                                                .unwrap_or((0.0, 0.0));
                                         update_local_drag_reorder(
                                             &parent,
                                             &b,
@@ -746,12 +777,13 @@ impl TaskbarWidget {
 
                 let seq_cancelled_end = Rc::clone(&seq_cancelled);
                 let niri_tx_release = niri_tx;
-                let b_release = button.clone();
+                let btn_end_weak = button.downgrade();
                 drag_gesture.connect_drag_end(move |_, _, _| {
+                    let b_release = btn_end_weak.upgrade();
                     crate::niri::drag::handle_source_gesture_end(
                         window_id,
                         seq_cancelled_end.get(),
-                        Some(&b_release),
+                        b_release.as_ref(),
                         &niri_tx_release,
                     );
                 });
@@ -785,9 +817,7 @@ impl TaskbarWidget {
                     let rel_mon_x = drag.current_global_x - mon_x;
                     let rel_mon_y = drag.current_global_y - mon_y;
                     let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
-                        self.container
-                            .translate_coordinates(&root, 0.0, 0.0)
-                            .unwrap_or((0.0, 0.0))
+                        crate::util::widget_translate_coords(&self.container, &root, 0.0, 0.0).unwrap_or((0.0, 0.0))
                     } else {
                         (0.0, 0.0)
                     };
@@ -828,17 +858,11 @@ fn update_local_drag_reorder(
     let bounds: Vec<ChildBounds> = children
         .iter()
         .map(|child| {
-            let alloc = child.allocation();
+            let (ax, ay, aw, ah) = crate::util::widget_bounds_in(child, parent).unwrap_or((0, 0, 0, 0));
             if is_vertical {
-                ChildBounds {
-                    pos: alloc.y(),
-                    len: alloc.height(),
-                }
+                ChildBounds { pos: ay, len: ah }
             } else {
-                ChildBounds {
-                    pos: alloc.x(),
-                    len: alloc.width(),
-                }
+                ChildBounds { pos: ax, len: aw }
             }
         })
         .collect();
@@ -1269,6 +1293,7 @@ mod tests {
                 crate::config::BarPosition::Left,
                 48,
                 niri.update_tx.clone(),
+                1,
             );
             {
                 let mut st = AppState::default();
@@ -1356,6 +1381,7 @@ mod tests {
                 crate::config::BarPosition::Left,
                 48,
                 niri.update_tx.clone(),
+                1,
             );
             {
                 let mut st = AppState::default();
@@ -1437,6 +1463,7 @@ mod tests {
                 crate::config::BarPosition::Left,
                 48,
                 niri.update_tx.clone(),
+                1,
             );
             let tb_target = super::TaskbarWidget::new(
                 gtk::Orientation::Vertical,
@@ -1444,6 +1471,7 @@ mod tests {
                 crate::config::BarPosition::Left,
                 48,
                 niri.update_tx.clone(),
+                1,
             );
 
             let mut outputs = HashMap::new();
@@ -1617,6 +1645,182 @@ mod tests {
                 source_clean_children[0].opacity(),
                 1.0,
                 "Source button opacity must be restored to 1.0"
+            );
+        });
+    }
+
+    #[test]
+    fn test_removed_taskbar_button_destroys_without_cycle() {
+        crate::util::run_gtk_test(|| {
+            use crate::config::TaskbarConfig;
+            use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
+            use gtk::prelude::*;
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let niri = std::sync::Arc::new(NiriService::new_mock());
+            let tb = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                niri.update_tx.clone(),
+                1,
+            );
+            let win = gtk::Window::new();
+            win.set_child(Some(&tb.container));
+            win.set_visible(true);
+
+            {
+                let mut st = AppState::default();
+                st.workspaces.push(WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("OUT-1".into()),
+                    is_active: true,
+                    is_focused: true,
+                });
+                st.windows.push(WindowInfo {
+                    id: 501,
+                    title: Some("Example App".into()),
+                    app_id: Some("org.example.App".into()),
+                    workspace_id: Some(1),
+                    is_focused: true,
+                    layout: Default::default(),
+                    pid: None,
+                });
+                *crate::util::lock(&niri.state) = st;
+            }
+            tb.reconcile(&Some("OUT-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
+
+            let children = crate::util::widget_children(&tb.container);
+            assert_eq!(children.len(), 1);
+            let destroyed = Rc::new(Cell::new(false));
+            let d_flag = Rc::clone(&destroyed);
+            children[0].connect_destroy(move |_| d_flag.set(true));
+            drop(children);
+
+            // Window closes: reconcile removes the button
+            crate::util::lock(&niri.state).windows.clear();
+            tb.reconcile(&Some("OUT-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
+            assert!(crate::util::widget_children(&tb.container).is_empty());
+
+            let ctx = glib::MainContext::default();
+            for _ in 0..10 {
+                while ctx.pending() {
+                    ctx.iteration(false);
+                }
+            }
+
+            assert!(
+                destroyed.get(),
+                "Removed taskbar button must emit destroy instead of leaking via GestureDrag cycle"
+            );
+            win.close();
+        });
+    }
+
+    #[test]
+    fn test_taskbar_uses_initial_scale_and_updates_on_scale_change() {
+        crate::util::run_gtk_test(|| {
+            use crate::config::TaskbarConfig;
+            use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
+            use gtk::prelude::*;
+
+            let niri = std::sync::Arc::new(NiriService::new_mock());
+            {
+                let mut st = AppState::default();
+                st.workspaces.push(WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("OUT-1".into()),
+                    is_active: true,
+                    is_focused: true,
+                });
+                st.windows.push(WindowInfo {
+                    id: 701,
+                    title: Some("Scale App".into()),
+                    app_id: Some("org.example.ScaleApp".into()),
+                    workspace_id: Some(1),
+                    is_focused: true,
+                    layout: Default::default(),
+                    pid: None,
+                });
+                *crate::util::lock(&niri.state) = st;
+            }
+            let cfg = TaskbarConfig {
+                icon_size: 20,
+                ..TaskbarConfig::default()
+            };
+
+            let (tx_1x, rx_1x) = async_channel::unbounded();
+            let tb_1x = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                tx_1x,
+                1,
+            );
+            tb_1x.reconcile(&Some("OUT-1".into()), &niri.state, &cfg, &niri, 10);
+
+            assert_eq!(tb_1x.active_widgets.borrow().get(&701).unwrap().icon_scale, 1);
+            let btn_1x = crate::util::widget_children(&tb_1x.container)
+                .into_iter()
+                .next()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            let img_1x = btn_1x.child().unwrap().downcast::<gtk::Image>().unwrap();
+            assert_eq!(img_1x.pixel_size(), 20);
+            assert_eq!(
+                img_1x.paintable().unwrap().intrinsic_width(),
+                20,
+                "TaskbarWidget with initial scale 1 must render 20px icon buffer"
+            );
+
+            let (tx_2x, _rx_2x) = async_channel::unbounded();
+            let tb_2x = super::TaskbarWidget::new(
+                gtk::Orientation::Vertical,
+                4,
+                crate::config::BarPosition::Left,
+                48,
+                tx_2x,
+                2,
+            );
+            tb_2x.reconcile(&Some("OUT-1".into()), &niri.state, &cfg, &niri, 10);
+
+            assert_eq!(tb_2x.active_widgets.borrow().get(&701).unwrap().icon_scale, 2);
+            let btn_2x = crate::util::widget_children(&tb_2x.container)
+                .into_iter()
+                .next()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            let img_2x = btn_2x.child().unwrap().downcast::<gtk::Image>().unwrap();
+            assert_eq!(img_2x.pixel_size(), 20);
+            assert_eq!(
+                img_2x.paintable().unwrap().intrinsic_width(),
+                40,
+                "TaskbarWidget with initial scale 2 must render 40px icon buffer"
+            );
+
+            // Dynamic scale transition 1 -> 2 must wake reconcile loop and rescale existing button icon
+            while rx_1x.try_recv().is_ok() {}
+            tb_1x.set_scale_factor(2);
+            assert!(
+                rx_1x.try_recv().is_ok(),
+                "Changing taskbar scale factor must wake bar reconcile loop"
+            );
+
+            tb_1x.reconcile(&Some("OUT-1".into()), &niri.state, &cfg, &niri, 10);
+            assert_eq!(tb_1x.active_widgets.borrow().get(&701).unwrap().icon_scale, 2);
+            let img_after = btn_1x.child().unwrap().downcast::<gtk::Image>().unwrap();
+            assert_eq!(img_after.pixel_size(), 20);
+            assert_eq!(
+                img_after.paintable().unwrap().intrinsic_width(),
+                40,
+                "Reconcile after scale change 1 -> 2 must replace existing button icon with 40px buffer"
             );
         });
     }

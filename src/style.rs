@@ -190,4 +190,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_css_contains_no_unused_or_unscoped_tray_rules() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let user_css_path = manifest_dir.join(".config/niri-bar/style.css");
+        let user_css = std::fs::read_to_string(&user_css_path).ok();
+
+        let mut targets = vec![("style.default.css", DEFAULT_CSS.to_string())];
+        if let Some(css) = user_css {
+            targets.push(("user style.css", css));
+        }
+
+        for (name, css) in targets {
+            assert!(
+                !css.contains("checkbutton.tray-menu-check"),
+                "{name} must not contain unused checkbutton.tray-menu-check rules (tray uses Button + Label)"
+            );
+            assert!(
+                !css.contains("\nseparator,\nseparator.horizontal,"),
+                "{name} must scope tray menu separator selectors under .tray-menu"
+            );
+        }
+    }
 }
