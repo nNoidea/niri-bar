@@ -4,6 +4,10 @@
 
 # niri-bar
 
+[![CI](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml/badge.svg)](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml)
+[![Release](https://img.shields.io/github/v/release/nNoidea/niri-bar)](https://github.com/nNoidea/niri-bar/releases)
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
+
 A fast, lightweight Wayland taskbar built in Rust **SPECIFICALLY for the [Niri](https://github.com/YaLTeR/niri) scrollable-tiling compositor.**
 
 > **Why `niri-bar` instead of any other bar?**
@@ -16,10 +20,6 @@ https://github.com/user-attachments/assets/da22fb12-8062-4617-a743-598555fd0e36
 
 ![](images/image.png)
 ![](images/image2.png)
-
-[![CI](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml/badge.svg)](https://github.com/nNoidea/niri-bar/actions/workflows/main.yml)
-[![Release](https://img.shields.io/github/v/release/nNoidea/niri-bar)](https://github.com/nNoidea/niri-bar/releases)
-![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
 ## Features
 
@@ -44,6 +44,7 @@ sudo dnf install niri-bar
 ### Debian
 
 Download the `.deb` package from [Releases](https://github.com/nNoidea/niri-bar/releases/latest) and install:
+
 ```bash
 sudo dpkg -i niri-bar_*_amd64.deb
 ```
@@ -59,7 +60,6 @@ git clone https://github.com/nNoidea/niri-bar.git
 cd niri-bar
 make install
 ```
-
 
 ### Requirements
 
