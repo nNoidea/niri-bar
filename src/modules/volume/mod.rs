@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{resolve_level, VolumeConfig};
-use crate::modules::{poll_backoff, spawn_command, BarModule, ModuleCore, ModuleState, MouseButton, ScrollDirection};
+use crate::modules::{poll_backoff, BarModule, ModuleCore, ModuleState, MouseButton, ScrollDirection};
 pub use pulse::PulseAction;
 use pulse::PulseSession;
 
@@ -26,7 +26,6 @@ pub struct SinkInfo {
     pub name: String,
     pub description: String,
     pub sink_type: SinkType,
-    pub is_bluetooth: bool,
 }
 
 pub struct VolumeModule {
@@ -53,7 +52,6 @@ impl VolumeModule {
             name: "@DEFAULT_SINK@".to_string(),
             description: "Default Output".to_string(),
             sink_type: SinkType::Speaker,
-            is_bluetooth: false,
         }));
         let (cmd_tx, cmd_rx) = async_channel::bounded(32);
 
@@ -174,7 +172,7 @@ impl VolumeModule {
             tokio::select! {
                 biased;
 
-                _ = core.wait_timeout_async(Duration::from_secs(86400)) => break,
+                () = core.wait_stopped() => break,
 
                 action_res = cmd_rx.recv() => {
                     let Ok(first_action) = action_res else { break };
@@ -289,7 +287,7 @@ impl VolumeModule {
         icon_name: Option<&str>,
         bus: Option<&str>,
         active_port: Option<&str>,
-    ) -> (SinkType, bool) {
+    ) -> SinkType {
         let name_lower = name.to_lowercase();
         let desc_lower = desc.to_lowercase();
         let ff_lower = form_factor.unwrap_or("").to_lowercase();
@@ -319,21 +317,17 @@ impl VolumeModule {
             || desc_lower.contains("displayport")
             || port_lower.contains("hdmi");
 
-        let sink_type = if is_bluetooth && (is_headphones || is_headset) {
+        if is_bluetooth {
             SinkType::Bluetooth
         } else if is_headphones {
             SinkType::Headphones
         } else if is_headset {
             SinkType::Headset
-        } else if is_bluetooth {
-            SinkType::Bluetooth
         } else if is_hdmi {
             SinkType::Hdmi
         } else {
             SinkType::Speaker
-        };
-
-        (sink_type, is_bluetooth)
+        }
     }
 
     pub fn adapt_icon_for_sink(formatted: &str, _volume: u32, _is_muted: bool, sink_type: SinkType) -> String {
@@ -443,16 +437,11 @@ impl BarModule for VolumeModule {
     }
 
     fn handle_click(&self, button: MouseButton) {
+        if self.config.click.try_run(button) {
+            return;
+        }
         match button {
             MouseButton::Left => {
-                if let Some(ref cmd) = self.config.click.on_click_left {
-                    let c = cmd.trim();
-                    if !c.is_empty() {
-                        spawn_command(c);
-                        return;
-                    }
-                }
-
                 let cur_vol = self.current_vol.load(Ordering::Relaxed);
                 let is_muted = self.is_muted.load(Ordering::Relaxed);
 
@@ -476,23 +465,9 @@ impl BarModule for VolumeModule {
                 }
             }
             MouseButton::Right => {
-                if let Some(ref cmd) = self.config.click.on_click_right {
-                    let c = cmd.trim();
-                    if !c.is_empty() {
-                        spawn_command(c);
-                        return;
-                    }
-                }
                 let _ = self.cmd_tx.try_send(PulseAction::CycleSink);
             }
-            MouseButton::Middle => {
-                if let Some(ref cmd) = self.config.click.on_click_middle {
-                    let c = cmd.trim();
-                    if !c.is_empty() {
-                        spawn_command(c);
-                    }
-                }
-            }
+            MouseButton::Middle => {}
         }
     }
 
@@ -522,7 +497,6 @@ mod tests {
                 name: "default_speaker".to_string(),
                 description: "Speaker".to_string(),
                 sink_type: SinkType::Speaker,
-                is_bluetooth: false,
             }
         }
 
@@ -531,7 +505,6 @@ mod tests {
                 name: name.to_string(),
                 description: desc.to_string(),
                 sink_type: SinkType::Bluetooth,
-                is_bluetooth: true,
             }
         }
 
@@ -540,7 +513,6 @@ mod tests {
                 name: name.to_string(),
                 description: desc.to_string(),
                 sink_type: SinkType::Headphones,
-                is_bluetooth: false,
             }
         }
 
@@ -549,7 +521,6 @@ mod tests {
                 name: name.to_string(),
                 description: desc.to_string(),
                 sink_type: SinkType::Hdmi,
-                is_bluetooth: false,
             }
         }
     }
@@ -880,16 +851,15 @@ mod tests {
         let n = VolumeModule::classify_sink;
         // Plain speaker is the default.
         assert_eq!(
-            n("alsa_output", "Ryzen HD Audio Speaker", None, None, None, None).0,
+            n("alsa_output", "Ryzen HD Audio Speaker", None, None, None, None),
             SinkType::Speaker
         );
         // Bluetooth via bus, bluez_ prefix, or icon.
-        assert!(n("bluez_sink.01", "Speaker", None, None, None, None).1);
         assert_eq!(
-            n("bluez_sink.01", "Speaker", None, None, None, None).0,
+            n("bluez_sink.01", "Speaker", None, None, None, None),
             SinkType::Bluetooth
         );
-        assert!(
+        assert_eq!(
             n(
                 "alsa_bt",
                 "Speaker",
@@ -897,37 +867,37 @@ mod tests {
                 Some("audio-bluetooth"),
                 Some("bluetooth"),
                 None
-            )
-            .1
+            ),
+            SinkType::Bluetooth
         );
         // Bluetooth headphones keep the Bluetooth type (not plain Headphones).
         assert_eq!(
-            n("bluez_sink.01", "WH-1000XM4", None, None, Some("bluetooth"), None).0,
+            n("bluez_sink.01", "WH-1000XM4", None, None, Some("bluetooth"), None),
             SinkType::Bluetooth
         );
         // Wired headphones via form factor, desc keywords, or port.
         assert_eq!(
-            n("alsa_hp", "Headphones", Some("headphone"), None, None, None).0,
+            n("alsa_hp", "Headphones", Some("headphone"), None, None, None),
             SinkType::Headphones
         );
         assert_eq!(
-            n("alsa_hp", "Pixel Buds Pro", None, None, None, None).0,
+            n("alsa_hp", "Pixel Buds Pro", None, None, None, None),
             SinkType::Headphones
         );
-        assert_eq!(n("alsa_hp", "AirPods", None, None, None, None).0, SinkType::Headphones);
+        assert_eq!(n("alsa_hp", "AirPods", None, None, None, None), SinkType::Headphones);
         assert_eq!(
-            n("alsa_hp", "Output", None, None, None, Some("headphone")).0,
+            n("alsa_hp", "Output", None, None, None, Some("headphone")),
             SinkType::Headphones
         );
         // Headset without headphone markers.
         assert_eq!(
-            n("usb_dongle", "Jabra Headset", None, None, None, None).0,
+            n("usb_dongle", "Jabra Headset", None, None, None, None),
             SinkType::Headset
         );
         // HDMI via name, desc, or DisplayPort alias.
-        assert_eq!(n("alsa_hdmi", "Output", None, None, None, None).0, SinkType::Hdmi);
+        assert_eq!(n("alsa_hdmi", "Output", None, None, None, None), SinkType::Hdmi);
         assert_eq!(
-            n("alsa_dp", "DisplayPort Monitor", None, None, None, None).0,
+            n("alsa_dp", "DisplayPort Monitor", None, None, None, None),
             SinkType::Hdmi
         );
     }

@@ -95,10 +95,12 @@ pub fn resolve_icon_pixbuf(req: &IconRequest, target_size: i32) -> Option<Pixbuf
         }
         _ => None,
     };
+    let load_norm = |p: &Path| load_file_pixbuf_fast(p, size).map(|pb| normalize_pixbuf_to_size(pb, size));
+
     if let Some(p) = direct_path {
         if p.is_absolute() && p.is_file() {
-            if let Some(pb) = load_file_pixbuf_fast(p, size) {
-                return Some(normalize_pixbuf_to_size(pb, size));
+            if let Some(pb) = load_norm(p) {
+                return Some(pb);
             }
         }
     }
@@ -127,15 +129,15 @@ pub fn resolve_icon_pixbuf(req: &IconRequest, target_size: i32) -> Option<Pixbuf
             for ext in &["", ".png", ".svg", ".ico", ".xpm", ".tga"] {
                 let candidate = dir.join(format!("{safe_key}{ext}"));
                 if candidate.is_file() {
-                    if let Some(pb) = load_file_pixbuf_fast(&candidate, size) {
-                        return Some(normalize_pixbuf_to_size(pb, size));
+                    if let Some(pb) = load_norm(&candidate) {
+                        return Some(pb);
                     }
                 }
             }
             let xdg_dirs = [dir.to_path_buf(), dir.join("icons")];
             if let Some(cand) = desktop::resolve_xdg_icon_in_dirs(safe_key, &xdg_dirs) {
-                if let Some(pb) = load_file_pixbuf_fast(&cand, size) {
-                    return Some(normalize_pixbuf_to_size(pb, size));
+                if let Some(pb) = load_norm(&cand) {
+                    return Some(pb);
                 }
             }
         }
@@ -144,28 +146,20 @@ pub fn resolve_icon_pixbuf(req: &IconRequest, target_size: i32) -> Option<Pixbuf
         if let Some(resolved) = find_app_icon(safe_key) {
             let res_path = Path::new(&resolved);
             if res_path.is_absolute() && res_path.is_file() {
-                if let Some(pb) = load_file_pixbuf_fast(res_path, size) {
-                    return Some(normalize_pixbuf_to_size(pb, size));
+                if let Some(pb) = load_norm(res_path) {
+                    return Some(pb);
                 }
             } else if let Some(icon_path) = desktop::resolve_xdg_icon(&resolved) {
-                if let Some(pb) = load_file_pixbuf_fast(&icon_path, size) {
-                    return Some(normalize_pixbuf_to_size(pb, size));
+                if let Some(pb) = load_norm(&icon_path) {
+                    return Some(pb);
                 }
             }
         }
 
-        // 3c. Direct XDG icon lookup (raster PNG first, then scalable SVG)
-        let lower = safe_key.to_lowercase();
-        let candidates = if lower != safe_key {
-            vec![safe_key, lower.as_str()]
-        } else {
-            vec![safe_key]
-        };
-        for candidate in candidates {
-            if let Some(icon_path) = desktop::resolve_xdg_icon(candidate) {
-                if let Some(pb) = load_file_pixbuf_fast(&icon_path, size) {
-                    return Some(normalize_pixbuf_to_size(pb, size));
-                }
+        // 3c. Direct XDG icon lookup (resolve_xdg_icon checks exact + lowercased name)
+        if let Some(icon_path) = desktop::resolve_xdg_icon(safe_key) {
+            if let Some(pb) = load_norm(&icon_path) {
+                return Some(pb);
             }
         }
 

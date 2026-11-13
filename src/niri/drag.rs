@@ -2,7 +2,9 @@ use crate::niri::model::OutputInfo;
 use gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{Button, Window};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::AppState;
@@ -39,30 +41,261 @@ pub struct GlobalDragState {
 /// by callers (see taskbar motion handler).
 pub const DRAG_THRESHOLD_LOGICAL_PX: f64 = 6.0;
 
-pub static GLOBAL_DRAG: Mutex<Option<GlobalDragState>> = Mutex::new(None);
-
-/// Next drag generation. Bumps on every new press so overlapping drags
-/// (A closed, B started) can be told apart by background threads.
-pub static DRAG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Pending drag-cancel from a background (Niri IPC) thread, as the closed
-/// `window_id`. The GTK main thread takes it and only cleans up when it
-/// matches (or when no drag is active). Never a bare bool: a global flag
-/// would kill an unrelated drag B started after A closed.
-pub static DRAG_CANCELLED: Mutex<Option<u64>> = Mutex::new(None);
-
-/// Request main-thread drag cleanup for `window_id` (background-safe).
-pub fn request_drag_cancel(window_id: u64) {
-    *crate::util::lock(&DRAG_CANCELLED) = Some(window_id);
+/// Snapshot returned when a motion event exceeds the drag threshold.
+pub struct DragMotionStep {
+    pub just_started: bool,
+    pub source_output: Option<String>,
+    pub prev_target: Option<String>,
 }
 
-/// Take a pending cancel, returning the closed `window_id` if any.
-pub fn take_drag_cancel() -> Option<u64> {
-    crate::util::lock(&DRAG_CANCELLED).take()
+/// Owned cross-thread coordinator for taskbar drag state, generation tracking,
+/// and background cancellation handoffs (no process-wide statics).
+pub struct DragController {
+    state: Mutex<Option<GlobalDragState>>,
+    gen: AtomicU64,
+    cancelled: Mutex<Option<u64>>,
+}
+
+impl Default for DragController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DragController {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            gen: AtomicU64::new(1),
+            cancelled: Mutex::new(None),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<GlobalDragState> {
+        crate::util::lock(&self.state).clone()
+    }
+
+    pub fn active_window_id(&self) -> Option<u64> {
+        crate::util::lock(&self.state).as_ref().map(|d| d.window_id)
+    }
+
+    pub fn begin_press(
+        &self,
+        window_id: u64,
+        source_output: Option<String>,
+        source_index: usize,
+        start_root: (f64, f64),
+        start_global: (f64, f64),
+    ) {
+        let mut drag = crate::util::lock(&self.state);
+        // Single-drag guard: never clobber an active drag from another button/overlay.
+        if drag.as_ref().is_some_and(|e| e.is_dragging && e.window_id != window_id) {
+            return;
+        }
+        let generation = self.gen.fetch_add(1, Ordering::Relaxed);
+        *drag = Some(GlobalDragState {
+            window_id,
+            source_output,
+            source_index,
+            start_root_x: start_root.0,
+            start_root_y: start_root.1,
+            current_global_x: start_global.0,
+            current_global_y: start_global.1,
+            is_dragging: false,
+            current_target_slot: source_index,
+            target_output: None,
+            target_slot: source_index,
+            target_slot_valid: false,
+            generation,
+        });
+    }
+
+    pub fn check_motion_step(&self, window_id: u64, root_x: f64, root_y: f64) -> Option<DragMotionStep> {
+        let mut drag_guard = crate::util::lock(&self.state);
+        let drag = drag_guard.as_mut()?;
+        if drag.window_id != window_id {
+            return None;
+        }
+        let (dx, dy) = (root_x - drag.start_root_x, root_y - drag.start_root_y);
+        if (dx * dx + dy * dy).sqrt() <= DRAG_THRESHOLD_LOGICAL_PX {
+            return None;
+        }
+        let just_started = !drag.is_dragging;
+        if just_started {
+            drag.is_dragging = true;
+        }
+        Some(DragMotionStep {
+            just_started,
+            source_output: drag.source_output.clone(),
+            prev_target: drag.target_output.clone(),
+        })
+    }
+
+    pub fn overlay_drag_source(&self, window_id: u64) -> Option<Option<String>> {
+        let g = crate::util::lock(&self.state);
+        match g.as_ref() {
+            Some(d) if d.window_id == window_id => Some(d.source_output.clone()),
+            _ => None,
+        }
+    }
+
+    /// Store a new pointer position + cross-monitor target for `window_id`.
+    /// Invalidates the preview slot until the remote `reconcile` recomputes it.
+    pub fn store_position(&self, window_id: u64, global_x: f64, global_y: f64, target: Option<String>) {
+        let mut g = crate::util::lock(&self.state);
+        if let Some(ref mut d) = *g {
+            if d.window_id == window_id {
+                if d.target_output != target {
+                    d.target_slot_valid = false;
+                }
+                d.current_global_x = global_x;
+                d.current_global_y = global_y;
+                d.target_output = target;
+            }
+        }
+    }
+
+    pub fn set_current_slot(&self, window_id: u64, slot: usize) {
+        let mut g = crate::util::lock(&self.state);
+        if let Some(ref mut d) = *g {
+            if d.window_id == window_id {
+                d.current_target_slot = slot;
+                d.target_slot = slot;
+            }
+        }
+    }
+
+    pub fn set_cross_monitor_preview_slot(&self, window_id: u64, slot: usize) {
+        let mut g = crate::util::lock(&self.state);
+        if let Some(ref mut d) = *g {
+            if d.window_id == window_id {
+                d.target_slot = slot;
+                d.target_slot_valid = true;
+            }
+        }
+    }
+
+    /// Background-safe cancellation when Niri closes `window_id`.
+    pub fn cancel_window(&self, window_id: u64) -> bool {
+        let cleared = {
+            let mut g = crate::util::lock(&self.state);
+            if g.as_ref().is_some_and(|d| d.window_id == window_id) {
+                g.take();
+                true
+            } else {
+                false
+            }
+        };
+        if cleared {
+            *crate::util::lock(&self.cancelled) = Some(window_id);
+        }
+        cleared
+    }
+
+    /// Main-thread check: consumes any pending background cancel and reports whether
+    /// GTK cursor/overlay cleanup should run now (never clobbering a newer drag).
+    pub fn should_cleanup_cancel(&self) -> bool {
+        let Some(cancelled_id) = crate::util::lock(&self.cancelled).take() else {
+            return false;
+        };
+        let current_id = self.active_window_id();
+        current_id.is_none() || current_id == Some(cancelled_id)
+    }
+
+    /// Escape-key cancellation: clears active drag only if it belongs to `window_id`.
+    pub fn cancel_if_matching(&self, window_id: u64) -> bool {
+        let mut g = crate::util::lock(&self.state);
+        if g.as_ref().is_some_and(|d| d.window_id == window_id) {
+            g.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take the active drag (if it belongs to `window_id`), decide the action,
+    /// and dispatch the Niri IPC off the GTK thread.
+    pub fn finish_drag(&self, window_id: u64, click_to_focus: bool) {
+        let drag_opt = {
+            let mut g = crate::util::lock(&self.state);
+            match g.take() {
+                Some(d) if d.window_id == window_id => Some(d),
+                other => {
+                    *g = other;
+                    None
+                }
+            }
+        };
+
+        let action = match drag_opt {
+            Some(ref d) => {
+                log_debug!("drag", "Finishing drag win={} gen={}", d.window_id, d.generation);
+                let action = decide_drag_action(d, click_to_focus);
+                // Silent drops are the hardest drag bugs to diagnose (empty
+                // taskbar on the target monitor looks identical to a dead drop):
+                // log them at debug so `NIRI_BAR_DEBUG=1` shows what happened.
+                if d.is_dragging && action == DragAction::None {
+                    log_debug!(
+                        "drag",
+                        "Dropping active drag win={} with no action (target_output={:?}, slot {}/{})",
+                        d.window_id,
+                        d.target_output,
+                        d.current_target_slot,
+                        d.source_index
+                    );
+                }
+                action
+            }
+            None => return,
+        };
+
+        dispatch_drag_action(window_id, action);
+    }
+
+    /// Handle `GestureDrag::drag_end` on a taskbar source button.
+    pub fn handle_source_gesture_end(
+        &self,
+        window_id: u64,
+        sequence_cancelled: bool,
+        source_button: Option<&Button>,
+        update_tx: &async_channel::Sender<()>,
+    ) -> bool {
+        if sequence_cancelled {
+            let is_actively_dragging = crate::util::lock(&self.state)
+                .as_ref()
+                .is_some_and(|d| d.window_id == window_id && d.is_dragging);
+            if is_actively_dragging {
+                return false;
+            }
+        }
+        reset_all_cursors_and_overlay(source_button);
+        self.finish_drag(window_id, !sequence_cancelled);
+        crate::util::nudge(update_tx);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, drag: Option<GlobalDragState>) {
+        *crate::util::lock(&self.state) = drag;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_dragging_or_activate_test(&self, window_id: u64, activate: bool) -> bool {
+        let mut g = crate::util::lock(&self.state);
+        if let Some(ref mut d) = *g {
+            if d.window_id == window_id {
+                if activate {
+                    d.is_dragging = true;
+                }
+                return d.is_dragging;
+            }
+        }
+        false
+    }
 }
 
 /// IPC action decided at drag release. Pure decision (no I/O) so it is unit-testable;
-/// `finish_drag` below dispatches it asynchronously on the shared Tokio runtime.
+/// `DragController::finish_drag` dispatches it asynchronously on the shared Tokio runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragAction {
     None,
@@ -108,45 +341,7 @@ pub fn decide_drag_action(drag: &GlobalDragState, click_to_focus: bool) -> DragA
     DragAction::None
 }
 
-/// Take the global drag (if it belongs to `window_id`), decide the action,
-/// and dispatch the Niri IPC off the GTK thread. Replaces two copies of the
-/// take + match + `spawn_blocking` sequence in the taskbar release handlers.
-/// Callers still own cursor/overlay reset + update-channel nudge.
-pub fn finish_drag(window_id: u64, click_to_focus: bool) {
-    let drag_opt = {
-        let mut g = crate::util::lock(&GLOBAL_DRAG);
-        match g.take() {
-            Some(d) if d.window_id == window_id => Some(d),
-            other => {
-                // Not ours: put it back so the owning button/overlay can finish it.
-                *g = other;
-                None
-            }
-        }
-    };
-
-    let action = match drag_opt {
-        Some(ref d) => {
-            log_debug!("drag", "Finishing drag win={} gen={}", d.window_id, d.generation);
-            let action = decide_drag_action(d, click_to_focus);
-            // Silent drops are the hardest drag bugs to diagnose (empty
-            // taskbar on the target monitor looks identical to a dead drop):
-            // log them at debug so `NIRI_BAR_DEBUG=1` shows what happened.
-            if d.is_dragging && action == DragAction::None {
-                log_debug!(
-                    "drag",
-                    "Dropping active drag win={} with no action (target_output={:?}, slot {}/{})",
-                    d.window_id,
-                    d.target_output,
-                    d.current_target_slot,
-                    d.source_index
-                );
-            }
-            action
-        }
-        None => return,
-    };
-
+fn dispatch_drag_action(window_id: u64, action: DragAction) {
     match action {
         DragAction::None => {}
         DragAction::MoveToMonitor { output, slot_1based } => {
@@ -214,51 +409,27 @@ pub fn bar_logical_origin(
 /// 2. Deterministic fallback to the nearest monitor by clamped Euclidean distance,
 ///    so cursor positions in 1-pixel rounding gaps or bezel borders never drop the target.
 pub fn find_output_at_point(px: f64, py: f64, outputs: &HashMap<String, OutputInfo>) -> Option<String> {
-    if outputs.is_empty() {
-        return None;
-    }
-
-    // 1. Exact bounding box match in Niri logical coordinates
-    for (name, out) in outputs {
-        if let Some(ref logical) = out.logical {
-            let min_x = f64::from(logical.x);
-            let max_x = f64::from(logical.x + logical.width as i32);
-            let min_y = f64::from(logical.y);
-            let max_y = f64::from(logical.y + logical.height as i32);
-
-            if px >= min_x && px < max_x && py >= min_y && py < max_y {
-                return Some(name.clone());
-            }
-        }
-    }
-
-    // 2. Fallback: closest monitor by clamped Euclidean distance (for bezel gaps / slight overshoots)
     let mut best: Option<(&String, f64)> = None;
     for (name, out) in outputs {
-        if let Some(ref logical) = out.logical {
-            let min_x = f64::from(logical.x);
-            let max_x = f64::from(logical.x + logical.width as i32);
-            let min_y = f64::from(logical.y);
-            let max_y = f64::from(logical.y + logical.height as i32);
+        let Some(ref logical) = out.logical else {
+            continue;
+        };
+        let min_x = f64::from(logical.x);
+        let max_x = f64::from(logical.x + logical.width as i32);
+        let min_y = f64::from(logical.y);
+        let max_y = f64::from(logical.y + logical.height as i32);
 
-            let clamped_x = px.clamp(min_x, max_x);
-            let clamped_y = py.clamp(min_y, max_y);
-            let dx = px - clamped_x;
-            let dy = py - clamped_y;
-            let dist_sq = dx * dx + dy * dy;
+        if px >= min_x && px < max_x && py >= min_y && py < max_y {
+            return Some(name.clone());
+        }
 
-            match best {
-                Some((_, best_dist)) if dist_sq < best_dist => {
-                    best = Some((name, dist_sq));
-                }
-                None => {
-                    best = Some((name, dist_sq));
-                }
-                _ => {}
-            }
+        let dx = px - px.clamp(min_x, max_x);
+        let dy = py - py.clamp(min_y, max_y);
+        let dist_sq = dx * dx + dy * dy;
+        if best.is_none_or(|(_, b)| dist_sq < b) {
+            best = Some((name, dist_sq));
         }
     }
-
     best.map(|(name, _)| name.clone())
 }
 
@@ -287,76 +458,41 @@ pub fn map_root_to_niri(
     ((global_x, global_y), hover)
 }
 
-/// Handle `GestureDrag::drag_end` on a taskbar source button.
-///
-/// When `spawn_monitor_overlays` maps a fullscreen `Layer::Overlay` window on
-/// top of the bar mid-drag (`is_dragging == true`), the Wayland compositor
-/// sends `wl_pointer.leave` to the bar window, which causes GTK4 to cancel
-/// the button's `GestureDrag` (`sequence_cancelled == true`) while the user
-/// is still holding the mouse button. In that case, we must NOT abort the
-/// drag—the fullscreen overlay window now owns tracking and release.
-///
-/// If `sequence_cancelled` is `false` (normal button release) or `is_dragging`
-/// is `false` (cancelled before crossing the drag threshold), we clean up
-/// cursors/overlays and finish the drag (focusing only on an uncancelled click).
-pub fn handle_source_gesture_end(
-    window_id: u64,
-    sequence_cancelled: bool,
-    source_button: Option<&Button>,
-    update_tx: &async_channel::Sender<()>,
-) -> bool {
-    if sequence_cancelled {
-        let is_actively_dragging = crate::util::lock(&GLOBAL_DRAG)
-            .as_ref()
-            .is_some_and(|d| d.window_id == window_id && d.is_dragging);
-        if is_actively_dragging {
-            return false;
-        }
-    }
-    reset_all_cursors_and_overlay(source_button);
-    finish_drag(window_id, !sequence_cancelled);
-    crate::util::nudge(update_tx);
-    true
-}
-
-/// Store a new pointer position + cross-monitor target for `window_id`.
-/// Main-thread only (touches the GTK-handler global drag). Invalidates the
-/// preview slot until the remote `reconcile` recomputes it.
-pub fn store_drag_position(window_id: u64, global_x: f64, global_y: f64, target: Option<String>) {
-    let mut g = crate::util::lock(&GLOBAL_DRAG);
-    if let Some(ref mut d) = *g {
-        if d.window_id == window_id {
-            if d.target_output != target {
-                d.target_slot_valid = false;
-            }
-            d.current_global_x = global_x;
-            d.current_global_y = global_y;
-            d.target_output = target;
-        }
-    }
+#[derive(Default)]
+struct DragOverlayUi {
+    windows: Vec<Window>,
+    cursor_grab: bool,
 }
 
 thread_local! {
-    pub static OVERLAY_WINDOWS: std::cell::RefCell<Vec<Window>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Main-thread-only overlay windows and cursor-grab flag (`gtk::Window` is `!Send`).
+    static DRAG_UI: RefCell<DragOverlayUi> = const {
+        RefCell::new(DragOverlayUi {
+            windows: Vec::new(),
+            cursor_grab: false,
+        })
+    };
 }
 
 pub fn close_overlay_windows() {
-    OVERLAY_WINDOWS.with(|cell| {
-        for w in cell.borrow_mut().drain(..) {
-            // Safe teardown: `Window::close()` goes through the normal
-            // delete-event path on the main thread. Background threads never
-            // call this directly (see DRAG_CANCELLED handoff in NiriService).
-            w.close();
-        }
-    });
+    let windows: Vec<Window> = DRAG_UI.with(|cell| std::mem::take(&mut cell.borrow_mut().windows));
+    for w in windows {
+        w.close();
+    }
+}
+
+fn complete_overlay_drag(drag: &DragController, wid: u64, source_btn: &Button, tx: &async_channel::Sender<()>) {
+    reset_all_cursors_and_overlay(Some(source_btn));
+    // Overlay exists only mid-drag: never click-to-focus.
+    drag.finish_drag(wid, false);
+    crate::util::nudge(tx);
 }
 
 /// Spawn fullscreen transparent layer-shell overlays on every monitor so a
 /// drag is tracked (and can be cancelled/dropped) outside the source button.
-/// Must run on the GTK main thread. Extracted from the taskbar motion handler
-/// with no behavior change; overlays are torn down by `close_overlay_windows`
-/// via every release/Escape path and the `DRAG_CANCELLED` handoff.
+/// Must run on the GTK main thread.
 pub fn spawn_monitor_overlays(
+    drag: &Arc<DragController>,
     state: &Arc<Mutex<AppState>>,
     update_tx: &async_channel::Sender<()>,
     window_id: u64,
@@ -372,6 +508,7 @@ pub fn spawn_monitor_overlays(
         overlay.add_css_class("drag-overlay");
         crate::layer_shell::setup_overlay_window(&overlay, Some(&mon));
 
+        let drag_motion = Arc::clone(drag);
         let state_overlay = Arc::clone(state);
         let tx_overlay = update_tx.clone();
         let wid_overlay = window_id;
@@ -379,47 +516,31 @@ pub fn spawn_monitor_overlays(
 
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion(move |_, ox, oy| {
-            // Fixed lock order: snapshot drag identity, drop guard, THEN
-            // lock state. Never hold GLOBAL_DRAG across a state lock.
-            let (ours, src_out) = {
-                let g = crate::util::lock(&GLOBAL_DRAG);
-                match g.as_ref() {
-                    Some(d) if d.window_id == wid_overlay => (true, d.source_output.clone()),
-                    _ => (false, None),
-                }
-            };
-            if !ours {
+            // Snapshot drag source BEFORE locking state (fixed lock ordering).
+            let Some(src_out) = drag_motion.overlay_drag_source(wid_overlay) else {
                 return;
-            }
-
-            let st_outputs = {
-                let st = crate::util::lock(&state_overlay);
-                st.outputs.clone()
             };
 
-            let hover = super::detect_monitor_output(&mon_overlay, &st_outputs);
-            let (cur_gx, cur_gy) = if let Some(ref out_name) = hover {
-                if let Some(out) = st_outputs.get(out_name) {
-                    if let Some(ref l) = out.logical {
-                        (f64::from(l.x) + ox, f64::from(l.y) + oy)
-                    } else {
-                        (ox, oy)
-                    }
-                } else {
-                    (ox, oy)
-                }
-            } else {
-                (ox, oy)
+            let (cur_gx, cur_gy, hover) = {
+                let st = crate::util::lock(&state_overlay);
+                let hover = super::detect_monitor_output(&mon_overlay, &st.outputs);
+                let (gx, gy) = hover
+                    .as_ref()
+                    .and_then(|name| st.outputs.get(name))
+                    .and_then(|o| o.logical.as_ref())
+                    .map_or((ox, oy), |l| (f64::from(l.x) + ox, f64::from(l.y) + oy));
+                (gx, gy, hover)
             };
 
             let (_, new_target) = decide_hover_target(hover, &src_out);
-            store_drag_position(wid_overlay, cur_gx, cur_gy, new_target);
+            drag_motion.store_position(wid_overlay, cur_gx, cur_gy, new_target);
             crate::util::nudge(&tx_overlay);
         });
         overlay.add_controller(motion);
 
-        let b_overlay_legacy = source_button.clone();
-        let tx_overlay_legacy = update_tx.clone();
+        let drag_legacy = Arc::clone(drag);
+        let b_legacy = source_button.clone();
+        let tx_legacy = update_tx.clone();
         let legacy = gtk::EventControllerLegacy::new();
         legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
         legacy.connect_event(move |_, event| {
@@ -427,55 +548,40 @@ pub fn spawn_monitor_overlays(
                 event.event_type(),
                 gdk::EventType::ButtonRelease | gdk::EventType::ButtonPress
             ) {
-                reset_all_cursors_and_overlay(Some(&b_overlay_legacy));
-                // Overlay exists only mid-drag: never click-to-focus.
-                finish_drag(wid_overlay, false);
-                crate::util::nudge(&tx_overlay_legacy);
+                complete_overlay_drag(&drag_legacy, wid_overlay, &b_legacy, &tx_legacy);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
         });
         overlay.add_controller(legacy);
 
-        let b_overlay_rel = source_button.clone();
-        let tx_overlay_rel = update_tx.clone();
-        let b_overlay_unpaired = source_button.clone();
-        let tx_overlay_unpaired = update_tx.clone();
+        let drag_rel = Arc::clone(drag);
+        let b_rel = source_button.clone();
+        let tx_rel = update_tx.clone();
+        let drag_unpaired = Arc::clone(drag);
+        let b_unpaired = source_button.clone();
+        let tx_unpaired = update_tx.clone();
 
         let click = gtk::GestureClick::builder()
             .button(0)
             .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
-        click.connect_released(move |_, _, _, _| {
-            reset_all_cursors_and_overlay(Some(&b_overlay_rel));
-            finish_drag(wid_overlay, false);
-            crate::util::nudge(&tx_overlay_rel);
-        });
+        click.connect_released(move |_, _, _, _| complete_overlay_drag(&drag_rel, wid_overlay, &b_rel, &tx_rel));
         click.connect_unpaired_release(move |_, _, _, _, _| {
-            reset_all_cursors_and_overlay(Some(&b_overlay_unpaired));
-            finish_drag(wid_overlay, false);
-            crate::util::nudge(&tx_overlay_unpaired);
+            complete_overlay_drag(&drag_unpaired, wid_overlay, &b_unpaired, &tx_unpaired)
         });
         overlay.add_controller(click);
 
+        let drag_esc = Arc::clone(drag);
         let b_overlay_esc = source_button.clone();
         let tx_overlay_esc = update_tx.clone();
 
         let key_ctrl = gtk::EventControllerKey::new();
         key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
-            if keyval == gdk::Key::Escape {
-                // Only cancel our own drag; a stale overlay must not kill a
-                // newer drag started after this overlay was created.
-                let ours = crate::util::lock(&GLOBAL_DRAG)
-                    .as_ref()
-                    .map(|d| d.window_id == wid_overlay)
-                    .unwrap_or(false);
-                if ours {
-                    reset_all_cursors_and_overlay(Some(&b_overlay_esc));
-                    crate::util::lock(&GLOBAL_DRAG).take();
-                    crate::util::nudge(&tx_overlay_esc);
-                    return glib::Propagation::Stop;
-                }
+            if keyval == gdk::Key::Escape && drag_esc.cancel_if_matching(wid_overlay) {
+                reset_all_cursors_and_overlay(Some(&b_overlay_esc));
+                crate::util::nudge(&tx_overlay_esc);
+                return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
         });
@@ -483,24 +589,17 @@ pub fn spawn_monitor_overlays(
 
         overlay.set_visible(true);
         gtk::prelude::WidgetExt::realize(&overlay);
-        OVERLAY_WINDOWS.with(|cell| cell.borrow_mut().push(overlay));
+        DRAG_UI.with(|cell| cell.borrow_mut().windows.push(overlay));
     }
 }
 
-thread_local! {
-    /// True while a drag has applied its icon cursor across toplevels.
-    pub static DRAG_CURSOR_GRAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether a drag currently has its icon cursor active (main thread).
 #[cfg(test)]
 pub fn drag_cursor_grab_active() -> bool {
-    DRAG_CURSOR_GRAB.with(|g| g.get())
+    DRAG_UI.with(|cell| cell.borrow().cursor_grab)
 }
 
-/// Release the drag cursor state if active. Idempotent.
-fn release_drag_cursor_grab() {
-    DRAG_CURSOR_GRAB.with(|g| g.set(false));
+fn set_drag_cursor_grab(active: bool) {
+    DRAG_UI.with(|cell| cell.borrow_mut().cursor_grab = active);
 }
 
 /// Scale an existing `gdk::Texture` to an exact square `(size, size)` logical
@@ -541,6 +640,29 @@ fn scale_texture_to_square(texture: &gdk::Texture, size: i32) -> Option<gdk::Tex
     Some(gdk::MemoryTexture::new(size, size, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, dst_stride).upcast())
 }
 
+pub(crate) fn set_widget_and_surface_cursor(widget: &impl WidgetExt, cursor: Option<&gdk::Cursor>) {
+    widget.set_cursor(cursor);
+    if let Some(native) = widget.native() {
+        if let Some(surface) = native.surface() {
+            surface.set_cursor(cursor);
+        }
+    }
+}
+
+fn apply_cursor_to_windows(cursor: Option<&gdk::Cursor>, apply_to_source: Option<&Button>) {
+    for widget in gtk::Window::list_toplevels() {
+        set_widget_and_surface_cursor(&widget, cursor);
+    }
+    DRAG_UI.with(|cell| {
+        for win in &cell.borrow().windows {
+            set_widget_and_surface_cursor(win, cursor);
+        }
+    });
+    if let Some(b) = apply_to_source {
+        set_widget_and_surface_cursor(b, cursor);
+    }
+}
+
 pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Option<&Button>) {
     let size = if size <= 0 { 20 } else { size };
     let texture_opt = source_button
@@ -553,69 +675,19 @@ pub fn apply_drag_cursor_globally(icon_key: &str, size: i32, source_button: Opti
 
     if let Some(texture) = texture_opt {
         if let Some(display) = gdk::Display::default() {
-            let hotspot_x = texture.width() / 2;
-            let hotspot_y = texture.height() / 2;
-            let cursor = gdk::Cursor::from_texture(&texture, hotspot_x, hotspot_y, None);
-
-            for widget in gtk::Window::list_toplevels() {
-                widget.set_cursor(Some(&cursor));
-                if let Some(native) = widget.native() {
-                    if let Some(surface) = native.surface() {
-                        surface.set_cursor(Some(&cursor));
-                    }
-                }
-            }
-
-            OVERLAY_WINDOWS.with(|cell| {
-                for win in cell.borrow().iter() {
-                    win.set_cursor(Some(&cursor));
-                    if let Some(native) = win.native() {
-                        if let Some(surface) = native.surface() {
-                            surface.set_cursor(Some(&cursor));
-                        }
-                    }
-                }
-            });
-
-            if let Some(b) = source_button {
-                b.set_cursor(Some(&cursor));
-                if let Some(native) = b.native() {
-                    if let Some(surface) = native.surface() {
-                        surface.set_cursor(Some(&cursor));
-                    }
-                }
-            }
-
-            DRAG_CURSOR_GRAB.with(|g| g.set(true));
+            let cursor = gdk::Cursor::from_texture(&texture, texture.width() / 2, texture.height() / 2, None);
+            apply_cursor_to_windows(Some(&cursor), source_button);
+            set_drag_cursor_grab(true);
             display.flush();
         }
     }
 }
 
 pub fn reset_all_cursors_and_overlay(source_button: Option<&Button>) {
-    release_drag_cursor_grab();
+    set_drag_cursor_grab(false);
 
     if let Some(display) = gdk::Display::default() {
-        for widget in gtk::Window::list_toplevels() {
-            widget.set_cursor(None);
-            if let Some(native) = widget.native() {
-                if let Some(surface) = native.surface() {
-                    surface.set_cursor(None);
-                }
-            }
-        }
-
-        OVERLAY_WINDOWS.with(|cell| {
-            for win in cell.borrow().iter() {
-                win.set_cursor(None);
-                if let Some(native) = win.native() {
-                    if let Some(surface) = native.surface() {
-                        surface.set_cursor(None);
-                    }
-                }
-            }
-        });
-
+        apply_cursor_to_windows(None, None);
         display.flush();
     }
 
@@ -1036,7 +1108,7 @@ mod tests {
     fn test_drag_cursor_grab_released_on_reset() {
         crate::util::run_gtk_test(|| {
             // Pretend a drag grabbed the pointer for its cursor.
-            DRAG_CURSOR_GRAB.with(|g| g.set(true));
+            set_drag_cursor_grab(true);
             assert!(drag_cursor_grab_active());
 
             // Every drag end path goes through reset: it must release the grab,
@@ -1056,58 +1128,59 @@ mod tests {
             let btn = gtk::Button::new();
             btn.add_css_class("is-dragging");
             let (tx, _rx) = async_channel::unbounded();
+            let drag = DragController::new();
 
             // 1. Active drag (is_dragging = true) + sequence cancelled (overlay mapped over bar):
-            // Must NOT abort GLOBAL_DRAG or strip .is-dragging; overlay now owns the drag.
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            // Must NOT abort active drag or strip .is-dragging; overlay now owns the drag.
+            drag.set_for_test(Some(GlobalDragState {
                 window_id: 77,
                 is_dragging: true,
                 ..test_drag()
-            });
-            let ended = handle_source_gesture_end(77, true, Some(&btn), &tx);
+            }));
+            let ended = drag.handle_source_gesture_end(77, true, Some(&btn), &tx);
             assert!(
                 !ended,
                 "Cancelled GestureDrag on BarWindow while is_dragging=true must hand off to overlay without aborting"
             );
-            assert!(crate::util::lock(&GLOBAL_DRAG).is_some());
+            assert_eq!(drag.active_window_id(), Some(77));
             assert!(btn.has_css_class("is-dragging"));
 
             // 2. Non-dragging press (is_dragging = false) + sequence cancelled:
-            // Must clean up GLOBAL_DRAG without focusing.
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            // Must clean up active drag without focusing.
+            drag.set_for_test(Some(GlobalDragState {
                 window_id: 77,
                 is_dragging: false,
                 ..test_drag()
-            });
-            let ended_pre_drag = handle_source_gesture_end(77, true, Some(&btn), &tx);
+            }));
+            let ended_pre_drag = drag.handle_source_gesture_end(77, true, Some(&btn), &tx);
             assert!(ended_pre_drag);
-            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+            assert_eq!(drag.active_window_id(), None);
             assert!(!btn.has_css_class("is-dragging"));
 
             // 3. Normal plain click (is_dragging = false, sequence_cancelled = false):
-            // Completes drag cleanly and clears GLOBAL_DRAG.
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            // Completes drag cleanly and clears active drag.
+            drag.set_for_test(Some(GlobalDragState {
                 window_id: 77,
                 is_dragging: false,
                 ..test_drag()
-            });
-            let ended_click = handle_source_gesture_end(77, false, Some(&btn), &tx);
+            }));
+            let ended_click = drag.handle_source_gesture_end(77, false, Some(&btn), &tx);
             assert!(ended_click, "Plain click release must finish the drag");
-            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+            assert_eq!(drag.active_window_id(), None);
 
             // 4. Local drag release on source button (is_dragging = true, sequence_cancelled = false):
-            // Drops locally and clears GLOBAL_DRAG.
+            // Drops locally and clears active drag.
             btn.add_css_class("is-dragging");
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            drag.set_for_test(Some(GlobalDragState {
                 window_id: 77,
                 is_dragging: true,
                 current_target_slot: 2,
                 source_index: 0,
                 ..test_drag()
-            });
-            let ended_local = handle_source_gesture_end(77, false, Some(&btn), &tx);
+            }));
+            let ended_local = drag.handle_source_gesture_end(77, false, Some(&btn), &tx);
             assert!(ended_local, "Local drop on button must finish the drag");
-            assert!(crate::util::lock(&GLOBAL_DRAG).is_none());
+            assert_eq!(drag.active_window_id(), None);
             assert!(!btn.has_css_class("is-dragging"));
         });
     }
@@ -1116,41 +1189,40 @@ mod tests {
     fn test_overlay_creation_and_escape_teardown() {
         crate::util::run_gtk_test(|| {
             use crate::niri::AppState;
-            use std::sync::{Arc, Mutex};
 
             struct DragGuard;
             impl Drop for DragGuard {
                 fn drop(&mut self) {
-                    *crate::util::lock(&GLOBAL_DRAG) = None;
                     close_overlay_windows();
                 }
             }
             let _guard = DragGuard;
 
+            let drag = Arc::new(DragController::new());
             let state = Arc::new(Mutex::new(AppState::default()));
             let (tx, _rx) = async_channel::unbounded();
             let source_btn = Button::new();
             source_btn.add_css_class("is-dragging");
 
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            drag.set_for_test(Some(GlobalDragState {
                 window_id: 99,
                 is_dragging: true,
                 ..test_drag()
-            });
+            }));
 
-            spawn_monitor_overlays(&state, &tx, 99, &source_btn);
+            spawn_monitor_overlays(&drag, &state, &tx, 99, &source_btn);
 
             // Overlays were spawned
-            let overlay_count = OVERLAY_WINDOWS.with(|cell| cell.borrow().len());
+            let overlay_count = DRAG_UI.with(|cell| cell.borrow().windows.len());
             assert!(
                 overlay_count > 0,
                 "Expected at least one overlay window spawned across monitors"
             );
 
             // Verify overlay controllers
-            OVERLAY_WINDOWS.with(|cell| {
-                let windows = cell.borrow();
-                let overlay = &windows[0];
+            DRAG_UI.with(|cell| {
+                let ui = cell.borrow();
+                let overlay = &ui.windows[0];
                 let controllers = overlay.observe_controllers();
                 let mut has_motion = false;
                 let mut has_legacy = false;
@@ -1190,9 +1262,9 @@ mod tests {
 
             // Verify that applying drag cursor sets cursor on overlay window and its surface
             apply_drag_cursor_globally("firefox", 24, Some(&source_btn));
-            OVERLAY_WINDOWS.with(|cell| {
-                let windows = cell.borrow();
-                let overlay = &windows[0];
+            DRAG_UI.with(|cell| {
+                let ui = cell.borrow();
+                let overlay = &ui.windows[0];
                 assert!(overlay.cursor().is_some(), "Overlay window widget cursor must be set");
                 if let Some(native) = overlay.native() {
                     if let Some(surface) = native.surface() {
@@ -1203,7 +1275,7 @@ mod tests {
 
             // Teardown via close_overlay_windows
             close_overlay_windows();
-            let remaining = OVERLAY_WINDOWS.with(|cell| cell.borrow().len());
+            let remaining = DRAG_UI.with(|cell| cell.borrow().windows.len());
             assert_eq!(remaining, 0, "Overlay windows must be emptied on close");
         });
     }
@@ -1250,5 +1322,70 @@ mod tests {
             }
             win.close();
         });
+    }
+
+    #[test]
+    fn test_set_widget_and_surface_cursor_updates_cursor() {
+        crate::util::run_gtk_test(|| {
+            let win = Window::new();
+            let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 8, 8).unwrap();
+            let tex = gdk::Texture::for_pixbuf(&pb);
+            let cursor = gdk::Cursor::from_texture(&tex, 4, 4, None);
+            set_widget_and_surface_cursor(&win, Some(&cursor));
+            assert!(win.cursor().is_some());
+            set_widget_and_surface_cursor(&win, None);
+            assert!(win.cursor().is_none());
+            win.close();
+        });
+    }
+
+    #[test]
+    fn test_drag_controller_isolation_and_lifecycle() {
+        let a = DragController::new();
+        let b = DragController::new();
+
+        a.begin_press(10, Some("eDP-1".into()), 0, (1.0, 2.0), (1.0, 2.0));
+        assert_eq!(a.active_window_id(), Some(10));
+        assert_eq!(
+            b.active_window_id(),
+            None,
+            "Separate DragController instances must be isolated"
+        );
+
+        // Monotonic generation & single-drag guard once dragging starts.
+        assert!(a.is_dragging_or_activate_test(10, true));
+        a.begin_press(20, Some("eDP-1".into()), 1, (5.0, 5.0), (5.0, 5.0));
+        assert_eq!(
+            a.active_window_id(),
+            Some(10),
+            "Active drag must not be clobbered by another window press"
+        );
+
+        // Switching target output resets preview slot validity; same output keeps it.
+        a.set_cross_monitor_preview_slot(10, 2);
+        a.store_position(10, 1500.0, 40.0, Some("DP-1".into()));
+        assert!(!a.snapshot().unwrap().target_slot_valid);
+        a.set_cross_monitor_preview_slot(10, 3);
+        a.store_position(10, 1510.0, 42.0, Some("DP-1".into()));
+        assert!(a.snapshot().unwrap().target_slot_valid);
+
+        // Closing another window does not cancel window 10.
+        assert!(!a.cancel_window(99));
+        assert_eq!(a.active_window_id(), Some(10));
+
+        // Closing window 10 clears it and schedules cleanup; if a newer drag B starts
+        // first, should_cleanup_cancel returns false so B survives.
+        assert!(a.cancel_window(10));
+        assert_eq!(a.active_window_id(), None);
+        a.begin_press(20, Some("eDP-1".into()), 1, (5.0, 5.0), (5.0, 5.0));
+        assert!(
+            !a.should_cleanup_cancel(),
+            "Pending cancel for closed win 10 must not tear down newer drag for win 20"
+        );
+
+        // Cancelling win 20 when no new drag replaces it triggers cleanup.
+        assert!(a.cancel_window(20));
+        assert!(a.should_cleanup_cancel());
+        assert!(!a.should_cleanup_cancel());
     }
 }

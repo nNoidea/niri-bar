@@ -3,7 +3,7 @@ use std::fs;
 use std::time::Duration;
 
 use crate::config::MemoryConfig;
-use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{BarModule, ModuleCore, ModuleState};
 
 pub struct MemoryModule {
     config: MemoryConfig,
@@ -136,8 +136,6 @@ impl BarModule for MemoryModule {
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
         self.config.click.commands()
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 }
 
 #[cfg(test)]

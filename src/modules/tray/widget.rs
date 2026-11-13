@@ -1,14 +1,12 @@
-use futures_util::future::{select, Either};
 use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Button, Image, Label, Orientation, Popover, Separator, Window};
 use std::collections::HashMap;
-use std::pin::pin;
 use std::sync::Arc;
 
 use super::protocol::clean_menu_label;
 use super::service::TrayService;
-use super::types::{ActivateRequest, MenuItem, ToggleType, TrayEvent, TrayItem, TrayTooltip};
+use super::types::{ActivateKind, ActivateRequest, MenuItem, ToggleType, TrayEvent, TrayItem, TrayTooltip};
 use crate::config::BarPosition;
 use crate::icon::update_tray_image;
 use crate::layer_shell::{KeyboardMode, LayerShell};
@@ -74,22 +72,15 @@ impl TrayWidget {
         let container_weak = container.downgrade();
         glib::MainContext::default().spawn_local(async move {
             loop {
-                let next = {
-                    let svc_fut = pin!(rx.recv());
-                    let scale_fut = pin!(scale_rx.recv());
-                    match select(svc_fut, scale_fut).await {
-                        Either::Left((res, _)) => match res {
-                            Ok(ev) => Some(TrayLoopEvent::Service(ev)),
-                            Err(_) => None,
-                        },
-                        Either::Right((res, _)) => match res {
-                            Ok(s) => Some(TrayLoopEvent::Scale(s)),
-                            Err(_) => None,
-                        },
-                    }
-                };
-                let Some(ev) = next else {
-                    break;
+                let ev = tokio::select! {
+                    res = rx.recv() => match res {
+                        Ok(ev) => TrayLoopEvent::Service(ev),
+                        Err(_) => break,
+                    },
+                    res = scale_rx.recv() => match res {
+                        Ok(s) => TrayLoopEvent::Scale(s),
+                        Err(_) => break,
+                    },
                 };
                 let Some(cont) = container_weak.upgrade() else {
                     break;
@@ -121,7 +112,7 @@ impl TrayWidget {
                         if clamped != current_scale {
                             current_scale = clamped;
                             for (key, (_, image)) in &buttons {
-                                if let (Some(item), _) = service_events.get_item_and_menu(key) {
+                                if let Some(item) = service_events.get_item(key) {
                                     Self::update_item_icon(image, &item, icon_sz, current_scale);
                                 }
                             }
@@ -147,39 +138,49 @@ impl TrayWidget {
     }
 
     pub fn compute_tooltip(title: Option<&str>, tooltip: Option<&TrayTooltip>) -> Option<String> {
+        let nonempty = |s: &str| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
         if let Some(tt) = tooltip {
             let t = tt.title.trim();
             let d = tt.description.trim();
-            if !t.is_empty() && !d.is_empty() {
-                if t.eq_ignore_ascii_case(d) {
-                    Some(t.to_string())
+            match (t.is_empty(), d.is_empty()) {
+                (false, false) => Some(if t.eq_ignore_ascii_case(d) {
+                    t.to_string()
                 } else {
-                    Some(format!("{t}: {d}"))
-                }
-            } else if !d.is_empty() {
-                Some(d.to_string())
-            } else if !t.is_empty() {
-                Some(t.to_string())
-            } else if let Some(title_str) = title {
-                let trimmed = title_str.trim();
-                if !trimmed.is_empty() {
-                    Some(trimmed.to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if let Some(title_str) = title {
-            let trimmed = title_str.trim();
-            if !trimmed.is_empty() {
-                Some(trimmed.to_string())
-            } else {
-                None
+                    format!("{t}: {d}")
+                }),
+                (true, false) => Some(d.to_string()),
+                (false, true) => Some(t.to_string()),
+                (true, true) => title.and_then(nonempty),
             }
         } else {
-            None
+            title.and_then(nonempty)
         }
+    }
+
+    fn try_open_tray_menu(
+        btn: &Button,
+        item: &TrayItem,
+        tray_menu: Option<&super::types::TrayMenu>,
+        svc: &Arc<TrayService>,
+        position: BarPosition,
+    ) -> bool {
+        let (Some(menu_path), Some(menu)) = (item.menu_path.as_ref(), tray_menu) else {
+            return false;
+        };
+        if menu.submenus.is_empty() {
+            return false;
+        }
+        svc.send_activate(ActivateRequest::AboutToShow {
+            bus_name: item.bus_name.clone(),
+            menu_path: menu_path.clone(),
+            id: 0,
+        });
+        let popover = build_tray_popover(&item.bus_name, menu_path, &menu.submenus, svc);
+        Self::popup_tray_menu(btn, &popover, position);
+        true
     }
 
     fn create_button(
@@ -234,69 +235,31 @@ impl TrayWidget {
                 return;
             };
 
-            match gesture.current_button() {
+            let kind = match gesture.current_button() {
                 1 => {
-                    // Left Click:
-                    if item.item_is_menu {
-                        if let (Some(menu_path), Some(tray_menu)) = (item.menu_path.clone(), tray_menu_opt) {
-                            if !tray_menu.submenus.is_empty() {
-                                svc.send_activate(ActivateRequest::AboutToShow {
-                                    bus_name: item.bus_name.clone(),
-                                    menu_path: menu_path.clone(),
-                                    id: 0,
-                                });
-                                let popover = build_tray_popover(&item.bus_name, &menu_path, &tray_menu.submenus, &svc);
-                                Self::popup_tray_menu(&btn, &popover, position);
-                                return;
-                            }
-                        }
+                    if item.item_is_menu
+                        && Self::try_open_tray_menu(&btn, &item, tray_menu_opt.as_ref(), &svc, position)
+                    {
+                        return;
                     }
-
-                    // Otherwise, send primary Activation
-                    svc.send_activate(ActivateRequest::Default {
-                        bus_name: item.bus_name.clone(),
-                        object_path: item.object_path,
-                        x: rx as i32,
-                        y: ry as i32,
-                    });
+                    ActivateKind::Default
                 }
-                2 => {
-                    // Middle Click: Secondary Action
-                    svc.send_activate(ActivateRequest::Secondary {
-                        bus_name: item.bus_name.clone(),
-                        object_path: item.object_path,
-                        x: rx as i32,
-                        y: ry as i32,
-                    });
-                }
+                2 => ActivateKind::Secondary,
                 3 => {
-                    // Right Click: Show DBusMenu or fallback to ContextMenu
-                    let mut showed_popup = false;
-
-                    if let (Some(ref menu_path), Some(ref tray_menu)) = (item.menu_path, tray_menu_opt) {
-                        if !tray_menu.submenus.is_empty() {
-                            svc.send_activate(ActivateRequest::AboutToShow {
-                                bus_name: item.bus_name.clone(),
-                                menu_path: menu_path.clone(),
-                                id: 0,
-                            });
-                            let popover = build_tray_popover(&item.bus_name, menu_path, &tray_menu.submenus, &svc);
-                            Self::popup_tray_menu(&btn, &popover, position);
-                            showed_popup = true;
-                        }
+                    if Self::try_open_tray_menu(&btn, &item, tray_menu_opt.as_ref(), &svc, position) {
+                        return;
                     }
-
-                    if !showed_popup {
-                        svc.send_activate(ActivateRequest::ContextMenu {
-                            bus_name: item.bus_name.clone(),
-                            object_path: item.object_path,
-                            x: rx as i32,
-                            y: ry as i32,
-                        });
-                    }
+                    ActivateKind::ContextMenu
                 }
-                _ => {}
-            }
+                _ => return,
+            };
+            svc.send_activate(ActivateRequest::Activate {
+                kind,
+                bus_name: item.bus_name,
+                object_path: item.object_path,
+                x: rx as i32,
+                y: ry as i32,
+            });
         });
         button.add_controller(click);
 
@@ -307,8 +270,7 @@ impl TrayWidget {
             gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
         );
         scroll.connect_scroll(move |_, dx, dy| {
-            let (item_opt, _) = svc_scroll.get_item_and_menu(&k_scroll);
-            if let Some(item) = item_opt {
+            if let Some(item) = svc_scroll.get_item(&k_scroll) {
                 let (delta, orient) = if dy < 0.0 {
                     (-1, "vertical")
                 } else if dy > 0.0 {
@@ -423,6 +385,19 @@ fn build_tray_popover(bus_name: &str, menu_path: &str, submenus: &[MenuItem], se
     popover
 }
 
+fn make_menu_button(label: &str, enabled: bool) -> Button {
+    let mi = Button::new();
+    mi.set_has_frame(false);
+    mi.set_focusable(false);
+    mi.add_css_class("tray-menu-item");
+    let lbl = Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    mi.set_child(Some(&lbl));
+    mi.set_sensitive(enabled);
+    enable_menu_item_hover_cursor(&mi);
+    mi
+}
+
 fn append_menu_items(
     container: &GtkBox,
     root_popover: &Popover,
@@ -478,15 +453,7 @@ fn append_menu_items(
                 &item.submenu
             };
 
-            let mi = Button::new();
-            mi.set_has_frame(false);
-            mi.set_focusable(false);
-            mi.add_css_class("tray-menu-item");
-            let lbl = Label::new(Some(&format!("{clean_label} ▸")));
-            lbl.set_xalign(0.0);
-            mi.set_child(Some(&lbl));
-            mi.set_sensitive(item.enabled);
-            enable_menu_item_hover_cursor(&mi);
+            let mi = make_menu_button(&format!("{clean_label} ▸"), item.enabled);
 
             let sub_box = GtkBox::new(Orientation::Vertical, 1);
             sub_box.set_margin_start(10);
@@ -514,15 +481,7 @@ fn append_menu_items(
                 _ => clean_label.clone(),
             };
 
-            let mi = Button::new();
-            mi.set_has_frame(false);
-            mi.set_focusable(false);
-            mi.add_css_class("tray-menu-item");
-            let lbl = Label::new(Some(&display_text));
-            lbl.set_xalign(0.0);
-            mi.set_child(Some(&lbl));
-            mi.set_sensitive(item.enabled);
-            enable_menu_item_hover_cursor(&mi);
+            let mi = make_menu_button(&display_text, item.enabled);
 
             let item_id = item.id;
             let svc = Arc::clone(service);

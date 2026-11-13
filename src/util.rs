@@ -77,22 +77,35 @@ pub fn widget_children(parent: &impl gtk::prelude::WidgetExt) -> Vec<gtk::Widget
 /// Move `child` to zero-based index `target_idx` inside `container`.
 pub fn reorder_box_child(container: &gtk::Box, child: &impl gtk::prelude::IsA<gtk::Widget>, target_idx: usize) {
     use gtk::prelude::*;
-    let children = widget_children(container);
     let child_ref: &gtk::Widget = child.as_ref();
-    let cur_idx = children.iter().position(|c| c == child_ref);
-    if cur_idx == Some(target_idx) {
-        return;
+    let mut prev_other: Option<gtk::Widget> = None;
+    let mut last_other: Option<gtk::Widget> = None;
+    let mut other_idx = 0usize;
+    let mut total_idx = 0usize;
+
+    let mut cur = container.first_child();
+    while let Some(c) = cur {
+        cur = c.next_sibling();
+        if &c == child_ref {
+            if total_idx == target_idx {
+                return;
+            }
+        } else {
+            if other_idx + 1 == target_idx {
+                prev_other = Some(c.clone());
+            }
+            last_other = Some(c);
+            other_idx += 1;
+        }
+        total_idx += 1;
     }
-    if target_idx == 0 {
-        container.reorder_child_after(child, Option::<&gtk::Widget>::None);
+
+    let after = if target_idx == 0 {
+        None
     } else {
-        let others: Vec<&gtk::Widget> = children.iter().filter(|c| *c != child_ref).collect();
-        let prev = others
-            .get(target_idx.saturating_sub(1))
-            .copied()
-            .or_else(|| others.last().copied());
-        container.reorder_child_after(child, prev);
-    }
+        prev_other.or(last_other)
+    };
+    container.reorder_child_after(child, after.as_ref());
 }
 
 /// Translate `(x, y)` from `from` widget coordinates into `to` widget coordinates.

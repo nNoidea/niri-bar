@@ -17,7 +17,7 @@ use crate::niri::{detect_monitor_output, NiriService};
 pub struct BarWindow {
     pub window: Window,
     pub monitor: gdk::Monitor,
-    pub taskbar: TaskbarWidget,
+    pub taskbar: Option<TaskbarWidget>,
     pub detected_output: Option<String>,
     pub error_badge: ErrorBadge,
     start_box: GtkBox,
@@ -83,27 +83,21 @@ pub fn compute_taskbar_capacity(
     taskbar_container: &GtkBox,
 ) -> usize {
     let is_vertical = config.position.is_vertical();
+    let axis_len = |w: i32, h: i32| if is_vertical { h } else { w };
     let mon_geom = monitor.geometry();
-    let mon_len = if is_vertical {
-        mon_geom.height()
-    } else {
-        mon_geom.width()
-    };
+    let mon_len = axis_len(mon_geom.width(), mon_geom.height());
     let (_, end_req) = end_box.preferred_size();
-    let end_len = if is_vertical { end_req.height() } else { end_req.width() };
+    let end_len = axis_len(end_req.width(), end_req.height());
     let taskbar_widget: &gtk::Widget = taskbar_container.upcast_ref();
-    let start_non_taskbar_len: i32 = crate::util::widget_children(start_box)
-        .iter()
-        .filter(|c| *c != taskbar_widget)
-        .map(|c| {
+    let mut start_non_taskbar_len = 0;
+    let mut child = start_box.first_child();
+    while let Some(c) = child {
+        if &c != taskbar_widget {
             let (_, req) = c.preferred_size();
-            if is_vertical {
-                req.height()
-            } else {
-                req.width()
-            }
-        })
-        .sum();
+            start_non_taskbar_len += axis_len(req.width(), req.height());
+        }
+        child = c.next_sibling();
+    }
     let item_stride = (config.size + config.spacing).max(1);
     calculate_taskbar_capacity(mon_len, end_len, start_non_taskbar_len, item_stride)
 }
@@ -113,9 +107,7 @@ pub fn resolve_module_placement(name: &str) -> Option<ModulePlacement> {
     match name {
         "taskbar" => Some(ModulePlacement::Taskbar),
         "tray" => Some(ModulePlacement::Tray),
-        "volume" | "bluetooth" | "network" | "memory" | "brightness" | "battery" | "clock" | "spacer" => {
-            Some(ModulePlacement::Simple)
-        }
+        _ if crate::modules::is_known_simple_module(name) => Some(ModulePlacement::Simple),
         _ => None,
     }
 }
@@ -267,121 +259,87 @@ impl ErrorBadge {
     }
 }
 
-impl BarWindow {
-    pub fn new(
-        monitor: gdk::Monitor,
-        config: &AppConfig,
-        niri: &Arc<NiriService>,
-        tray_service: &Arc<TrayService>,
-        modules: &SharedModules,
-    ) -> Self {
-        let window = Window::new();
-        window.init_layer_shell();
-        window.set_monitor(Some(&monitor));
-        window.set_layer(Layer::Top);
-        window.auto_exclusive_zone_enable();
+fn configure_layer_shell_window(monitor: &gdk::Monitor, config: &AppConfig) -> (Window, Orientation) {
+    let window = Window::new();
+    window.init_layer_shell();
+    window.set_monitor(Some(monitor));
+    window.set_layer(Layer::Top);
+    window.auto_exclusive_zone_enable();
 
-        let is_vertical = config.position.is_vertical();
-        let box_orient = if is_vertical {
-            Orientation::Vertical
-        } else {
-            Orientation::Horizontal
-        };
+    let is_vertical = config.position.is_vertical();
+    let box_orient = if is_vertical {
+        Orientation::Vertical
+    } else {
+        Orientation::Horizontal
+    };
 
-        // Anchors and sizing
-        match config.position {
-            BarPosition::Left => {
-                window.set_anchor(Edge::Left, true);
-                window.set_anchor(Edge::Top, true);
-                window.set_anchor(Edge::Bottom, true);
-                window.set_size_request(config.size, -1);
-            }
-            BarPosition::Right => {
-                window.set_anchor(Edge::Right, true);
-                window.set_anchor(Edge::Top, true);
-                window.set_anchor(Edge::Bottom, true);
-                window.set_size_request(config.size, -1);
-            }
-            BarPosition::Top => {
-                window.set_anchor(Edge::Top, true);
-                window.set_anchor(Edge::Left, true);
-                window.set_anchor(Edge::Right, true);
-                window.set_size_request(-1, config.size);
-            }
-            BarPosition::Bottom => {
-                window.set_anchor(Edge::Bottom, true);
-                window.set_anchor(Edge::Left, true);
-                window.set_anchor(Edge::Right, true);
-                window.set_size_request(-1, config.size);
-            }
-        }
+    let (edges, (req_w, req_h)) = match config.position {
+        BarPosition::Left => ([Edge::Left, Edge::Top, Edge::Bottom], (config.size, -1)),
+        BarPosition::Right => ([Edge::Right, Edge::Top, Edge::Bottom], (config.size, -1)),
+        BarPosition::Top => ([Edge::Top, Edge::Left, Edge::Right], (-1, config.size)),
+        BarPosition::Bottom => ([Edge::Bottom, Edge::Left, Edge::Right], (-1, config.size)),
+    };
+    for edge in edges {
+        window.set_anchor(edge, true);
+    }
+    window.set_size_request(req_w, req_h);
+    window.add_css_class("niri-bar");
+    window.add_css_class(if is_vertical { "vertical" } else { "horizontal" });
 
-        window.add_css_class("niri-bar");
-        if is_vertical {
-            window.add_css_class("vertical");
-        } else {
-            window.add_css_class("horizontal");
-        }
+    (window, box_orient)
+}
 
-        let overlay = gtk::Overlay::new();
-        window.set_child(Some(&overlay));
+fn make_bar_section(box_orient: Orientation, spacing: i32, classes: &[&str], main_align: gtk::Align) -> GtkBox {
+    let b = GtkBox::new(box_orient, spacing);
+    for cls in classes {
+        b.add_css_class(cls);
+    }
+    if box_orient == Orientation::Vertical {
+        b.set_valign(main_align);
+        b.set_halign(gtk::Align::Fill);
+    } else {
+        b.set_halign(main_align);
+        b.set_valign(gtk::Align::Fill);
+    }
+    b
+}
 
-        // 1. Section 1: Modules at start (base layer)
-        let start_box = GtkBox::new(box_orient, config.spacing);
-        start_box.add_css_class("taskbar-section");
-        start_box.add_css_class("start-section");
-        if is_vertical {
-            start_box.set_valign(gtk::Align::Start);
-            start_box.set_halign(gtk::Align::Fill);
-        } else {
-            start_box.set_halign(gtk::Align::Start);
-            start_box.set_valign(gtk::Align::Fill);
-        }
-        let initial_scale = monitor.scale_factor().max(1);
-        let taskbar = TaskbarWidget::new(
-            box_orient,
-            config.spacing,
-            config.position,
-            config.size,
-            niri.update_tx.clone(),
-            initial_scale,
-        );
-        overlay.set_child(Some(&start_box));
+struct BarSectionCtx<'a> {
+    taskbar: Option<&'a TaskbarWidget>,
+    tray_service: Option<&'a Arc<TrayService>>,
+    modules: &'a SharedModules,
+    config: &'a AppConfig,
+    box_orient: Orientation,
+    initial_scale: i32,
+}
 
-        // 2. Section 2: Modules at end (overlay layer)
-        let end_box = GtkBox::new(box_orient, config.spacing);
-        end_box.add_css_class("modules-box");
-        end_box.add_css_class("modules-section");
-        end_box.add_css_class("end-section");
-        if is_vertical {
-            end_box.set_valign(gtk::Align::End);
-            end_box.set_halign(gtk::Align::Fill);
-        } else {
-            end_box.set_halign(gtk::Align::End);
-            end_box.set_valign(gtk::Align::Fill);
-        }
-        overlay.add_overlay(&end_box);
-
-        let add_module = |container: &GtkBox, mod_name: &str| match resolve_module_placement(mod_name) {
+fn populate_bar_section(container: &GtkBox, mod_names: &[String], ctx: &BarSectionCtx<'_>) {
+    let is_vertical = ctx.config.position.is_vertical();
+    for mod_name in mod_names {
+        match resolve_module_placement(mod_name) {
             Some(ModulePlacement::Taskbar) => {
-                container.append(&taskbar.container);
+                if let Some(tb) = ctx.taskbar {
+                    container.append(&tb.container);
+                }
             }
             Some(ModulePlacement::Tray) => {
-                let tray_w = TrayWidget::new(
-                    tray_service,
-                    box_orient,
-                    config.position,
-                    config.tray.icon_size,
-                    config.tray.spacing,
-                    initial_scale,
-                );
-                container.append(&tray_w.container);
+                if let Some(tray_svc) = ctx.tray_service {
+                    let tray_w = TrayWidget::new(
+                        tray_svc,
+                        ctx.box_orient,
+                        ctx.config.position,
+                        ctx.config.tray.icon_size,
+                        ctx.config.tray.spacing,
+                        ctx.initial_scale,
+                    );
+                    container.append(&tray_w.container);
+                }
             }
             Some(ModulePlacement::Simple) => {
-                if let Some(m) = modules.get(mod_name) {
-                    let w = ModuleWidget::new(m, box_orient);
+                if let Some(m) = ctx.modules.get(mod_name) {
+                    let w = ModuleWidget::new(m, ctx.box_orient);
                     if mod_name == "spacer" {
-                        crate::modules::spacer::configure_spacer_button(&w.button, config.spacer.size, is_vertical);
+                        crate::modules::spacer::configure_spacer_button(&w.button, ctx.config.spacer.size, is_vertical);
                     }
                     container.append(&w.button);
                 }
@@ -393,15 +351,59 @@ impl BarWindow {
                     &format!("Unknown module '{mod_name}', skipping (check [modules] start/end)"),
                 );
             }
+        }
+    }
+}
+
+impl BarWindow {
+    pub fn new(
+        monitor: gdk::Monitor,
+        config: &AppConfig,
+        niri: &Arc<NiriService>,
+        tray_service: Option<&Arc<TrayService>>,
+        modules: &SharedModules,
+    ) -> Self {
+        let (window, box_orient) = configure_layer_shell_window(&monitor, config);
+        let overlay = gtk::Overlay::new();
+        window.set_child(Some(&overlay));
+
+        let start_box = make_bar_section(
+            box_orient,
+            config.spacing,
+            &["taskbar-section", "start-section"],
+            gtk::Align::Start,
+        );
+        let end_box = make_bar_section(
+            box_orient,
+            config.spacing,
+            &["modules-box", "modules-section", "end-section"],
+            gtk::Align::End,
+        );
+        overlay.set_child(Some(&start_box));
+        overlay.add_overlay(&end_box);
+
+        let initial_scale = monitor.scale_factor().max(1);
+        let taskbar = config.modules.contains_module("taskbar").then(|| {
+            TaskbarWidget::new(
+                box_orient,
+                config.spacing,
+                config.position,
+                config.size,
+                niri.update_tx.clone(),
+                initial_scale,
+            )
+        });
+
+        let section_ctx = BarSectionCtx {
+            taskbar: taskbar.as_ref(),
+            tray_service,
+            modules,
+            config,
+            box_orient,
+            initial_scale,
         };
-
-        for mod_name in &config.modules.start_modules() {
-            add_module(&start_box, mod_name);
-        }
-
-        for mod_name in &config.modules.end_modules() {
-            add_module(&end_box, mod_name);
-        }
+        populate_bar_section(&start_box, &config.modules.start_modules(), &section_ctx);
+        populate_bar_section(&end_box, &config.modules.end_modules(), &section_ctx);
 
         // Live config / style error badge (black background, red text, self-contained without external CSS)
         let error_badge = ErrorBadge::new();
@@ -409,7 +411,6 @@ impl BarWindow {
 
         window.set_visible(true);
 
-        // Initial taskbar reconcile
         let detected_output = {
             let st = crate::util::lock(&niri.state);
             detect_monitor_output(&monitor, &st.outputs)
@@ -426,10 +427,11 @@ impl BarWindow {
             detected_output
         );
 
-        let capacity = compute_taskbar_capacity(&monitor, config, &start_box, &end_box, &taskbar.container);
-        log_debug!("bar", "Bar capacity computed: {}", capacity);
-
-        taskbar.reconcile(&detected_output, &niri.state, &config.taskbar, niri, capacity);
+        if let Some(ref tb) = taskbar {
+            let capacity = compute_taskbar_capacity(&monitor, config, &start_box, &end_box, &tb.container);
+            log_debug!("bar", "Bar capacity computed: {}", capacity);
+            tb.reconcile(&detected_output, &niri.state, &config.taskbar, niri, capacity);
+        }
 
         Self {
             window,
@@ -453,16 +455,6 @@ impl BarWindow {
         self.error_badge.clear_error();
     }
 
-    fn compute_capacity(&self, config: &AppConfig) -> usize {
-        compute_taskbar_capacity(
-            &self.monitor,
-            config,
-            &self.start_box,
-            &self.end_box,
-            &self.taskbar.container,
-        )
-    }
-
     /// Re-resolve the Niri output for this monitor and reconcile the taskbar.
     /// Called on every Niri update and monitor reconcile; never blocks on IPC.
     ///
@@ -471,11 +463,10 @@ impl BarWindow {
     /// staying there forever after a hotplug race, an unresolved bar
     /// triggers its own throttled off-thread outputs refetch.
     pub fn update(&mut self, niri: &Arc<NiriService>, config: &AppConfig) {
-        let outputs = {
+        let new_detected = {
             let st = crate::util::lock(&niri.state);
-            st.outputs.clone()
+            detect_monitor_output(&self.monitor, &st.outputs)
         };
-        let new_detected = detect_monitor_output(&self.monitor, &outputs);
         if new_detected != self.detected_output {
             log_info!(
                 "bar",
@@ -486,7 +477,7 @@ impl BarWindow {
             );
         }
         self.detected_output = new_detected;
-        if self.detected_output.is_none() {
+        if self.taskbar.is_some() && self.detected_output.is_none() {
             let now = std::time::Instant::now();
             let due = self
                 .last_output_refresh
@@ -502,9 +493,16 @@ impl BarWindow {
                 niri.refresh_outputs_async();
             }
         }
-        let capacity = self.compute_capacity(config);
-        self.taskbar
-            .reconcile(&self.detected_output, &niri.state, &config.taskbar, niri, capacity);
+        if let Some(ref mut taskbar) = self.taskbar {
+            let capacity = compute_taskbar_capacity(
+                &self.monitor,
+                config,
+                &self.start_box,
+                &self.end_box,
+                &taskbar.container,
+            );
+            taskbar.reconcile(&self.detected_output, &niri.state, &config.taskbar, niri, capacity);
+        }
     }
 }
 

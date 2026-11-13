@@ -36,59 +36,46 @@ pub fn resolve_level(
     value: u32,
     special_state: Option<&str>,
 ) -> (String, Option<u32>) {
-    // 1. If special state is passed (e.g. "muted", "charging", "full"), check if it exists in levels
-    if let Some(state) = special_state {
-        if let Some(template) = levels.get(state) {
-            let replaced = template.replace("%v", &value.to_string());
-            return (replaced, None);
-        }
+    // 1. Special state overrides numeric thresholds (e.g. "muted", "charging", "full")
+    if let Some(template) = special_state.and_then(|s| levels.get(s)) {
+        return (template.replace("%v", &value.to_string()), None);
     }
 
-    // 2. Parse numeric thresholds from the map
-    let mut numeric_thresholds: Vec<(u32, &String)> = Vec::new();
+    // 2. Single-pass scan for highest threshold <= value, falling back to minimum threshold
+    let mut best_le: Option<(u32, &str)> = None;
+    let mut min_any: Option<(u32, &str)> = None;
     for (k, v) in levels {
-        let clean_k = k.trim().trim_end_matches('%');
-        if let Ok(threshold) = clean_k.parse::<u32>() {
-            numeric_thresholds.push((threshold, v));
+        let Ok(threshold) = k.trim().trim_end_matches('%').parse::<u32>() else {
+            continue;
+        };
+        if threshold <= value && best_le.is_none_or(|(bt, _)| threshold >= bt) {
+            best_le = Some((threshold, v));
+        }
+        if min_any.is_none_or(|(mt, _)| threshold < mt) {
+            min_any = Some((threshold, v));
         }
     }
 
-    numeric_thresholds.sort_by_key(|(t, _)| *t);
-
-    if numeric_thresholds.is_empty() {
-        return (format!("{value}%"), None);
+    match best_le.or(min_any) {
+        Some((threshold, template)) => (template.replace("%v", &value.to_string()), Some(threshold)),
+        None => (format!("{value}%"), None),
     }
-
-    // Find the highest threshold <= value
-    let mut chosen_threshold = numeric_thresholds[0].0;
-    let mut chosen_template = numeric_thresholds[0].1;
-
-    for (threshold, template) in &numeric_thresholds {
-        if *threshold <= value {
-            chosen_threshold = *threshold;
-            chosen_template = template;
-        } else {
-            break;
-        }
-    }
-
-    let replaced = chosen_template.replace("%v", &value.to_string());
-    (replaced, Some(chosen_threshold))
 }
 
 /// Pick a display template for a named mode (`wifi`/`lan`/`disconnected`,
 /// `on`/`off`/`connected`, ...), substituting `%`-style placeholders.
 /// Unknown modes fall back to the mode name itself.
 pub fn resolve_mode(modes: &HashMap<String, String>, mode: &str, placeholders: &[(&str, &str)]) -> String {
-    if let Some(template) = modes.get(mode) {
-        let mut result = template.clone();
-        for (k, v) in placeholders {
+    let Some(template) = modes.get(mode) else {
+        return mode.to_string();
+    };
+    let mut result = template.clone();
+    for (k, v) in placeholders {
+        if result.contains(k) {
             result = result.replace(k, v);
         }
-        result
-    } else {
-        mode.to_string()
     }
+    result
 }
 
 /// Optional shell commands run on mouse clicks (via `sh -c`, so `&&`,
@@ -112,6 +99,20 @@ impl ClickActions {
             self.on_click_right.as_deref(),
             self.on_click_middle.as_deref(),
         )
+    }
+
+    pub fn try_run(&self, button: crate::modules::MouseButton) -> bool {
+        let cmd = match button {
+            crate::modules::MouseButton::Left => self.on_click_left.as_deref(),
+            crate::modules::MouseButton::Right => self.on_click_right.as_deref(),
+            crate::modules::MouseButton::Middle => self.on_click_middle.as_deref(),
+        };
+        if let Some(c) = cmd.map(str::trim).filter(|c| !c.is_empty()) {
+            crate::modules::spawn_command(c);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -171,15 +172,26 @@ impl Default for ModulesConfig {
     }
 }
 
+const DEFAULT_START_MODULES: &[&str] = &["spacer", "taskbar"];
+
 impl ModulesConfig {
     pub fn start_modules(&self) -> Vec<String> {
         self.start
             .clone()
-            .unwrap_or_else(|| vec!["spacer".to_string(), "taskbar".to_string()])
+            .unwrap_or_else(|| DEFAULT_START_MODULES.iter().map(|s| (*s).to_string()).collect())
     }
 
     pub fn end_modules(&self) -> Vec<String> {
         self.end.clone().unwrap_or_else(|| self.order.clone())
+    }
+
+    pub fn contains_module(&self, name: &str) -> bool {
+        let in_start = match &self.start {
+            Some(list) => list.iter().any(|s| s == name),
+            None => DEFAULT_START_MODULES.contains(&name),
+        };
+        let end = self.end.as_ref().unwrap_or(&self.order);
+        in_start || end.iter().any(|s| s == name)
     }
 }
 
@@ -203,16 +215,13 @@ impl VolumeConfig {
         is_headphones: bool,
         is_hdmi: bool,
     ) -> Option<&HashMap<String, String>> {
-        if is_bluetooth && self.levels_bluetooth.is_some() {
-            return self.levels_bluetooth.as_ref();
-        }
-        if is_headphones && self.levels_headphones.is_some() {
-            return self.levels_headphones.as_ref();
-        }
-        if is_hdmi && self.levels_hdmi.is_some() {
-            return self.levels_hdmi.as_ref();
-        }
-        None
+        [
+            (is_bluetooth, &self.levels_bluetooth),
+            (is_headphones, &self.levels_headphones),
+            (is_hdmi, &self.levels_hdmi),
+        ]
+        .into_iter()
+        .find_map(|(active, map)| active.then_some(map.as_ref()).flatten())
     }
 }
 
@@ -547,18 +556,20 @@ pub fn parse_config_table(table: &toml::Table) -> AppConfig {
         );
         T::default()
     }
+    // Scalar type errors (e.g. `size = "big"`) fall back with a hint.
+    let parse_int = |key: &str, default: i32| -> i32 {
+        match table.get(key) {
+            Some(v) => v.as_integer().map(|n| n as i32).unwrap_or_else(|| {
+                crate::log_warn!("config", "Invalid `{key}`, using {default}");
+                default
+            }),
+            None => default,
+        }
+    };
     let cfg = AppConfig {
         position: section(table, "position"),
-        size: table
-            .get("size")
-            .and_then(|v| v.as_integer())
-            .map(|n| n as i32)
-            .unwrap_or(50),
-        spacing: table
-            .get("spacing")
-            .and_then(|v| v.as_integer())
-            .map(|n| n as i32)
-            .unwrap_or(0),
+        size: parse_int("size", 50),
+        spacing: parse_int("spacing", 0),
         taskbar: section(table, "taskbar"),
         tray: section(table, "tray"),
         modules: section(table, "modules"),
@@ -571,13 +582,6 @@ pub fn parse_config_table(table: &toml::Table) -> AppConfig {
         clock: section(table, "clock"),
         spacer: section(table, "spacer"),
     };
-    // Scalar type errors (e.g. `size = "big"`) fall back with a hint.
-    if table.get("size").is_some_and(|v| v.as_integer().is_none()) {
-        crate::logger::emit("WARN", "config", "Invalid `size`, using 50");
-    }
-    if table.get("spacing").is_some_and(|v| v.as_integer().is_none()) {
-        crate::logger::emit("WARN", "config", "Invalid `spacing`, using 0");
-    }
     cfg.validated()
 }
 
@@ -586,30 +590,18 @@ impl AppConfig {
     /// `step = 0` / `max_volume = 0` are handled at the use sites
     /// (`volume`/`brightness` treat 0 as 10 / 100).
     pub fn validated(mut self) -> Self {
-        if self.size <= 0 || self.size > 500 {
-            crate::logger::emit("WARN", "config", &format!("Invalid size {}, using 50", self.size));
-            self.size = 50;
+        fn clamp_range(val: &mut i32, range: std::ops::RangeInclusive<i32>, default: i32, name: &str) {
+            if !range.contains(val) {
+                crate::log_warn!("config", "Invalid {name} {}, using {default}", *val);
+                *val = default;
+            }
         }
-        if self.spacing < 0 || self.spacing > 100 {
-            crate::logger::emit("WARN", "config", &format!("Invalid spacing {}, using 0", self.spacing));
-            self.spacing = 0;
-        }
-        if self.taskbar.icon_size <= 0 || self.taskbar.icon_size > 256 {
-            crate::logger::emit("WARN", "config", "Invalid taskbar.icon_size, using 32");
-            self.taskbar.icon_size = 32;
-        }
-        if self.tray.icon_size <= 0 || self.tray.icon_size > 256 {
-            crate::logger::emit("WARN", "config", "Invalid tray.icon_size, using 22");
-            self.tray.icon_size = 22;
-        }
-        if self.tray.spacing < 0 || self.tray.spacing > 100 {
-            crate::logger::emit("WARN", "config", "Invalid tray.spacing, using 4");
-            self.tray.spacing = 4;
-        }
-        if self.spacer.size < 0 || self.spacer.size > 500 {
-            crate::logger::emit("WARN", "config", "Invalid spacer.size, using 5");
-            self.spacer.size = 5;
-        }
+        clamp_range(&mut self.size, 1..=500, 50, "size");
+        clamp_range(&mut self.spacing, 0..=100, 0, "spacing");
+        clamp_range(&mut self.taskbar.icon_size, 1..=256, 32, "taskbar.icon_size");
+        clamp_range(&mut self.tray.icon_size, 1..=256, 22, "tray.icon_size");
+        clamp_range(&mut self.tray.spacing, 0..=100, 4, "tray.spacing");
+        clamp_range(&mut self.spacer.size, 0..=500, 5, "spacer.size");
         if self.battery.warning_threshold < self.battery.critical_threshold {
             crate::logger::emit(
                 "WARN",
@@ -1146,5 +1138,63 @@ mod tests {
         // Fresh install / default
         let default_cfg = AppConfig::default();
         assert_eq!(default_cfg.taskbar.scroll_safety_margin, 1);
+    }
+
+    #[test]
+    fn test_resolve_level_unsorted_and_below_minimum() {
+        let levels = HashMap::from([
+            ("80%".to_string(), "high %v".to_string()),
+            ("20".to_string(), "low %v".to_string()),
+            ("50%".to_string(), "mid %v".to_string()),
+        ]);
+        // Below minimum threshold (20) selects lowest available threshold (20)
+        assert_eq!(resolve_level(&levels, 5, None), ("low 5".to_string(), Some(20)));
+        assert_eq!(resolve_level(&levels, 20, None), ("low 20".to_string(), Some(20)));
+        assert_eq!(resolve_level(&levels, 65, None), ("mid 65".to_string(), Some(50)));
+        assert_eq!(resolve_level(&levels, 99, None), ("high 99".to_string(), Some(80)));
+    }
+
+    #[test]
+    fn test_modules_config_contains_module() {
+        let def = ModulesConfig::default();
+        assert!(def.contains_module("taskbar"));
+        assert!(def.contains_module("spacer"));
+        assert!(def.contains_module("tray"));
+        assert!(def.contains_module("clock"));
+        assert!(!def.contains_module("nonexistent"));
+
+        let custom = ModulesConfig {
+            start: Some(vec!["spacer".into()]),
+            end: Some(vec!["clock".into()]),
+            order: default_module_order(),
+        };
+        assert!(!custom.contains_module("taskbar"));
+        assert!(!custom.contains_module("tray"));
+        assert!(custom.contains_module("spacer"));
+        assert!(custom.contains_module("clock"));
+    }
+
+    #[test]
+    fn test_volume_config_get_levels_for_sink_precedence() {
+        let mut cfg = VolumeConfig {
+            levels_headphones: Some(HashMap::from([("0".into(), "hp %v".into())])),
+            levels_hdmi: Some(HashMap::from([("0".into(), "hdmi %v".into())])),
+            ..Default::default()
+        };
+        // Bluetooth flagged but map not configured -> falls through to headphones
+        assert_eq!(
+            cfg.get_levels_for_sink(true, true, true)
+                .and_then(|m| m.get("0"))
+                .map(String::as_str),
+            Some("hp %v")
+        );
+        cfg.levels_bluetooth = Some(HashMap::from([("0".into(), "bt %v".into())]));
+        assert_eq!(
+            cfg.get_levels_for_sink(true, true, true)
+                .and_then(|m| m.get("0"))
+                .map(String::as_str),
+            Some("bt %v")
+        );
+        assert!(cfg.get_levels_for_sink(false, false, false).is_none());
     }
 }

@@ -1,5 +1,5 @@
 use crate::config::SpacerConfig;
-use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{BarModule, ModuleCore, ModuleState};
 use gtk::Orientation;
 
 pub struct SpacerModule {
@@ -37,8 +37,6 @@ impl BarModule for SpacerModule {
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
         self.config.click.commands()
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 }
 
 pub fn configure_spacer_button(button: &gtk::Button, size: i32, is_vertical: bool) {

@@ -25,105 +25,6 @@ pub fn parse_item_address(service: &str, sender_opt: Option<&str>) -> (String, S
     }
 }
 
-pub fn parse_icon_pixmap(val: &zbus::Variant<'_>) -> Option<Vec<TrayIconPixmap>> {
-    const MAX_DIM: i32 = 512;
-    const MAX_PIXELS: u64 = 512 * 512;
-    const MAX_PIXMAPS: usize = 8;
-    const MAX_STORED_DIM: i32 = 64;
-
-    let arr = match val {
-        zbus::Variant::Array(a) => a,
-        zbus::Variant::Variant(inner) => return parse_icon_pixmap(inner),
-        _ => return None,
-    };
-
-    let mut best: Option<(i32, i32, &zbus::Array<'_>)> = None;
-    for elem in arr.iter().take(MAX_PIXMAPS + 1) {
-        let structure = match elem {
-            zbus::Variant::Structure(s) => s,
-            _ => continue,
-        };
-        let fields = structure.fields();
-        if fields.len() < 3 {
-            continue;
-        }
-        let w = match &fields[0] {
-            zbus::Variant::I32(v) => *v,
-            zbus::Variant::U32(v) => (*v).min(i32::MAX as u32) as i32,
-            zbus::Variant::I16(v) => *v as i32,
-            zbus::Variant::U16(v) => *v as i32,
-            _ => continue,
-        };
-        let h = match &fields[1] {
-            zbus::Variant::I32(v) => *v,
-            zbus::Variant::U32(v) => (*v).min(i32::MAX as u32) as i32,
-            zbus::Variant::I16(v) => *v as i32,
-            zbus::Variant::U16(v) => *v as i32,
-            _ => continue,
-        };
-        // Reject absurd dimensions before any allocation (DoS guard).
-        if w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM {
-            continue;
-        }
-        let expected = match (w as u64).checked_mul(h as u64).and_then(|n| n.checked_mul(4)) {
-            Some(n) if n <= MAX_PIXELS * 4 && n <= (isize::MAX as u64) => n as usize,
-            _ => continue,
-        };
-        let data_arr = match &fields[2] {
-            zbus::Variant::Array(a) if a.len() == expected => a,
-            _ => continue,
-        };
-        let area = (w as u64) * (h as u64);
-        if best
-            .as_ref()
-            .is_none_or(|(bw, bh, _)| area >= (*bw as u64) * (*bh as u64))
-        {
-            best = Some((w, h, data_arr));
-        }
-    }
-
-    let (w, h, data_arr) = best?;
-    let (dst_w, dst_h) = scaled_pixmap_dims(w, h, MAX_STORED_DIM);
-
-    let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
-    let mut pixels = Vec::with_capacity(dst_len);
-
-    if dst_w == w && dst_h == h {
-        for b in data_arr.iter() {
-            if let zbus::Variant::U8(byte) = b {
-                pixels.push(*byte);
-            } else {
-                return None;
-            }
-        }
-    } else {
-        for dy in 0..dst_h {
-            let sy = ((dy as i64 * h as i64) / dst_h as i64) as usize;
-            for dx in 0..dst_w {
-                let sx = ((dx as i64 * w as i64) / dst_w as i64) as usize;
-                let base = (sy * (w as usize) + sx) * 4;
-                for c in 0..4 {
-                    if let Ok(Some(byte)) = data_arr.get::<u8>(base + c) {
-                        pixels.push(byte);
-                    } else {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
-    if pixels.len() != dst_len || pixels.is_empty() {
-        None
-    } else {
-        Some(vec![TrayIconPixmap {
-            width: dst_w,
-            height: dst_h,
-            pixels,
-        }])
-    }
-}
-
 fn scaled_pixmap_dims(w: i32, h: i32, max_dim: i32) -> (i32, i32) {
     if w > max_dim || h > max_dim {
         if w >= h {
@@ -139,7 +40,7 @@ fn scaled_pixmap_dims(w: i32, h: i32, max_dim: i32) -> (i32, i32) {
 }
 
 /// Zero-copy D-Bus 1.0 wire parser for `Properties.Get(iface, "IconPixmap")`
-/// reply bodies (signature `v` wrapping `a(iiay)`).
+/// reply bodies (`v` wrapping `a(iiay)` or `a(uuay)`, including nested `v`).
 ///
 /// Deserializing `a(iiay)` via `zvariant::OwnedValue` unpacks every pixel byte
 /// into a 24-byte `zvariant::Value::U8` enum (~25 MB of heap for a 512x512 icon).
@@ -161,20 +62,37 @@ pub fn parse_icon_pixmap_dbus_body(data: &[u8], is_le: bool) -> Option<Vec<TrayI
     };
     let read_i32 = |slice: &[u8]| -> i32 { read_u32(slice) as i32 };
 
-    // 1. Variant signature `g`: 1-byte length + ASCII signature + NUL
-    let sig_len = *data.first()? as usize;
-    let sig_end = 1usize.checked_add(sig_len)?;
-    if data.len() <= sig_end || data.get(1..sig_end)? != b"a(iiay)" || data[sig_end] != 0 {
+    // 1. Unwrap one or more D-Bus variant signature `g` layers (1-byte length + ASCII + NUL)
+    let mut pos = 0usize;
+    let mut matched_sig = false;
+    for _ in 0..4 {
+        let sig_len = *data.get(pos)? as usize;
+        let sig_start = pos + 1;
+        let sig_end = sig_start.checked_add(sig_len)?;
+        if data.len() <= sig_end || data[sig_end] != 0 {
+            return None;
+        }
+        let sig = &data[sig_start..sig_end];
+        pos = sig_end + 1;
+        if sig == b"v" {
+            continue;
+        }
+        if sig == b"a(iiay)" || sig == b"a(uuay)" {
+            matched_sig = true;
+            break;
+        }
         return None;
     }
-    let mut pos = sig_end + 1;
+    if !matched_sig {
+        return None;
+    }
 
     // 2. Array byte length (4-byte aligned)
     pos = (pos + 3) & !3;
     let arr_byte_len = read_u32(data.get(pos..pos + 4)?) as usize;
     pos += 4;
 
-    // 3. Struct elements `(iiay)` are 8-byte aligned in D-Bus 1.0
+    // 3. Struct elements `(iiay)`/`(uuay)` are 8-byte aligned in D-Bus 1.0
     pos = (pos + 7) & !7;
     let arr_end = pos.checked_add(arr_byte_len)?;
     if arr_end > data.len() {
@@ -242,99 +160,40 @@ pub fn parse_icon_pixmap_dbus_body(data: &[u8], is_le: bool) -> Option<Vec<TrayI
     }])
 }
 
-pub fn parse_tooltip(props: &HashMap<String, zbus::OwnedVariant>) -> Option<TrayTooltip> {
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+pub fn parse_tooltip(val: &zbus::Variant<'_>) -> Option<TrayTooltip> {
     const MAX_TOOLTIP: usize = 512;
-    let trunc = |s: String| {
-        if s.len() <= MAX_TOOLTIP {
-            s
-        } else {
-            s.chars().take(MAX_TOOLTIP).collect()
-        }
-    };
-    let val = props.get("ToolTip").or_else(|| props.get("Tooltip"))?;
-    match val.deref() {
+    match val {
+        zbus::Variant::Variant(inner) => parse_tooltip(inner),
         zbus::Variant::Structure(s) => {
             let fields = s.fields();
             let title = fields
                 .get(2)
-                .and_then(|v| match v {
-                    zbus::Variant::Str(st) => Some(trunc(st.as_str().to_string())),
-                    _ => None,
-                })
+                .and_then(extract_val_str)
+                .map(|st| truncate_str(st, MAX_TOOLTIP))
                 .unwrap_or_default();
             let description = fields
                 .get(3)
-                .and_then(|v| match v {
-                    zbus::Variant::Str(st) => Some(trunc(st.as_str().to_string())),
-                    _ => None,
-                })
+                .and_then(extract_val_str)
+                .map(|st| truncate_str(st, MAX_TOOLTIP))
                 .unwrap_or_default();
             Some(TrayTooltip { title, description })
         }
         zbus::Variant::Str(s) => {
-            let text = trunc(s.as_str().to_string());
+            let text = truncate_str(s.as_str(), MAX_TOOLTIP);
             Some(TrayTooltip {
                 title: text.clone(),
                 description: text,
             })
         }
         _ => None,
-    }
-}
-
-#[derive(serde::Deserialize, zbus::Type, Debug, Clone)]
-pub struct RawMenuItem {
-    pub id: i32,
-    pub props: HashMap<String, zbus::OwnedVariant>,
-    pub children: Vec<zbus::OwnedVariant>,
-}
-
-impl<'a> TryFrom<&'a zbus::Variant<'a>> for RawMenuItem {
-    type Error = zbus::Error;
-
-    fn try_from(val: &'a zbus::Variant<'a>) -> Result<Self, Self::Error> {
-        match val {
-            zbus::Variant::Structure(s) => {
-                let fields = s.fields();
-                if fields.len() < 3 {
-                    return Err(zbus::Error::IncorrectType);
-                }
-                let id = match &fields[0] {
-                    zbus::Variant::I32(i) => *i,
-                    zbus::Variant::U32(u) => *u as i32,
-                    _ => return Err(zbus::Error::IncorrectType),
-                };
-                let mut props = HashMap::new();
-                if let zbus::Variant::Dict(d) = &fields[1] {
-                    for (k, v) in d.iter() {
-                        if let zbus::Variant::Str(ks) = k {
-                            if let Ok(ov) = zbus::OwnedVariant::try_from(v.clone()) {
-                                props.insert(ks.as_str().to_string(), ov);
-                            }
-                        }
-                    }
-                }
-                let mut children = Vec::new();
-                if let zbus::Variant::Array(arr) = &fields[2] {
-                    for elem in arr.iter() {
-                        if let Ok(ov) = zbus::OwnedVariant::try_from(elem.clone()) {
-                            children.push(ov);
-                        }
-                    }
-                }
-                Ok(RawMenuItem { id, props, children })
-            }
-            zbus::Variant::Variant(v) => RawMenuItem::try_from(&**v),
-            _ => Err(zbus::Error::IncorrectType),
-        }
-    }
-}
-
-impl TryFrom<&zbus::OwnedVariant> for RawMenuItem {
-    type Error = zbus::Error;
-
-    fn try_from(val: &zbus::OwnedVariant) -> Result<Self, Self::Error> {
-        RawMenuItem::try_from(val.deref())
     }
 }
 
@@ -366,67 +225,55 @@ fn extract_val_i32(val: &zbus::Variant<'_>) -> Option<i32> {
     }
 }
 
-pub fn parse_raw_menu_item(raw: &RawMenuItem) -> MenuItem {
-    parse_raw_menu_item_depth(raw, 0)
-}
-
 const MAX_MENU_DEPTH: u8 = 8;
 const MAX_MENU_CHILDREN: usize = 500;
 const MAX_LABEL_LEN: usize = 256;
 
-fn parse_raw_menu_item_depth(raw: &RawMenuItem, depth: u8) -> MenuItem {
-    let raw_label = raw
-        .props
-        .get("label")
-        .and_then(|v| extract_val_str(v.deref()).map(truncate_label));
-    let item_type = raw
-        .props
-        .get("type")
-        .and_then(|v| extract_val_str(v.deref()))
-        .unwrap_or("standard");
-    let is_separator = item_type == "separator";
+fn build_menu_item<'a>(
+    id: i32,
+    props_iter: impl Iterator<Item = (&'a str, &'a zbus::Variant<'a>)>,
+    submenu: Vec<MenuItem>,
+) -> MenuItem {
+    let mut label = None;
+    let mut is_separator = false;
+    let mut enabled = true;
+    let mut visible = true;
+    let mut toggle_type = None;
+    let mut toggle_state = 0;
 
-    let enabled = raw
-        .props
-        .get("enabled")
-        .and_then(|v| extract_val_bool(v.deref()))
-        .unwrap_or(true);
-    let visible = raw
-        .props
-        .get("visible")
-        .and_then(|v| extract_val_bool(v.deref()))
-        .unwrap_or(true);
-
-    let toggle_type = raw
-        .props
-        .get("toggle-type")
-        .and_then(|v| match extract_val_str(v.deref()) {
-            Some("checkmark") => Some(ToggleType::Checkmark),
-            Some("radio") => Some(ToggleType::Radio),
-            _ => None,
-        });
-
-    let toggle_state = raw
-        .props
-        .get("toggle-state")
-        .and_then(|v| extract_val_i32(v.deref()))
-        .unwrap_or(0);
-
-    let mut submenu = Vec::new();
-    if depth < MAX_MENU_DEPTH {
-        for child_val in raw.children.iter().take(MAX_MENU_CHILDREN + 1) {
-            if let Ok(child_item) = RawMenuItem::try_from(child_val) {
-                submenu.push(parse_raw_menu_item_depth(&child_item, depth + 1));
+    for (k, v) in props_iter {
+        match k {
+            "label" => label = extract_val_str(v).map(|s| truncate_str(s, MAX_LABEL_LEN)),
+            "type" => is_separator = extract_val_str(v) == Some("separator"),
+            "enabled" => {
+                if let Some(b) = extract_val_bool(v) {
+                    enabled = b;
+                }
             }
-            if submenu.len() >= MAX_MENU_CHILDREN {
-                break;
+            "visible" => {
+                if let Some(b) = extract_val_bool(v) {
+                    visible = b;
+                }
             }
+            "toggle-type" => {
+                toggle_type = match extract_val_str(v) {
+                    Some("checkmark") => Some(ToggleType::Checkmark),
+                    Some("radio") => Some(ToggleType::Radio),
+                    _ => None,
+                };
+            }
+            "toggle-state" => {
+                if let Some(s) = extract_val_i32(v) {
+                    toggle_state = s;
+                }
+            }
+            _ => {}
         }
     }
 
     MenuItem {
-        id: raw.id,
-        label: raw_label,
+        id,
+        label,
         enabled,
         visible,
         is_separator,
@@ -436,19 +283,61 @@ fn parse_raw_menu_item_depth(raw: &RawMenuItem, depth: u8) -> MenuItem {
     }
 }
 
+fn parse_menu_variant(val: &zbus::Variant<'_>, depth: u8) -> Option<MenuItem> {
+    match val {
+        zbus::Variant::Variant(inner) => parse_menu_variant(inner, depth),
+        zbus::Variant::Structure(s) => {
+            let fields = s.fields();
+            let id = extract_val_i32(fields.first()?)?;
+            let props_iter = fields
+                .get(1)
+                .into_iter()
+                .flat_map(|v| match v {
+                    zbus::Variant::Dict(d) => Some(d),
+                    _ => None,
+                })
+                .flat_map(|d| {
+                    d.iter().filter_map(|(k, v)| match k {
+                        zbus::Variant::Str(ks) => Some((ks.as_str(), v)),
+                        _ => None,
+                    })
+                });
+            let mut submenu = Vec::new();
+            if depth < MAX_MENU_DEPTH {
+                if let Some(zbus::Variant::Array(arr)) = fields.get(2) {
+                    for child in arr.iter().take(MAX_MENU_CHILDREN) {
+                        if let Some(parsed) = parse_menu_variant(child, depth + 1) {
+                            submenu.push(parsed);
+                        }
+                    }
+                }
+            }
+            Some(build_menu_item(id, props_iter, submenu))
+        }
+        _ => None,
+    }
+}
+
+/// Parses a decoded DBusMenu `GetLayout` root node `(id, props, children)` without
+/// building an intermediate recursive wrapper struct.
+pub fn parse_dbusmenu_tuple(
+    id: i32,
+    props: &HashMap<String, zbus::OwnedVariant>,
+    children: &[zbus::OwnedVariant],
+) -> MenuItem {
+    let submenu = children
+        .iter()
+        .take(MAX_MENU_CHILDREN)
+        .filter_map(|c| parse_menu_variant(c.deref(), 1))
+        .collect();
+    build_menu_item(id, props.iter().map(|(k, v)| (k.as_str(), v.deref())), submenu)
+}
+
 /// Strip DBusMenu mnemonic underscores (`_Preferences` → `Preferences`)
 /// and surrounding whitespace. Used by the GTK menu builder so labels
 /// render without mnemonics and duplicates collapse.
 pub fn clean_menu_label(raw: &str) -> String {
     raw.replace('_', "").trim().to_string()
-}
-
-fn truncate_label(s: &str) -> String {
-    if s.len() <= MAX_LABEL_LEN {
-        s.to_string()
-    } else {
-        s.chars().take(MAX_LABEL_LEN).collect()
-    }
 }
 
 #[cfg(test)]
@@ -509,19 +398,16 @@ mod tests {
         );
 
         let child1_struct = zbus::Structure::from((1i32, props_child1, Vec::<zbus::OwnedVariant>::new()));
-
         let child2_struct = zbus::Structure::from((2i32, props_child2, Vec::<zbus::OwnedVariant>::new()));
 
-        let root = RawMenuItem {
-            id: 0,
-            props: props_root,
-            children: vec![
+        let parsed = parse_dbusmenu_tuple(
+            0,
+            &props_root,
+            &[
                 zbus::OwnedVariant::try_from(zbus::Variant::Structure(child1_struct)).unwrap(),
                 zbus::OwnedVariant::try_from(zbus::Variant::Structure(child2_struct)).unwrap(),
             ],
-        };
-
-        let parsed = parse_raw_menu_item(&root);
+        );
         assert_eq!(parsed.id, 0);
         assert_eq!(parsed.submenu.len(), 2);
         assert_eq!(parsed.submenu[0].label.as_deref(), Some("Open Toolbox"));
@@ -551,25 +437,16 @@ mod tests {
         );
 
         let sep_struct = zbus::Structure::from((10i32, props_sep, Vec::<zbus::OwnedVariant>::new()));
-
         let check_struct = zbus::Structure::from((11i32, props_check, Vec::<zbus::OwnedVariant>::new()));
 
-        let mut props_root = HashMap::new();
-        props_root.insert(
-            "children-display".to_string(),
-            zbus::OwnedVariant::try_from(zbus::Variant::from("submenu")).unwrap(),
-        );
-
-        let root = RawMenuItem {
-            id: 0,
-            props: props_root,
-            children: vec![
+        let parsed = parse_dbusmenu_tuple(
+            0,
+            &HashMap::new(),
+            &[
                 zbus::OwnedVariant::try_from(zbus::Variant::Structure(sep_struct)).unwrap(),
                 zbus::OwnedVariant::try_from(zbus::Variant::Structure(check_struct)).unwrap(),
             ],
-        };
-
-        let parsed = parse_raw_menu_item(&root);
+        );
         assert_eq!(parsed.submenu.len(), 2);
         assert!(parsed.submenu[0].is_separator);
         assert_eq!(parsed.submenu[1].toggle_type, Some(ToggleType::Checkmark));
@@ -584,36 +461,27 @@ mod tests {
         assert_eq!(clean_menu_label("_"), "");
     }
 
-    fn deep_menu(depth: usize) -> RawMenuItem {
-        // A chain `depth` levels deep: only RawMenuItem construction, no
-        // parsing — parse_raw_menu_item must cap it without stack overflow.
-        let mut child = RawMenuItem {
-            id: depth as i32,
-            props: HashMap::new(),
-            children: Vec::new(),
-        };
-        for id in (0..depth).rev() {
-            let wrapped = zbus::Structure::from((
+    fn deep_menu_children(depth: usize) -> Vec<zbus::OwnedVariant> {
+        let mut node = zbus::OwnedVariant::try_from(zbus::Variant::Structure(zbus::Structure::from((
+            depth as i32,
+            HashMap::<String, zbus::OwnedVariant>::new(),
+            Vec::<zbus::OwnedVariant>::new(),
+        ))))
+        .unwrap();
+        for id in (1..depth).rev() {
+            node = zbus::OwnedVariant::try_from(zbus::Variant::Structure(zbus::Structure::from((
                 id as i32,
                 HashMap::<String, zbus::OwnedVariant>::new(),
-                vec![
-                    zbus::OwnedVariant::try_from(zbus::Variant::Structure(zbus::Structure::from((
-                        child.id,
-                        child.props.clone(),
-                        child.children.clone(),
-                    ))))
-                    .unwrap(),
-                ],
-            ));
-            child = RawMenuItem::try_from(&zbus::OwnedVariant::try_from(zbus::Variant::Structure(wrapped)).unwrap())
-                .expect("test menu nesting must parse as RawMenuItem");
+                vec![node],
+            ))))
+            .unwrap();
         }
-        child
+        vec![node]
     }
 
     #[test]
     fn test_menu_depth_capped() {
-        let parsed = parse_raw_menu_item(&deep_menu(100));
+        let parsed = parse_dbusmenu_tuple(0, &HashMap::new(), &deep_menu_children(100));
         // Walk the parsed tree: depth must stop at MAX_MENU_DEPTH.
         let mut depth = 0;
         let mut node = &parsed;
@@ -632,32 +500,22 @@ mod tests {
             "label".to_string(),
             zbus::OwnedVariant::try_from(zbus::Variant::from("x".repeat(2000).as_str())).unwrap(),
         );
-        let item = RawMenuItem {
-            id: 1,
-            props,
-            children: Vec::new(),
-        };
-        let parsed = parse_raw_menu_item(&item);
+        let parsed = parse_dbusmenu_tuple(1, &props, &[]);
         assert!(parsed.label.as_ref().is_some_and(|l| l.len() <= 256));
     }
 
     #[test]
     fn test_pixmap_dimension_caps() {
+        let le_ctxt = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
         // Absurd dimensions with a short buffer must be rejected, not allocated.
-        let huge = zbus::Variant::from(vec![zbus::Variant::Structure(zbus::Structure::from((
-            99999i32,
-            99999i32,
-            zbus::Variant::from(vec![0u8; 16]),
-        )))]);
-        assert!(parse_icon_pixmap(&huge).is_none());
+        let huge = zbus::Variant::from(vec![(99999i32, 99999i32, vec![0u8; 16])]);
+        let huge_bytes = zbus::wire::to_bytes(le_ctxt, &huge).unwrap();
+        assert!(parse_icon_pixmap_dbus_body(&huge_bytes, true).is_none());
 
         // Length mismatch (declares 2x2x4, delivers 4 bytes) rejected.
-        let short = zbus::Variant::from(vec![zbus::Variant::Structure(zbus::Structure::from((
-            2i32,
-            2i32,
-            zbus::Variant::from(vec![0u8; 4]),
-        )))]);
-        assert!(parse_icon_pixmap(&short).is_none());
+        let short = zbus::Variant::from(vec![(2i32, 2i32, vec![0u8; 4])]);
+        let short_bytes = zbus::wire::to_bytes(le_ctxt, &short).unwrap();
+        assert!(parse_icon_pixmap_dbus_body(&short_bytes, true).is_none());
     }
 
     #[test]
@@ -666,26 +524,62 @@ mod tests {
             (16i32, 16i32, vec![0xAAu8; 16 * 16 * 4]),
             (512i32, 512i32, vec![0xFFu8; 512 * 512 * 4]),
         ]);
-        let parsed = parse_icon_pixmap(&val).expect("Should parse valid pixmaps");
-        assert_eq!(parsed.len(), 1, "Should keep only the single best pixmap");
-        assert_eq!(parsed[0].width, 64);
-        assert_eq!(parsed[0].height, 64);
-        assert_eq!(parsed[0].pixels.len(), 64 * 64 * 4);
-        assert!(parsed[0].pixels.iter().all(|&b| b == 0xFF));
-
-        // Verify zero-copy D-Bus wire body parser produces the exact same output
         let ctxt = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
         let bytes = zbus::wire::to_bytes(ctxt, &val).unwrap();
         let wire_parsed = parse_icon_pixmap_dbus_body(&bytes, true).expect("Should parse D-Bus wire body");
-        assert_eq!(wire_parsed, parsed);
+        assert_eq!(wire_parsed.len(), 1, "Should keep only the single best pixmap");
+        assert_eq!(wire_parsed[0].width, 64);
+        assert_eq!(wire_parsed[0].height, 64);
+        assert_eq!(wire_parsed[0].pixels.len(), 64 * 64 * 4);
+        assert!(wire_parsed[0].pixels.iter().all(|&b| b == 0xFF));
     }
 
     #[test]
     fn test_nested_variant_unwrapping() {
         let inner = zbus::Variant::from(vec![(4i32, 4i32, vec![0x77u8; 4 * 4 * 4])]);
         let wrapped = zbus::Variant::Variant(Box::new(inner));
-        let parsed = parse_icon_pixmap(&wrapped).expect("Nested Variant::Variant must unwrap");
+        let ctxt = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
+        let bytes = zbus::wire::to_bytes(ctxt, &wrapped).unwrap();
+        let parsed = parse_icon_pixmap_dbus_body(&bytes, true).expect("Nested Variant::Variant must unwrap");
         assert_eq!(parsed[0].width, 4);
         assert_eq!(parsed[0].height, 4);
+    }
+
+    #[test]
+    fn test_pixmap_dbus_body_handles_unsigned_nested_and_be() {
+        let val_u = zbus::Variant::from(vec![(8u32, 8u32, vec![0x55u8; 8 * 8 * 4])]);
+        let le_ctxt = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
+        let bytes_u = zbus::wire::to_bytes(le_ctxt, &val_u).expect("serialize a(uuay)");
+        let parsed_u = parse_icon_pixmap_dbus_body(&bytes_u, true).expect("a(uuay) must parse");
+        assert_eq!(parsed_u[0].width, 8);
+        assert_eq!(parsed_u[0].height, 8);
+
+        let wrapped = zbus::Variant::Variant(Box::new(val_u));
+        let bytes_nested = zbus::wire::to_bytes(le_ctxt, &wrapped).expect("serialize nested v");
+        let parsed_nested = parse_icon_pixmap_dbus_body(&bytes_nested, true).expect("nested variant must parse");
+        assert_eq!(parsed_nested[0].width, 8);
+
+        let be_ctxt = zbus::wire::serialized::Context::new(zbus::wire::BE, 0);
+        let val_be = zbus::Variant::from(vec![(4i32, 4i32, vec![0x33u8; 4 * 4 * 4])]);
+        let bytes_be = zbus::wire::to_bytes(be_ctxt, &val_be).expect("serialize BE");
+        let parsed_be = parse_icon_pixmap_dbus_body(&bytes_be, false).expect("BE body must parse");
+        assert_eq!(parsed_be[0].width, 4);
+        assert!(parsed_be[0].pixels.iter().all(|&b| b == 0x33));
+    }
+
+    #[test]
+    fn test_parse_dbusmenu_node_directly() {
+        let mut child_props = HashMap::new();
+        child_props.insert(
+            "label".to_string(),
+            zbus::OwnedVariant::try_from(zbus::Variant::from("_Settings")).expect("variant"),
+        );
+        let child_struct = zbus::Structure::from((7i32, child_props, Vec::<zbus::OwnedVariant>::new()));
+        let child_ov = zbus::OwnedVariant::try_from(zbus::Variant::Structure(child_struct)).expect("ov");
+        let parsed = parse_dbusmenu_tuple(0, &HashMap::new(), &[child_ov]);
+        assert_eq!(parsed.id, 0);
+        assert_eq!(parsed.submenu.len(), 1);
+        assert_eq!(parsed.submenu[0].id, 7);
+        assert_eq!(parsed.submenu[0].label.as_deref(), Some("_Settings"));
     }
 }

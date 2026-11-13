@@ -2,7 +2,7 @@ use glib::Propagation;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Button, Orientation};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -97,40 +97,33 @@ pub fn filter_windows_for_output(
     current_output: &Option<String>,
     only_current_workspace: bool,
 ) -> Vec<WindowInfo> {
-    let active_map = active_workspace_per_output(workspaces);
+    let Some(bar_out) = current_output.as_ref() else {
+        // Do not leak or mirror other monitors' windows if output is unresolved
+        return Vec::new();
+    };
+    let active_ws_for_bar = if only_current_workspace {
+        active_workspace_per_output(workspaces).get(bar_out).copied()
+    } else {
+        None
+    };
+
     let mut filtered: Vec<WindowInfo> = windows
         .iter()
         .filter(|w| {
-            let ws_id = match w.workspace_id {
-                Some(id) => id,
-                None => return false,
+            let Some(ws_id) = w.workspace_id else {
+                return false;
             };
-            let ws = match workspaces.iter().find(|ws| ws.id == ws_id) {
-                Some(ws) => ws,
-                None => return false,
+            let Some(ws) = workspaces.iter().find(|ws| ws.id == ws_id) else {
+                return false;
             };
-            let win_out = match ws.output {
-                Some(ref o) => o,
-                None => return false,
-            };
-
-            if let Some(ref bar_out) = current_output {
-                if win_out != bar_out {
-                    return false;
-                }
-            } else {
-                // Do not leak or mirror other monitors' windows if output is unresolved
+            if ws.output.as_deref() != Some(bar_out.as_str()) {
                 return false;
             }
-
-            if only_current_workspace {
-                if let Some(&active_ws_id) = active_map.get(win_out) {
-                    if ws.id != active_ws_id {
-                        return false;
-                    }
+            if let Some(active_ws_id) = active_ws_for_bar {
+                if ws.id != active_ws_id {
+                    return false;
                 }
             }
-
             true
         })
         .cloned()
@@ -251,6 +244,322 @@ pub fn calculate_sliding_window(
     vp.visible_range()
 }
 
+fn relative_drag_coords(
+    global_x: f64,
+    global_y: f64,
+    logical: Option<&crate::niri::model::LogicalOutput>,
+    container_off: (f64, f64),
+) -> (f64, f64) {
+    let (mon_x, mon_y) = logical.map_or((0.0, 0.0), |l| (f64::from(l.x), f64::from(l.y)));
+    (global_x - mon_x - container_off.0, global_y - mon_y - container_off.1)
+}
+
+fn container_root_offset(container: &GtkBox) -> (f64, f64) {
+    container
+        .root()
+        .and_then(|r| crate::util::widget_translate_coords(container, &r, 0.0, 0.0))
+        .unwrap_or((0.0, 0.0))
+}
+
+struct WindowRenderView<'a> {
+    window: &'a WindowInfo,
+    icon_key: &'a str,
+    title: &'a str,
+    is_ghost_preview: bool,
+    scale_factor: i32,
+}
+
+struct DragButtonCtx<'a> {
+    state: &'a Arc<std::sync::Mutex<AppState>>,
+    drag: &'a Arc<DragController>,
+    niri_tx: &'a async_channel::Sender<()>,
+    current_output: &'a Option<String>,
+    viewport: &'a Rc<RefCell<TaskbarViewport>>,
+    bar_position: crate::config::BarPosition,
+    bar_size: i32,
+    config: &'a TaskbarConfig,
+    is_vertical: bool,
+    initial_idx: usize,
+}
+
+fn apply_existing_widget_state(
+    widget: &mut WindowWidget,
+    view: &WindowRenderView<'_>,
+    drag_snapshot: Option<&GlobalDragState>,
+    current_output: &Option<String>,
+    config: &TaskbarConfig,
+) {
+    let win_id = view.window.id;
+    let is_focused = view.window.is_focused;
+    if widget.is_focused != is_focused {
+        if is_focused {
+            widget.button.add_css_class("focused");
+        } else {
+            widget.button.remove_css_class("focused");
+        }
+        widget.is_focused = is_focused;
+    }
+
+    if view.is_ghost_preview {
+        widget.button.add_css_class("drag-placeholder");
+        widget.button.add_css_class("cross-monitor-preview");
+        widget.button.remove_css_class("is-dragging");
+    } else {
+        widget.button.remove_css_class("cross-monitor-preview");
+        let locally_dragging =
+            drag_snapshot.is_some_and(|d| d.window_id == win_id && d.source_output == *current_output && d.is_dragging);
+
+        if locally_dragging {
+            widget.button.add_css_class("is-dragging");
+            let targeting_other = drag_snapshot.is_some_and(|d| d.target_output.is_some());
+            if targeting_other {
+                widget.button.add_css_class("drag-source-away");
+                widget.button.remove_css_class("drag-placeholder");
+                widget.button.set_opacity(0.0);
+            } else {
+                widget.button.remove_css_class("drag-source-away");
+                widget.button.add_css_class("drag-placeholder");
+                widget.button.set_opacity(1.0);
+            }
+        } else {
+            widget.button.remove_css_class("drag-placeholder");
+            widget.button.remove_css_class("is-dragging");
+            widget.button.remove_css_class("drag-source-away");
+            widget.button.set_opacity(1.0);
+            widget.button.set_cursor_from_name(Some("pointer"));
+        }
+    }
+
+    if config.show_tooltips && widget.tooltip != view.title {
+        widget.button.set_tooltip_text(Some(view.title));
+        widget.tooltip = view.title.to_string();
+    }
+
+    if *widget.icon_key.borrow() != view.icon_key || widget.icon_scale != view.scale_factor {
+        let img =
+            crate::icon::create_app_image_with_pid(view.icon_key, view.window.pid, config.icon_size, view.scale_factor);
+        widget.button.set_child(Some(&img));
+        *widget.icon_key.borrow_mut() = view.icon_key.to_string();
+        widget.icon_scale = view.scale_factor;
+    }
+}
+
+fn attach_middle_click_close(button: &Button, window_id: u64) {
+    let middle_click = gtk::GestureClick::builder()
+        .button(2)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    middle_click.connect_pressed(move |gesture, n_press, _, _| {
+        if n_press >= 1 {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            crate::runtime::spawn(async move {
+                if let Err(e) = ipc::close_window(window_id).await {
+                    log_warn!("taskbar", "Close window {window_id} failed: {e}");
+                }
+            });
+        }
+    });
+    button.add_controller(middle_click);
+}
+
+fn attach_drag_and_click_gesture(
+    button: &Button,
+    window_id: u64,
+    shared_icon_key: &Rc<RefCell<String>>,
+    ctx: DragButtonCtx<'_>,
+) {
+    // Capture-phase GestureDrag grabs the pointer sequence in `connect_drag_begin`
+    // so `connect_drag_update` keeps receiving motion after leaving the button.
+    let current_output_clone = ctx.current_output.clone();
+    let drag_begin_ctrl = Arc::clone(ctx.drag);
+    let drag_update_ctrl = Arc::clone(ctx.drag);
+    let drag_end_ctrl = Arc::clone(ctx.drag);
+    let state_press = Arc::clone(ctx.state);
+    let state_motion = Arc::clone(ctx.state);
+    let shared_icon_key_motion = Rc::clone(shared_icon_key);
+    let vp_press = Rc::clone(ctx.viewport);
+    let vp_motion = Rc::clone(ctx.viewport);
+    let bar_pos = ctx.bar_position;
+    let bar_sz = ctx.bar_size;
+    let icon_sz = ctx.config.icon_size;
+    let is_vertical = ctx.is_vertical;
+    let idx = ctx.initial_idx;
+
+    let drag_gesture = gtk::GestureDrag::builder()
+        .button(1)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    let seq_cancelled = Rc::new(Cell::new(false));
+
+    let seq_cancelled_begin = Rc::clone(&seq_cancelled);
+    let btn_press_weak = button.downgrade();
+    drag_gesture.connect_drag_begin(move |gesture, x, y| {
+        seq_cancelled_begin.set(false);
+        let Some(b) = btn_press_weak.upgrade() else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, x, y);
+        let parent = b.parent().and_then(|p| p.downcast::<GtkBox>().ok());
+        let current_idx = parent
+            .as_ref()
+            .and_then(|p| {
+                let b_widget: &gtk::Widget = b.upcast_ref();
+                crate::util::widget_children(p).iter().position(|c| c == b_widget)
+            })
+            .unwrap_or(idx);
+
+        let global_idx = vp_press.borrow().start + current_idx;
+        let out_name = current_output_clone.clone();
+        let (start_global_x, start_global_y) = {
+            let st = crate::util::lock(&state_press);
+            let (pt, _) = map_root_to_niri(root_x, root_y, &out_name, &st.outputs, bar_pos, bar_sz);
+            pt
+        };
+
+        drag_begin_ctrl.begin_press(
+            window_id,
+            out_name,
+            global_idx,
+            (root_x, root_y),
+            (start_global_x, start_global_y),
+        );
+    });
+
+    let seq_cancelled_cancel = Rc::clone(&seq_cancelled);
+    drag_gesture.connect_cancel(move |_, _| seq_cancelled_cancel.set(true));
+
+    let niri_tx_motion = ctx.niri_tx.clone();
+    let btn_motion_weak = button.downgrade();
+    drag_gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+        let Some(b) = btn_motion_weak.upgrade() else {
+            return;
+        };
+        let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
+        let (evt_x, evt_y) = (start_x + offset_x, start_y + offset_y);
+        let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, evt_x, evt_y);
+
+        let Some(step) = drag_update_ctrl.check_motion_step(window_id, root_x, root_y) else {
+            return;
+        };
+        if step.just_started {
+            b.add_css_class("is-dragging");
+            b.add_css_class("drag-placeholder");
+            // Spawn overlays BEFORE cursor so new overlay windows inherit drag cursor.
+            spawn_monitor_overlays(&drag_update_ctrl, &state_motion, &niri_tx_motion, window_id, &b);
+            let current_key = shared_icon_key_motion.borrow().clone();
+            apply_drag_cursor_globally(&current_key, icon_sz, Some(&b));
+        }
+
+        let ((current_global_x, current_global_y), hover) = {
+            let st = crate::util::lock(&state_motion);
+            map_root_to_niri(root_x, root_y, &step.source_output, &st.outputs, bar_pos, bar_sz)
+        };
+        let (is_cross_monitor, new_target) = decide_hover_target(hover, &step.source_output);
+        let target_out_changed = step.prev_target != new_target;
+        drag_update_ctrl.store_position(window_id, current_global_x, current_global_y, new_target);
+
+        if !is_cross_monitor {
+            if let Some(parent) = b.parent().and_then(|p| p.downcast::<GtkBox>().ok()) {
+                let rel_coords = crate::util::widget_translate_coords(&b, &parent, evt_x, evt_y).unwrap_or((0.0, 0.0));
+                update_local_drag_reorder(
+                    &parent,
+                    &b,
+                    rel_coords,
+                    is_vertical,
+                    vp_motion.borrow().start,
+                    window_id,
+                    &drag_update_ctrl,
+                );
+            }
+            if target_out_changed {
+                crate::util::nudge(&niri_tx_motion);
+            }
+        } else {
+            crate::util::nudge(&niri_tx_motion);
+        }
+    });
+
+    let seq_cancelled_end = Rc::clone(&seq_cancelled);
+    let niri_tx_release = ctx.niri_tx.clone();
+    let btn_end_weak = button.downgrade();
+    drag_gesture.connect_drag_end(move |_, _, _| {
+        let b_release = btn_end_weak.upgrade();
+        drag_end_ctrl.handle_source_gesture_end(
+            window_id,
+            seq_cancelled_end.get(),
+            b_release.as_ref(),
+            &niri_tx_release,
+        );
+    });
+    button.add_controller(drag_gesture);
+}
+
+fn create_window_button(view: &WindowRenderView<'_>, ctx: DragButtonCtx<'_>) -> (Button, Rc<RefCell<String>>) {
+    let window_id = view.window.id;
+    let button = Button::new();
+    button.add_css_class("app-button");
+    button.set_has_frame(false);
+    button.set_halign(gtk::Align::Center);
+    button.set_valign(gtk::Align::Center);
+    button.set_focusable(false);
+    button.set_cursor_from_name(Some("pointer"));
+
+    let shared_icon_key = Rc::new(RefCell::new(view.icon_key.to_string()));
+    if view.window.is_focused {
+        button.add_css_class("focused");
+    }
+    if view.is_ghost_preview {
+        button.add_css_class("drag-placeholder");
+        button.add_css_class("cross-monitor-preview");
+    }
+
+    let img =
+        crate::icon::create_app_image_with_pid(view.icon_key, view.window.pid, ctx.config.icon_size, view.scale_factor);
+    button.set_child(Some(&img));
+
+    if ctx.config.show_tooltips {
+        button.set_tooltip_text(Some(view.title));
+    }
+
+    attach_middle_click_close(&button, window_id);
+    attach_drag_and_click_gesture(&button, window_id, &shared_icon_key, ctx);
+
+    (button, shared_icon_key)
+}
+
+fn snapshot_windows_for_reconcile(
+    state: &Arc<std::sync::Mutex<AppState>>,
+    current_output: &Option<String>,
+    only_current_workspace: bool,
+    drag_want_id: Option<u64>,
+) -> (
+    Vec<WindowInfo>,
+    usize,
+    Option<crate::niri::model::LogicalOutput>,
+    Option<WindowInfo>,
+) {
+    let st = crate::util::lock(state);
+    let filtered = filter_windows_for_output(&st.windows, &st.workspaces, current_output, only_current_workspace);
+    let logical = current_output
+        .as_ref()
+        .and_then(|o| st.outputs.get(o))
+        .and_then(|i| i.logical.clone());
+    let drag_win = drag_want_id
+        .filter(|id| !filtered.iter().any(|w| w.id == *id))
+        .and_then(|id| st.windows.iter().find(|w| w.id == id).cloned());
+    (filtered, st.windows.len(), logical, drag_win)
+}
+
+struct ReconcileCtx<'a> {
+    current_output: &'a Option<String>,
+    state: &'a Arc<std::sync::Mutex<AppState>>,
+    config: &'a TaskbarConfig,
+    niri_service: &'a Arc<NiriService>,
+    drag_snapshot: Option<&'a GlobalDragState>,
+    curr_logical: Option<&'a crate::niri::model::LogicalOutput>,
+}
+
 impl TaskbarWidget {
     pub fn new(
         orientation: Orientation,
@@ -341,496 +650,198 @@ impl TaskbarWidget {
         }
         self.container.set_visible(true);
 
-        let (windows, workspaces, outputs) = {
-            let st = crate::util::lock(state);
-            (st.windows.clone(), st.workspaces.clone(), st.outputs.clone())
-        };
+        // Fixed lock order: snapshot DragController first, then inspect AppState.
+        let drag_snapshot = niri_service.drag.snapshot();
+        let drag_want_id = drag_snapshot.as_ref().and_then(|d| {
+            let matches_output = d
+                .target_output
+                .as_ref()
+                .zip(current_output.as_ref())
+                .is_some_and(|(t, c)| t == c);
+            (d.is_dragging && matches_output && d.source_output.as_ref() != current_output.as_ref())
+                .then_some(d.window_id)
+        });
 
-        let mut filtered_windows =
-            filter_windows_for_output(&windows, &workspaces, current_output, config.only_current_workspace);
+        let (mut filtered_windows, total_sys_windows, curr_logical, preview_drag_win) =
+            snapshot_windows_for_reconcile(state, current_output, config.only_current_workspace, drag_want_id);
 
         log_debug!(
             "taskbar",
             "Bar output {:?}: rendering {} window(s) (total system windows: {})",
             current_output,
             filtered_windows.len(),
-            windows.len()
+            total_sys_windows
         );
 
-        // Check if there is an incoming cross-monitor drag preview targeting this bar's output
-        let mut drag_snapshot = {
-            let guard = crate::util::lock(&GLOBAL_DRAG);
-            guard.clone()
+        let ctx = ReconcileCtx {
+            current_output,
+            state,
+            config,
+            niri_service,
+            drag_snapshot: drag_snapshot.as_ref(),
+            curr_logical: curr_logical.as_ref(),
+        };
+        let preview_window_id = match (ctx.drag_snapshot, preview_drag_win) {
+            (Some(drag), Some(drag_win)) => {
+                self.apply_cross_monitor_preview(&ctx, drag, drag_win, &mut filtered_windows)
+            }
+            _ => None,
         };
 
-        let is_vertical = self.orientation == Orientation::Vertical;
-        let mut preview_window_id: Option<u64> = None;
-
-        if let Some(ref mut drag) = drag_snapshot {
-            if drag.is_dragging {
-                if let (Some(ref target_out), Some(ref curr_out)) = (&drag.target_output, current_output) {
-                    if target_out == curr_out
-                        && drag.source_output.as_ref() != Some(curr_out)
-                        && !filtered_windows.iter().any(|w| w.id == drag.window_id)
-                    {
-                        if let Some(drag_win) = windows.iter().find(|w| w.id == drag.window_id) {
-                            let mon_logical = outputs.get(curr_out).and_then(|o| o.logical.clone());
-
-                            let (mon_x, mon_y) = mon_logical.map(|l| (l.x as f64, l.y as f64)).unwrap_or((0.0, 0.0));
-
-                            let rel_mon_x = drag.current_global_x - mon_x;
-                            let rel_mon_y = drag.current_global_y - mon_y;
-
-                            let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
-                                crate::util::widget_translate_coords(&self.container, &root, 0.0, 0.0)
-                                    .unwrap_or((0.0, 0.0))
-                            } else {
-                                (0.0, 0.0)
-                            };
-
-                            let rel_container_x = rel_mon_x - container_off_x;
-                            let rel_container_y = rel_mon_y - container_off_y;
-
-                            let existing_children = crate::util::widget_children(&self.container);
-                            let non_preview: Vec<_> = existing_children
-                                .iter()
-                                .filter(|c| !c.has_css_class("cross-monitor-preview"))
-                                .collect();
-
-                            let mut slot = non_preview.len();
-                            for (i, child) in non_preview.iter().enumerate() {
-                                let (ax, ay, aw, ah) =
-                                    crate::util::widget_bounds_in(*child, &self.container).unwrap_or((0, 0, 0, 0));
-                                if is_vertical {
-                                    if rel_container_y < (ay + ah) as f64 {
-                                        slot = i;
-                                        break;
-                                    }
-                                } else {
-                                    if rel_container_x < (ax + aw) as f64 {
-                                        slot = i;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let cur_start = self.viewport.borrow().start;
-                            let n = filtered_windows.len();
-                            let final_slot = (cur_start + slot).min(n);
-                            filtered_windows.insert(final_slot, drag_win.clone());
-                            preview_window_id = Some(drag.window_id);
-                            log_debug!(
-                                "taskbar",
-                                "Cross-monitor preview: win={} target={} slot={} on bar output={:?} (source={:?})",
-                                drag.window_id,
-                                target_out,
-                                final_slot,
-                                curr_out,
-                                drag.source_output
-                            );
-
-                            {
-                                let mut g = crate::util::lock(&GLOBAL_DRAG);
-                                if let Some(ref mut d) = *g {
-                                    if d.window_id == drag.window_id {
-                                        d.target_slot = final_slot;
-                                        d.target_slot_valid = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let focused_id = filtered_windows.iter().find(|w| w.is_focused).map(|w| w.id);
-        let focused_idx = filtered_windows.iter().position(|w| w.is_focused);
-        let total_count = filtered_windows.len();
-        let (start_idx, end_idx) = {
+        let (start_idx, visible_len) = {
+            let focused = filtered_windows.iter().enumerate().find(|(_, w)| w.is_focused);
             let mut vp = self.viewport.borrow_mut();
             vp.update(
-                focused_id,
-                focused_idx,
-                total_count,
+                focused.map(|(_, w)| w.id),
+                focused.map(|(i, _)| i),
+                filtered_windows.len(),
                 capacity,
                 config.scroll_safety_margin,
             );
             vp.visible_range()
         };
+        let visible_windows = filtered_windows.get(start_idx..visible_len).unwrap_or(&[]);
 
-        let visible_windows = if start_idx < end_idx && end_idx <= total_count {
-            &filtered_windows[start_idx..end_idx]
-        } else {
-            &[]
-        };
+        self.sync_visible_widgets(&ctx, visible_windows, preview_window_id, start_idx);
+    }
 
-        let mut widgets_map = self.active_widgets.borrow_mut();
-        let current_ids: HashSet<u64> = visible_windows.iter().map(|w| w.id).collect();
-
-        // 1. Remove widgets for windows that no longer exist or are outside visible window
-        widgets_map.retain(|id, w| {
-            if !current_ids.contains(id) {
-                self.container.remove(&w.button);
-                false
-            } else {
-                true
+    fn apply_cross_monitor_preview(
+        &self,
+        ctx: &ReconcileCtx<'_>,
+        drag: &GlobalDragState,
+        drag_win: WindowInfo,
+        filtered_windows: &mut Vec<WindowInfo>,
+    ) -> Option<u64> {
+        let is_vertical = self.orientation == Orientation::Vertical;
+        let (rel_x, rel_y) = relative_drag_coords(
+            drag.current_global_x,
+            drag.current_global_y,
+            ctx.curr_logical,
+            container_root_offset(&self.container),
+        );
+        let mut slot = None;
+        let mut non_preview_idx = 0usize;
+        for child in crate::util::widget_children(&self.container) {
+            if child.has_css_class("cross-monitor-preview") {
+                continue;
             }
+            let (ax, ay, aw, ah) = crate::util::widget_bounds_in(&child, &self.container).unwrap_or((0, 0, 0, 0));
+            let before = if is_vertical {
+                rel_y < (ay + ah) as f64
+            } else {
+                rel_x < (ax + aw) as f64
+            };
+            if before {
+                slot = Some(non_preview_idx);
+                break;
+            }
+            non_preview_idx += 1;
+        }
+        let cur_start = self.viewport.borrow().start;
+        let final_slot = (cur_start + slot.unwrap_or(non_preview_idx)).min(filtered_windows.len());
+        filtered_windows.insert(final_slot, drag_win);
+        log_debug!(
+            "taskbar",
+            "Cross-monitor preview: win={} target={:?} slot={} on bar output={:?} (source={:?})",
+            drag.window_id,
+            drag.target_output,
+            final_slot,
+            ctx.current_output,
+            drag.source_output
+        );
+        ctx.niri_service
+            .drag
+            .set_cross_monitor_preview_slot(drag.window_id, final_slot);
+        Some(drag.window_id)
+    }
+
+    fn sync_visible_widgets(
+        &self,
+        ctx: &ReconcileCtx<'_>,
+        visible_windows: &[WindowInfo],
+        preview_window_id: Option<u64>,
+        start_idx: usize,
+    ) {
+        let mut widgets_map = self.active_widgets.borrow_mut();
+        widgets_map.retain(|id, w| {
+            let keep = visible_windows.iter().any(|vw| vw.id == *id);
+            if !keep {
+                self.container.remove(&w.button);
+            }
+            keep
         });
 
-        // 2. Reconcile remaining / new windows in visible window
-        let any_locally_dragging = drag_snapshot
-            .as_ref()
-            .is_some_and(|d| d.is_dragging && d.source_output == *current_output && d.target_output.is_none());
+        let is_vertical = self.orientation == Orientation::Vertical;
+        let any_locally_dragging = ctx
+            .drag_snapshot
+            .is_some_and(|d| d.is_dragging && d.source_output == *ctx.current_output && d.target_output.is_none());
         let scale_factor = self.effective_scale.get().max(1);
+
         for (idx, window) in visible_windows.iter().enumerate() {
             let win_id = window.id;
-            let icon_key = window
-                .app_id
-                .clone()
-                .unwrap_or_else(|| "application-x-executable".to_string());
-            let title = window.title.clone().unwrap_or_else(|| icon_key.clone());
-            let is_focused = window.is_focused;
-            let is_ghost_preview = preview_window_id == Some(win_id);
+            let icon_key = window.app_id.as_deref().unwrap_or("application-x-executable");
+            let title = window.title.as_deref().unwrap_or(icon_key);
+            let view = WindowRenderView {
+                window,
+                icon_key,
+                title,
+                is_ghost_preview: preview_window_id == Some(win_id),
+                scale_factor,
+            };
 
             if let Some(widget) = widgets_map.get_mut(&win_id) {
-                // Focus styling
-                if widget.is_focused != is_focused {
-                    if is_focused {
-                        widget.button.add_css_class("focused");
-                    } else {
-                        widget.button.remove_css_class("focused");
-                    }
-                    widget.is_focused = is_focused;
-                }
-
-                // Drag state styling
-                if is_ghost_preview {
-                    widget.button.add_css_class("drag-placeholder");
-                    widget.button.add_css_class("cross-monitor-preview");
-                    widget.button.remove_css_class("is-dragging");
-                } else {
-                    widget.button.remove_css_class("cross-monitor-preview");
-                    let is_locally_dragging = drag_snapshot
-                        .as_ref()
-                        .map(|d| d.window_id == win_id && d.source_output == *current_output && d.is_dragging)
-                        .unwrap_or(false);
-
-                    if is_locally_dragging {
-                        widget.button.add_css_class("is-dragging");
-                        let is_targeting_other = drag_snapshot
-                            .as_ref()
-                            .map(|d| d.target_output.is_some())
-                            .unwrap_or(false);
-                        if is_targeting_other {
-                            widget.button.add_css_class("drag-source-away");
-                            widget.button.remove_css_class("drag-placeholder");
-                            widget.button.set_opacity(0.0);
-                        } else {
-                            widget.button.remove_css_class("drag-source-away");
-                            widget.button.add_css_class("drag-placeholder");
-                            widget.button.set_opacity(1.0);
-                        }
-                    } else {
-                        widget.button.remove_css_class("drag-placeholder");
-                        widget.button.remove_css_class("is-dragging");
-                        widget.button.remove_css_class("drag-source-away");
-                        widget.button.set_opacity(1.0);
-                        widget.button.set_cursor_from_name(Some("pointer"));
-                    }
-                }
-
-                // Tooltip
-                if config.show_tooltips && widget.tooltip != title {
-                    widget.button.set_tooltip_text(Some(&title));
-                    widget.tooltip.clone_from(&title);
-                }
-
-                // Icon image
-                if *widget.icon_key.borrow() != icon_key || widget.icon_scale != scale_factor {
-                    let img =
-                        crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
-                    widget.button.set_child(Some(&img));
-                    (*widget.icon_key.borrow_mut()).clone_from(&icon_key);
-                    widget.icon_scale = scale_factor;
-                }
-
+                apply_existing_widget_state(widget, &view, ctx.drag_snapshot, ctx.current_output, ctx.config);
                 if !any_locally_dragging {
                     crate::util::reorder_box_child(&self.container, &widget.button, idx);
                 }
             } else {
-                // Create new button widget
-                let button = Button::new();
-                button.add_css_class("app-button");
-                button.set_has_frame(false);
-                button.set_halign(gtk::Align::Center);
-                button.set_valign(gtk::Align::Center);
-                button.set_focusable(false);
-                button.set_cursor_from_name(Some("pointer"));
-
-                let shared_icon_key = Rc::new(RefCell::new(icon_key.clone()));
-                let window_id = window.id;
-
-                if is_focused {
-                    button.add_css_class("focused");
-                }
-
-                if is_ghost_preview {
-                    button.add_css_class("drag-placeholder");
-                    button.add_css_class("cross-monitor-preview");
-                }
-
-                let img = crate::icon::create_app_image_with_pid(&icon_key, window.pid, config.icon_size, scale_factor);
-                button.set_child(Some(&img));
-
-                if config.show_tooltips {
-                    button.set_tooltip_text(Some(&title));
-                }
-
-                // Middle click: close window
-                let middle_click = gtk::GestureClick::builder()
-                    .button(2)
-                    .propagation_phase(gtk::PropagationPhase::Capture)
-                    .build();
-                middle_click.connect_pressed(move |gesture, n_press, _, _| {
-                    if n_press >= 1 {
-                        gesture.set_state(gtk::EventSequenceState::Claimed);
-                        crate::runtime::spawn(async move {
-                            if let Err(e) = ipc::close_window(window_id).await {
-                                log_warn!("taskbar", "Close window {window_id} failed: {e}");
-                            }
-                        });
-                    }
-                });
-                button.add_controller(middle_click);
-
-                // Drag & Drop + Left click tracking via Capture-phase GestureDrag.
-                // Claiming the sequence in `connect_drag_begin` grabs the pointer sequence
-                // so `connect_drag_update` keeps receiving motion even after the cursor
-                // leaves the 44x44px button allocation (whereas EventControllerMotion stops
-                // at the widget border), and never fires on plain hover motion.
-                let current_output_clone = current_output.clone();
-                let state_clone_press = Arc::clone(state);
-                let state_clone_motion = Arc::clone(state);
-                let config_icon_sz = config.icon_size;
-                let shared_icon_key_motion = Rc::clone(&shared_icon_key);
-                let niri_tx = niri_service.update_tx.clone();
-                let bar_pos = self.bar_position;
-                let bar_sz = self.bar_size;
-                let vp_press = Rc::clone(&self.viewport);
-                let vp_motion = Rc::clone(&self.viewport);
-
-                let drag_gesture = gtk::GestureDrag::builder()
-                    .button(1)
-                    .propagation_phase(gtk::PropagationPhase::Capture)
-                    .build();
-                let seq_cancelled = Rc::new(Cell::new(false));
-
-                let seq_cancelled_begin = Rc::clone(&seq_cancelled);
-                let btn_press_weak = button.downgrade();
-                drag_gesture.connect_drag_begin(move |gesture, x, y| {
-                    seq_cancelled_begin.set(false);
-                    let Some(b) = btn_press_weak.upgrade() else {
-                        return;
-                    };
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                    let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, x, y);
-                    let parent = b.parent().and_then(|p| p.downcast::<GtkBox>().ok());
-                    let current_idx = parent
-                        .as_ref()
-                        .map(|p| {
-                            let children = crate::util::widget_children(p);
-                            let b_widget: &gtk::Widget = b.upcast_ref();
-                            children.iter().position(|c| c == b_widget).unwrap_or(idx)
-                        })
-                        .unwrap_or(idx);
-
-                    let cur_start = vp_press.borrow().start;
-                    let global_idx = cur_start + current_idx;
-
-                    // Anchor the press in Niri space through the monitor
-                    // containing it (see `map_root_to_niri`) — no
-                    // widget-offset arithmetic, so GDK↔Niri skew cannot
-                    // offset the whole drag.
-                    let (source_out, (start_global_x, start_global_y)) = {
-                        let st = crate::util::lock(&state_clone_press);
-                        let out_name = current_output_clone.clone();
-                        let (pt, _) = map_root_to_niri(root_x, root_y, &out_name, &st.outputs, bar_pos, bar_sz);
-                        (out_name, pt)
-                    };
-
-                    let mut drag = crate::util::lock(&GLOBAL_DRAG);
-                    // Single-drag guard: never clobber an active drag
-                    // from another button/overlay.
-                    if let Some(ref existing) = *drag {
-                        if existing.is_dragging && existing.window_id != window_id {
-                            return;
-                        }
-                    }
-                    let generation = crate::niri::drag::DRAG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    *drag = Some(GlobalDragState {
-                        window_id,
-                        source_output: source_out,
-                        source_index: global_idx,
-                        start_root_x: root_x,
-                        start_root_y: root_y,
-                        current_global_x: start_global_x,
-                        current_global_y: start_global_y,
-                        is_dragging: false,
-                        current_target_slot: global_idx,
-                        target_output: None,
-                        target_slot: global_idx,
-                        target_slot_valid: false,
-                        generation,
-                    });
-                });
-
-                let seq_cancelled_cancel = Rc::clone(&seq_cancelled);
-                drag_gesture.connect_cancel(move |_, _| {
-                    seq_cancelled_cancel.set(true);
-                });
-
-                let niri_tx_motion = niri_tx.clone();
-                let btn_motion_weak = button.downgrade();
-                drag_gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
-                    let Some(b) = btn_motion_weak.upgrade() else {
-                        return;
-                    };
-                    let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
-                    let evt_x = start_x + offset_x;
-                    let evt_y = start_y + offset_y;
-
-                    let mut drag_guard = crate::util::lock(&GLOBAL_DRAG);
-                    if let Some(ref mut drag) = *drag_guard {
-                        if drag.window_id == window_id {
-                            let (root_x, root_y) = crate::util::widget_to_toplevel_coords(&b, evt_x, evt_y);
-                            let dx = root_x - drag.start_root_x;
-                            let dy = root_y - drag.start_root_y;
-                            let dist = (dx * dx + dy * dy).sqrt();
-
-                            if dist > DRAG_THRESHOLD_LOGICAL_PX {
-                                if !drag.is_dragging {
-                                    drag.is_dragging = true;
-                                    b.add_css_class("is-dragging");
-                                    b.add_css_class("drag-placeholder");
-
-                                    // Fullscreen transparent overlays so the
-                                    // drag tracks across monitors (see drag.rs).
-                                    // Spawn BEFORE applying the cursor so the
-                                    // overlay windows get the icon cursor too.
-                                    spawn_monitor_overlays(&state_clone_motion, &niri_tx_motion, window_id, &b);
-
-                                    let current_key = shared_icon_key_motion.borrow().clone();
-                                    apply_drag_cursor_globally(&current_key, config_icon_sz, Some(&b));
-                                }
-
-                                let source_out_snapshot = drag.source_output.clone();
-                                let prev_target = drag.target_output.clone();
-                                // Drop the guard BEFORE locking state or
-                                // touching GDK (fixed lock order).
-                                drop(drag_guard);
-
-                                let st_outputs = {
-                                    let st = crate::util::lock(&state_clone_motion);
-                                    st.outputs.clone()
-                                };
-
-                                // Absolute per-event mapping (no accumulated
-                                // deltas): skew cannot drift the target.
-                                let ((current_global_x, current_global_y), hover) = map_root_to_niri(
-                                    root_x,
-                                    root_y,
-                                    &source_out_snapshot,
-                                    &st_outputs,
-                                    bar_pos,
-                                    bar_sz,
-                                );
-                                let (is_cross_monitor, new_target) = decide_hover_target(hover, &source_out_snapshot);
-                                let target_out_changed = prev_target != new_target;
-                                store_drag_position(window_id, current_global_x, current_global_y, new_target);
-
-                                if !is_cross_monitor {
-                                    if let Some(parent) = b.parent().and_then(|p| p.downcast::<GtkBox>().ok()) {
-                                        let (rel_x, rel_y) =
-                                            crate::util::widget_translate_coords(&b, &parent, evt_x, evt_y)
-                                                .unwrap_or((0.0, 0.0));
-                                        update_local_drag_reorder(
-                                            &parent,
-                                            &b,
-                                            rel_x,
-                                            rel_y,
-                                            is_vertical,
-                                            vp_motion.borrow().start,
-                                            window_id,
-                                        );
-                                    }
-                                    if target_out_changed {
-                                        crate::util::nudge(&niri_tx_motion);
-                                    }
-                                } else {
-                                    crate::util::nudge(&niri_tx_motion);
-                                }
-                            }
-                        }
-                    }
-                });
-
-                let seq_cancelled_end = Rc::clone(&seq_cancelled);
-                let niri_tx_release = niri_tx;
-                let btn_end_weak = button.downgrade();
-                drag_gesture.connect_drag_end(move |_, _, _| {
-                    let b_release = btn_end_weak.upgrade();
-                    crate::niri::drag::handle_source_gesture_end(
-                        window_id,
-                        seq_cancelled_end.get(),
-                        b_release.as_ref(),
-                        &niri_tx_release,
-                    );
-                });
-                button.add_controller(drag_gesture);
-
-                // Add to container and ensure correct initial index
+                let (button, shared_icon_key) = create_window_button(
+                    &view,
+                    DragButtonCtx {
+                        state: ctx.state,
+                        drag: &ctx.niri_service.drag,
+                        niri_tx: &ctx.niri_service.update_tx,
+                        current_output: ctx.current_output,
+                        viewport: &self.viewport,
+                        bar_position: self.bar_position,
+                        bar_size: self.bar_size,
+                        config: ctx.config,
+                        is_vertical,
+                        initial_idx: idx,
+                    },
+                );
                 self.container.append(&button);
                 crate::util::reorder_box_child(&self.container, &button, idx);
-
                 widgets_map.insert(
-                    window_id,
+                    win_id,
                     WindowWidget {
                         button,
                         icon_key: shared_icon_key,
                         icon_scale: scale_factor,
-                        is_focused,
-                        tooltip: title,
+                        is_focused: window.is_focused,
+                        tooltip: title.to_string(),
                     },
                 );
             }
         }
 
         if any_locally_dragging {
-            if let Some(ref drag) = drag_snapshot {
+            if let Some(drag) = ctx.drag_snapshot {
                 if let Some(drag_widget) = widgets_map.get(&drag.window_id) {
-                    let mon_logical = current_output
-                        .as_ref()
-                        .and_then(|curr_out| outputs.get(curr_out))
-                        .and_then(|o| o.logical.clone());
-                    let (mon_x, mon_y) = mon_logical.map(|l| (l.x as f64, l.y as f64)).unwrap_or((0.0, 0.0));
-                    let rel_mon_x = drag.current_global_x - mon_x;
-                    let rel_mon_y = drag.current_global_y - mon_y;
-                    let (container_off_x, container_off_y) = if let Some(root) = self.container.root() {
-                        crate::util::widget_translate_coords(&self.container, &root, 0.0, 0.0).unwrap_or((0.0, 0.0))
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    let rel_container_x = rel_mon_x - container_off_x;
-                    let rel_container_y = rel_mon_y - container_off_y;
+                    let rel_coords = relative_drag_coords(
+                        drag.current_global_x,
+                        drag.current_global_y,
+                        ctx.curr_logical,
+                        container_root_offset(&self.container),
+                    );
                     update_local_drag_reorder(
                         &self.container,
                         &drag_widget.button,
-                        rel_container_x,
-                        rel_container_y,
+                        rel_coords,
                         is_vertical,
                         start_idx,
                         drag.window_id,
+                        &ctx.niri_service.drag,
                     );
                 }
             }
@@ -841,12 +852,13 @@ impl TaskbarWidget {
 fn update_local_drag_reorder(
     parent: &GtkBox,
     b: &Button,
-    rel_x: f64,
-    rel_y: f64,
+    rel_coords: (f64, f64),
     is_vertical: bool,
     viewport_start: usize,
     window_id: u64,
+    drag: &DragController,
 ) {
+    let (rel_x, rel_y) = rel_coords;
     let children = crate::util::widget_children(parent);
     if children.len() <= 1 {
         return;
@@ -878,14 +890,7 @@ fn update_local_drag_reorder(
         crate::util::reorder_box_child(parent, b, target_idx);
     }
 
-    let global_target = viewport_start + target_idx;
-    let mut g = crate::util::lock(&GLOBAL_DRAG);
-    if let Some(ref mut d) = *g {
-        if d.window_id == window_id {
-            d.current_target_slot = global_target;
-            d.target_slot = global_target;
-        }
-    }
+    drag.set_current_slot(window_id, viewport_start + target_idx);
 }
 
 #[cfg(test)]
@@ -1368,9 +1373,8 @@ mod tests {
     #[test]
     fn test_reconcile_during_local_drag_preserves_reordered_box_position() {
         crate::util::run_gtk_test(|| {
-            *crate::util::lock(&crate::niri::drag::GLOBAL_DRAG) = None;
             use crate::config::TaskbarConfig;
-            use crate::niri::drag::{GlobalDragState, GLOBAL_DRAG};
+            use crate::niri::drag::GlobalDragState;
             use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
             use gtk::prelude::*;
 
@@ -1415,7 +1419,7 @@ mod tests {
 
             // Simulate dragging window 10 to slot 2 (index 2)
             crate::util::reorder_box_child(&tb.container, &btn_10, 2);
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            niri.drag.set_for_test(Some(GlobalDragState {
                 window_id: 10,
                 source_output: Some("eDP-1".into()),
                 source_index: 0,
@@ -1429,7 +1433,7 @@ mod tests {
                 target_slot: 0,
                 target_slot_valid: false,
                 generation: 1,
-            });
+            }));
 
             // Reconcile while dragging locally must NOT snap btn_10 back to index 0
             tb.reconcile(&Some("eDP-1".into()), &niri.state, &TaskbarConfig::default(), &niri, 10);
@@ -1441,16 +1445,15 @@ mod tests {
                 "Reconcile during active local drag must not snap dragged button back to index 0"
             );
 
-            *crate::util::lock(&GLOBAL_DRAG) = None;
+            niri.drag.set_for_test(None);
         });
     }
 
     #[test]
     fn test_cross_monitor_drag_preview_reconcile_and_cleanup() {
         crate::util::run_gtk_test(|| {
-            *crate::util::lock(&crate::niri::drag::GLOBAL_DRAG) = None;
             use crate::config::TaskbarConfig;
-            use crate::niri::drag::{GlobalDragState, GLOBAL_DRAG};
+            use crate::niri::drag::GlobalDragState;
             use crate::niri::model::{LogicalOutput, OutputInfo};
             use crate::niri::{AppState, NiriService, WindowInfo, WorkspaceInfo};
             use gtk::prelude::*;
@@ -1562,7 +1565,7 @@ mod tests {
             assert_eq!(crate::util::widget_children(&tb_target.container).len(), 1);
 
             // 1. Simulate cross-monitor drag of win 10 targeting DP-1
-            *crate::util::lock(&GLOBAL_DRAG) = Some(GlobalDragState {
+            niri.drag.set_for_test(Some(GlobalDragState {
                 window_id: 10,
                 source_output: Some("eDP-1".into()),
                 source_index: 0,
@@ -1576,7 +1579,7 @@ mod tests {
                 target_slot: 0,
                 target_slot_valid: false,
                 generation: 1,
-            });
+            }));
 
             // Target bar reconciles: must insert ghost preview button
             tb_target.reconcile(&Some("DP-1".into()), &niri.state, &cfg, &niri, 10);
@@ -1596,10 +1599,10 @@ mod tests {
                 "Ghost preview button must have .drag-placeholder class"
             );
 
-            // GLOBAL_DRAG target_slot_valid must now be true
+            // DragController target_slot_valid must now be true
             {
-                let g = crate::util::lock(&GLOBAL_DRAG);
-                let d = g.as_ref().unwrap();
+                let snap = niri.drag.snapshot();
+                let d = snap.as_ref().unwrap();
                 assert!(d.target_slot_valid, "Drag target slot must be marked valid");
             }
 
@@ -1618,7 +1621,7 @@ mod tests {
             );
 
             // 2. Drag ends (dropped or cancelled): clean up
-            *crate::util::lock(&GLOBAL_DRAG) = None;
+            niri.drag.set_for_test(None);
 
             // Target bar reconciles again: ghost preview button must be removed
             tb_target.reconcile(&Some("DP-1".into()), &niri.state, &cfg, &niri, 10);
@@ -1823,5 +1826,19 @@ mod tests {
                 "Reconcile after scale change 1 -> 2 must replace existing button icon with 40px buffer"
             );
         });
+    }
+
+    #[test]
+    fn test_relative_drag_coords_subtracts_monitor_and_container_offsets() {
+        let logical = crate::niri::model::LogicalOutput {
+            x: 1920,
+            y: 100,
+            width: 2560,
+            height: 1440,
+            scale: Some(1.0),
+        };
+        let (rx, ry) = super::relative_drag_coords(2050.0, 220.0, Some(&logical), (30.0, 10.0));
+        assert_eq!((rx, ry), (100.0, 110.0));
+        assert_eq!(super::relative_drag_coords(50.0, 60.0, None, (5.0, 10.0)), (45.0, 50.0));
     }
 }

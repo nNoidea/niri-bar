@@ -43,25 +43,35 @@ pub fn watch_target_for_filenames(file_basename: Option<&str>, other_basename: O
 }
 
 fn watch_target_for_event(file: &gio::File, other: Option<&gio::File>) -> Option<&'static str> {
-    let file_name = file.basename().map(|n| n.to_string_lossy().to_string());
-    let other_name = other.and_then(|f| f.basename().map(|n| n.to_string_lossy().to_string()));
-    watch_target_for_filenames(file_name.as_deref(), other_name.as_deref())
+    let file_base = file.basename();
+    let other_base = other.and_then(|f| f.basename());
+    watch_target_for_filenames(
+        file_base.as_deref().and_then(|p| p.to_str()),
+        other_base.as_deref().and_then(|p| p.to_str()),
+    )
 }
 
 /// Re-apply the combined [`ActiveError`] to every bar: show the message
 /// when any slot is set, clear only when both are `None`.
 pub fn refresh_error_badges(bars: &Rc<RefCell<Vec<BarWindow>>>, err: &ActiveError) {
     let Ok(list) = bars.try_borrow() else { return };
-    match err.message() {
-        Some(msg) => {
-            for b in list.iter() {
-                b.show_error(msg);
-            }
+    for b in list.iter() {
+        match err.message() {
+            Some(msg) => b.show_error(msg),
+            None => b.clear_error(),
         }
-        None => {
-            for b in list.iter() {
-                b.clear_error();
-            }
+    }
+}
+
+fn update_error_slot(ctx: &ReconcileCtx, is_style: bool, msg: Option<String>, refresh: bool) {
+    if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
+        if is_style {
+            err.style = msg;
+        } else {
+            err.config = msg;
+        }
+        if refresh {
+            refresh_error_badges(&ctx.bars, &err);
         }
     }
 }
@@ -102,30 +112,20 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
             Some(n) => n,
             None => return,
         };
+        let is_style = target_name == "style.css";
 
         if deleted {
             let msg = format!("{target_name} was deleted");
-            if target_name == "style.css" {
+            if is_style {
                 log_warn!("style", "Live style reload error: {msg}");
-                if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                    err.style = Some(msg);
-                    refresh_error_badges(&ctx.bars, &err);
-                }
             } else {
                 log_warn!("config", "Live config reload error: {msg}");
-                if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                    err.config = Some(msg);
-                    refresh_error_badges(&ctx.bars, &err);
-                }
             }
+            update_error_slot(&ctx, is_style, Some(msg), true);
             return;
         }
 
-        let deb = if target_name == "style.css" {
-            Rc::clone(&debounce_style)
-        } else {
-            Rc::clone(&debounce_config)
-        };
+        let deb = Rc::clone(if is_style { &debounce_style } else { &debounce_config });
         let ctx = ctx.clone();
         let sched = Rc::clone(&schedule_reconcile);
 
@@ -136,24 +136,18 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
         let deb_clone = Rc::clone(&deb);
         let new_src = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
             *deb_clone.borrow_mut() = None;
-            if target_name == "style.css" {
+            if is_style {
                 match crate::style::reload_styles() {
                     Ok(()) => {
                         log_info!("style", "style.css live-reloaded successfully");
-                        if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                            err.style = None;
-                            refresh_error_badges(&ctx.bars, &err);
-                        }
+                        update_error_slot(&ctx, true, None, true);
                     }
                     Err(e) => {
                         log_warn!("style", "Live style reload error: {e}");
-                        if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                            err.style = Some(e);
-                            refresh_error_badges(&ctx.bars, &err);
-                        }
+                        update_error_slot(&ctx, true, Some(e), true);
                     }
                 }
-            } else if target_name == "config.toml" {
+            } else {
                 match crate::config::reload_config() {
                     Ok(new_config) => {
                         log_info!("config", "config.toml live-reloaded successfully; updating layout");
@@ -164,10 +158,9 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
                             mods.shutdown();
                             *mods = crate::modules::SharedModules::new(&new_config);
                         }
+                        crate::monitor::sync_tray_service(&ctx.tray_service, &new_config);
 
-                        if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                            err.config = None;
-                        }
+                        update_error_slot(&ctx, false, None, false);
 
                         if let Ok(mut bars) = ctx.bars.try_borrow_mut() {
                             for b in bars.drain(..) {
@@ -179,10 +172,7 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
                     }
                     Err(e) => {
                         log_warn!("config", "Live config reload error: {e}");
-                        if let Ok(mut err) = ctx.active_error.try_borrow_mut() {
-                            err.config = Some(e);
-                            refresh_error_badges(&ctx.bars, &err);
-                        }
+                        update_error_slot(&ctx, false, Some(e), true);
                     }
                 }
             }

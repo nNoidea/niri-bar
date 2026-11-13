@@ -25,65 +25,22 @@ use crate::modules::network::NetworkModule;
 use crate::modules::spacer::SpacerModule;
 use crate::modules::volume::VolumeModule;
 
-/// Async cancellation and interruptible-sleep primitive for module workers.
-///
-/// Tracks `(stopped, notified)` atomically paired with a `tokio::sync::Notify`
-/// so async workers can sleep until either a trigger notification (`notify()`)
-/// or shutdown (`stop()`) without needing a separate channel or OS thread.
-#[derive(Clone, Debug, Default)]
-struct StopSignal {
-    state: Arc<(AtomicBool, AtomicBool, tokio::sync::Notify)>,
+/// Async cancellation, wake trigger, and subscriber broadcast helper shared across modules.
+struct ModuleCoreInner {
+    subscribers: Mutex<Vec<ModuleSubscriber>>,
+    stopped: AtomicBool,
+    notified: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
-impl StopSignal {
-    fn new() -> Self {
+impl Default for ModuleCoreInner {
+    fn default() -> Self {
         Self {
-            state: Arc::new((
-                AtomicBool::new(false),
-                AtomicBool::new(false),
-                tokio::sync::Notify::new(),
-            )),
+            subscribers: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            notified: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
         }
-    }
-
-    fn stop(&self) {
-        let (stopped, _, notify) = &*self.state;
-        stopped.store(true, Ordering::SeqCst);
-        notify.notify_waiters();
-    }
-
-    fn notify(&self) {
-        let (_, notified, notify) = &*self.state;
-        notified.store(true, Ordering::SeqCst);
-        notify.notify_waiters();
-    }
-
-    fn is_stopped(&self) -> bool {
-        self.state.0.load(Ordering::SeqCst)
-    }
-
-    /// Awaits up to `dur`, returning early if `stop()` or `notify()` is called.
-    /// Returns `(stopped, notified)`.
-    async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
-        let (stopped, notified, notify) = &*self.state;
-        let notified_fut = notify.notified();
-        tokio::pin!(notified_fut);
-        notified_fut.as_mut().enable();
-
-        let is_stopped = stopped.load(Ordering::SeqCst);
-        let is_notified = notified.swap(false, Ordering::SeqCst);
-        if is_stopped || is_notified {
-            return (is_stopped, is_notified);
-        }
-
-        let _ = tokio::time::timeout(dur, notified_fut).await;
-        let is_stopped = stopped.load(Ordering::SeqCst);
-        let is_notified = notified.swap(false, Ordering::SeqCst);
-        (is_stopped, is_notified)
-    }
-
-    async fn wait_timeout_async(&self, dur: Duration) -> bool {
-        self.wait_or_notified_async(dur).await.0
     }
 }
 
@@ -205,27 +162,21 @@ pub async fn dbus_get_property(
 
 /// Core subscription and lifecycle helper shared across modules.
 #[derive(Clone, Default)]
-pub struct ModuleCore {
-    subscribers: ModuleSubscribers,
-    stop_signal: StopSignal,
-}
+pub struct ModuleCore(Arc<ModuleCoreInner>);
 
 impl ModuleCore {
     pub fn new() -> Self {
-        Self {
-            subscribers: Arc::new(Mutex::new(Vec::new())),
-            stop_signal: StopSignal::new(),
-        }
+        Self::default()
     }
 
     pub fn subscribe(&self, orientation: Orientation) -> async_channel::Receiver<ModuleState> {
         let (tx, rx) = async_channel::unbounded();
-        crate::util::lock(&self.subscribers).push((tx, orientation));
+        crate::util::lock(&self.0.subscribers).push((tx, orientation));
         rx
     }
 
     pub fn broadcast(&self, f: impl Fn(Orientation) -> ModuleState) {
-        let mut guard = crate::util::lock(&self.subscribers);
+        let mut guard = crate::util::lock(&self.0.subscribers);
         guard.retain(|(t, orient)| {
             let state = f(*orient);
             t.try_send(state).is_ok() || !t.is_closed()
@@ -233,88 +184,210 @@ impl ModuleCore {
     }
 
     pub fn shutdown(&self) {
-        self.stop_signal.stop();
-        crate::util::lock(&self.subscribers).clear();
+        self.0.stopped.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+        crate::util::lock(&self.0.subscribers).clear();
     }
 
     pub fn notify(&self) {
-        self.stop_signal.notify();
+        self.0.notified.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.stop_signal.is_stopped()
+        self.0.stopped.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
     pub fn subscriber_count(&self) -> usize {
-        crate::util::lock(&self.subscribers)
+        crate::util::lock(&self.0.subscribers)
             .iter()
             .filter(|(tx, _)| !tx.is_closed())
             .count()
     }
 
+    /// Awaits up to `dur`, returning early if `shutdown()` or `notify()` is called.
+    /// Returns `(stopped, notified)`.
     pub async fn wait_or_notified_async(&self, dur: Duration) -> (bool, bool) {
-        self.stop_signal.wait_or_notified_async(dur).await
+        let notified_fut = self.0.notify.notified();
+        tokio::pin!(notified_fut);
+        notified_fut.as_mut().enable();
+
+        let is_stopped = self.0.stopped.load(Ordering::SeqCst);
+        let is_notified = self.0.notified.swap(false, Ordering::SeqCst);
+        if is_stopped || is_notified {
+            return (is_stopped, is_notified);
+        }
+
+        let _ = tokio::time::timeout(dur, notified_fut).await;
+        (
+            self.0.stopped.load(Ordering::SeqCst),
+            self.0.notified.swap(false, Ordering::SeqCst),
+        )
     }
 
     pub async fn wait_timeout_async(&self, dur: Duration) -> bool {
-        self.stop_signal.wait_timeout_async(dur).await
+        self.wait_or_notified_async(dur).await.0
     }
+
+    /// Resolves only when `shutdown()` has been called; ignores `notify()`.
+    pub async fn wait_stopped(&self) {
+        let notified_fut = self.0.notify.notified();
+        tokio::pin!(notified_fut);
+        notified_fut.as_mut().enable();
+        while !self.is_stopped() {
+            notified_fut.as_mut().await;
+            notified_fut.set(self.0.notify.notified());
+            notified_fut.as_mut().enable();
+        }
+    }
+}
+
+pub struct DbusPollSpec<S> {
+    pub tag: &'static str,
+    pub base_interval: Duration,
+    pub max_interval: Duration,
+    pub fast_poll_on_notify: bool,
+    pub degraded_msg: &'static str,
+    pub degraded_is_warn: bool,
+    pub is_transitional: fn(&S) -> bool,
+}
+
+/// Shared worker loop for D-Bus-triggered poll modules (`bluetooth`, `network`, `battery`).
+/// Renews D-Bus subscriptions periodically, backs off while unhealthy, and broadcasts on change.
+pub fn spawn_dbus_poller<S, Fut>(
+    core: ModuleCore,
+    initial: S,
+    last: Arc<Mutex<S>>,
+    spec: DbusPollSpec<S>,
+    triggers: impl Fn(&ModuleCore) -> Vec<tokio::task::JoinHandle<()>> + Send + 'static,
+    poll_fn: impl Fn() -> Fut + Send + 'static,
+    format_fn: impl Fn(&S, Orientation) -> ModuleState + Send + 'static,
+) where
+    S: PartialEq + Clone + Send + 'static,
+    Fut: std::future::Future<Output = (S, bool)> + Send,
+{
+    crate::runtime::spawn(async move {
+        if core.is_stopped() {
+            return;
+        }
+        let mut last_cached: Option<S> = Some(initial);
+        let mut fast_poll_ticks: usize = 0;
+        let mut fail_streak: u32 = 0;
+        let mut degraded_warned = false;
+        let mut _live_subs = DbusSubscriptions::new(triggers(&core));
+        let mut last_renew = std::time::Instant::now();
+        let mut first_pass = true;
+
+        loop {
+            if first_pass {
+                first_pass = false;
+            } else {
+                let wait = if fast_poll_ticks > 0 {
+                    fast_poll_ticks -= 1;
+                    Duration::from_millis(100)
+                } else {
+                    poll_backoff(spec.base_interval, fail_streak, spec.max_interval)
+                };
+                let (stopped, notified) = core.wait_or_notified_async(wait).await;
+                if stopped {
+                    break;
+                }
+                if notified && spec.fast_poll_on_notify {
+                    fast_poll_ticks = 40;
+                    last_cached = None;
+                }
+            }
+
+            let (current_state, healthy) = poll_fn().await;
+            if healthy {
+                if fail_streak > 0 {
+                    log_info!(spec.tag, "Backend recovered");
+                }
+                fail_streak = 0;
+                degraded_warned = false;
+            } else {
+                fail_streak = fail_streak.saturating_add(1);
+                if !degraded_warned {
+                    degraded_warned = true;
+                    if spec.degraded_is_warn {
+                        log_warn!(spec.tag, "{}", spec.degraded_msg);
+                    } else {
+                        log_info!(spec.tag, "{}", spec.degraded_msg);
+                    }
+                }
+            }
+
+            if last_cached.as_ref() != Some(&current_state) {
+                last_cached = Some(current_state.clone());
+                *crate::util::lock(&last) = current_state.clone();
+                core.broadcast(|orient| format_fn(&current_state, orient));
+            }
+
+            if (spec.is_transitional)(&current_state) && fast_poll_ticks == 0 {
+                fast_poll_ticks = 20;
+            }
+
+            if last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3 {
+                _live_subs = DbusSubscriptions::new(triggers(&core));
+                last_renew = std::time::Instant::now();
+            }
+        }
+    });
+}
+
+pub const SIMPLE_MODULE_NAMES: &[&str] = &[
+    "volume",
+    "bluetooth",
+    "network",
+    "memory",
+    "brightness",
+    "battery",
+    "clock",
+    "spacer",
+];
+
+pub fn is_known_simple_module(name: &str) -> bool {
+    SIMPLE_MODULE_NAMES.contains(&name)
 }
 
 #[derive(Clone)]
 pub struct SharedModules {
-    pub volume: Arc<VolumeModule>,
-    pub bluetooth: Arc<BluetoothModule>,
-    pub network: Arc<NetworkModule>,
-    pub memory: Arc<MemoryModule>,
-    pub brightness: Arc<BrightnessModule>,
-    pub battery: Arc<BatteryModule>,
-    pub clock: Arc<ClockModule>,
-    pub spacer: Arc<SpacerModule>,
+    modules: Vec<(&'static str, Arc<dyn BarModule>)>,
 }
 
 impl SharedModules {
     pub fn new(config: &AppConfig) -> Self {
-        Self {
-            volume: Arc::new(VolumeModule::new(config.volume.clone())),
-            bluetooth: Arc::new(BluetoothModule::new(config.bluetooth.clone())),
-            network: Arc::new(NetworkModule::new(config.network.clone())),
-            memory: Arc::new(MemoryModule::new(config.memory.clone())),
-            brightness: Arc::new(BrightnessModule::new(config.brightness.clone())),
-            battery: Arc::new(BatteryModule::new(config.battery.clone())),
-            clock: Arc::new(ClockModule::new(config.clock.clone())),
-            spacer: Arc::new(SpacerModule::new(config.spacer.clone())),
-        }
+        type ModuleFactory = fn(&AppConfig) -> Arc<dyn BarModule>;
+        let candidates: [(&'static str, ModuleFactory); 8] = [
+            ("volume", |c| Arc::new(VolumeModule::new(c.volume.clone()))),
+            ("bluetooth", |c| Arc::new(BluetoothModule::new(c.bluetooth.clone()))),
+            ("network", |c| Arc::new(NetworkModule::new(c.network.clone()))),
+            ("memory", |c| Arc::new(MemoryModule::new(c.memory.clone()))),
+            ("brightness", |c| Arc::new(BrightnessModule::new(c.brightness.clone()))),
+            ("battery", |c| Arc::new(BatteryModule::new(c.battery.clone()))),
+            ("clock", |c| Arc::new(ClockModule::new(c.clock.clone()))),
+            ("spacer", |c| Arc::new(SpacerModule::new(c.spacer.clone()))),
+        ];
+        let modules = candidates
+            .into_iter()
+            .filter(|(name, _)| config.modules.contains_module(name))
+            .map(|(name, build)| (name, build(config)))
+            .collect();
+        Self { modules }
     }
 
     pub fn shutdown(&self) {
-        for m in [
-            &*self.volume as &dyn BarModule,
-            &*self.bluetooth,
-            &*self.network,
-            &*self.memory,
-            &*self.brightness,
-            &*self.battery,
-            &*self.clock,
-            &*self.spacer,
-        ] {
+        for (_, m) in &self.modules {
             m.shutdown();
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn BarModule>> {
-        match name {
-            "volume" => Some(Arc::clone(&self.volume) as Arc<dyn BarModule>),
-            "bluetooth" => Some(Arc::clone(&self.bluetooth) as Arc<dyn BarModule>),
-            "network" => Some(Arc::clone(&self.network) as Arc<dyn BarModule>),
-            "memory" => Some(Arc::clone(&self.memory) as Arc<dyn BarModule>),
-            "brightness" => Some(Arc::clone(&self.brightness) as Arc<dyn BarModule>),
-            "battery" => Some(Arc::clone(&self.battery) as Arc<dyn BarModule>),
-            "clock" => Some(Arc::clone(&self.clock) as Arc<dyn BarModule>),
-            "spacer" => Some(Arc::clone(&self.spacer) as Arc<dyn BarModule>),
-            _ => None,
-        }
+        self.modules
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, m)| Arc::clone(m))
     }
 }
 
@@ -339,7 +412,6 @@ pub struct ModuleState {
 }
 
 pub type ModuleSubscriber = (async_channel::Sender<ModuleState>, Orientation);
-pub type ModuleSubscribers = Arc<std::sync::Mutex<Vec<ModuleSubscriber>>>;
 
 pub trait BarModule: Send + Sync + 'static {
     fn name(&self) -> &'static str;
@@ -376,7 +448,7 @@ pub trait BarModule: Send + Sync + 'static {
             }
         }
     }
-    fn handle_scroll(&self, direction: ScrollDirection);
+    fn handle_scroll(&self, _direction: ScrollDirection) {}
     fn is_clickable(&self) -> bool {
         let (left, right, middle) = self.click_commands();
         [left, right, middle]
@@ -449,38 +521,6 @@ pub fn spawn_command(cmd: &str) {
                     "modules",
                     &format!("failed to spawn command '{cmd_owned}': {e}"),
                 );
-            }
-        }
-    });
-}
-
-/// Spawn a fixed system binary with argv (no shell) in the background.
-///
-/// Prefer this over [`spawn_command`] whenever the command does not need
-/// shell features. Arguments are passed directly to `exec`, so no quoting
-/// or charset validation is needed and shell injection is impossible.
-/// Failures and non-zero exits are logged with `tag` for context.
-pub fn spawn_command_argv(tag: &str, program: &str, args: &[&str]) {
-    let tag_owned = tag.to_string();
-    let program_resolved = resolve_helper(program);
-    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let display = format!("{program_resolved} {}", args_owned.join(" "));
-    crate::runtime::spawn(async move {
-        match tokio::process::Command::new(&program_resolved)
-            .args(&args_owned)
-            .spawn()
-        {
-            Ok(mut child) => match child.wait().await {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    crate::logger::emit("WARN", &tag_owned, &format!("command exited with {status}: {display}"));
-                }
-                Err(e) => {
-                    crate::logger::emit("WARN", &tag_owned, &format!("failed waiting on '{display}': {e}"));
-                }
-            },
-            Err(e) => {
-                crate::logger::emit("WARN", &tag_owned, &format!("failed to spawn '{display}': {e}"));
             }
         }
     });
@@ -653,37 +693,42 @@ impl ModuleWidget {
     ) {
         let combined = Self::format_combined_label(state.icon.as_deref(), state.text.as_deref(), orientation);
 
-        label.set_text(&combined);
-        label.set_visible(module_name != "spacer" && !combined.is_empty());
-
+        if label.text().as_str() != combined {
+            label.set_text(&combined);
+        }
+        let show_content = !combined.is_empty();
+        label.set_visible(module_name != "spacer" && show_content);
         if module_name != "spacer" {
-            button.set_visible(!combined.is_empty());
+            button.set_visible(show_content);
         }
 
-        if let Some(ref tip) = state.tooltip {
-            button.set_tooltip_text(Some(tip));
-        } else {
-            button.set_tooltip_text(None);
+        if button.tooltip_text().as_deref() != state.tooltip.as_deref() {
+            button.set_tooltip_text(state.tooltip.as_deref());
         }
 
         let expected_module_class = format!("module-{module_name}");
         for old_cls in button.css_classes() {
             let s = old_cls.as_str();
-            if s != "module-item"
-                && s != expected_module_class
-                && s != "button"
-                && s != "clickable"
-                && s != "non-clickable"
-                && s != "no-hover"
-                && s != "no-pointer"
-                && s != "cursor-default"
-                && s != "cursor-pointer"
-            {
+            let keep_static = s == expected_module_class
+                || matches!(
+                    s,
+                    "module-item"
+                        | "button"
+                        | "clickable"
+                        | "non-clickable"
+                        | "no-hover"
+                        | "no-pointer"
+                        | "cursor-default"
+                        | "cursor-pointer"
+                );
+            if !keep_static && !state.css_classes.iter().any(|want| want == s) {
                 button.remove_css_class(s);
             }
         }
         for cls in &state.css_classes {
-            button.add_css_class(cls);
+            if !button.has_css_class(cls) {
+                button.add_css_class(cls);
+            }
         }
         update_button_cursor(button);
     }
@@ -842,32 +887,21 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_command_argv_true_false() {
-        // `/bin/true` exits 0 (silent success), `/bin/false` exits 1
-        // (logged WARN, no panic). Both spawn in background; sleep briefly
-        // so the reaper thread runs without making the test flaky.
-        spawn_command_argv("test", "/bin/true", &[]);
-        spawn_command_argv("test", "/bin/false", &[]);
-        spawn_command_argv("test", "/bin/echo", &["hello world; rm -rf /"]);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    #[test]
     fn test_stop_signal_immediate_wake() {
-        let stop = StopSignal::new();
-        assert!(!stop.is_stopped());
+        let core = ModuleCore::new();
+        assert!(!core.is_stopped());
 
-        let stop_clone = stop.clone();
+        let core_clone = core.clone();
         let start = std::time::Instant::now();
         let handle = crate::runtime::spawn(async move {
             // Sleep for 60 seconds unless stopped
-            stop_clone.wait_timeout_async(Duration::from_secs(60)).await
+            core_clone.wait_timeout_async(Duration::from_secs(60)).await
         });
 
         // Trigger stop after a short delay
         std::thread::sleep(Duration::from_millis(20));
-        stop.stop();
-        assert!(stop.is_stopped());
+        core.shutdown();
+        assert!(core.is_stopped());
 
         let stopped = crate::runtime::handle().block_on(handle).expect("task must complete");
         assert!(stopped, "wait_timeout_async must return true when stopped");
@@ -951,23 +985,17 @@ mod tests {
         let cfg = AppConfig::default();
         let shared = SharedModules::new(&cfg);
 
-        assert!(!shared.volume.is_stopped());
-        assert!(!shared.battery.is_stopped());
-        assert!(!shared.bluetooth.is_stopped());
-        assert!(!shared.brightness.is_stopped());
-        assert!(!shared.clock.is_stopped());
-        assert!(!shared.memory.is_stopped());
-        assert!(!shared.network.is_stopped());
+        for name in SIMPLE_MODULE_NAMES {
+            let m = shared.get(name).expect("default config must enable all simple modules");
+            assert!(!m.is_stopped(), "{name} should start active");
+        }
 
         shared.shutdown();
 
-        assert!(shared.volume.is_stopped());
-        assert!(shared.battery.is_stopped());
-        assert!(shared.bluetooth.is_stopped());
-        assert!(shared.brightness.is_stopped());
-        assert!(shared.clock.is_stopped());
-        assert!(shared.memory.is_stopped());
-        assert!(shared.network.is_stopped());
+        for name in SIMPLE_MODULE_NAMES {
+            let m = shared.get(name).expect("module must still be registered");
+            assert!(m.is_stopped(), "{name} must be stopped after shutdown");
+        }
     }
 
     #[test]
@@ -1176,6 +1204,90 @@ mod tests {
                 0,
                 "ModuleWidget subscriber channel must close when widget is destroyed"
             );
+        });
+    }
+
+    #[test]
+    fn test_is_known_simple_module() {
+        for name in [
+            "volume",
+            "bluetooth",
+            "network",
+            "memory",
+            "brightness",
+            "battery",
+            "clock",
+            "spacer",
+        ] {
+            assert!(is_known_simple_module(name), "{name} should be known");
+        }
+        for name in ["taskbar", "tray", "", "unknown", "volumne"] {
+            assert!(!is_known_simple_module(name), "{name} should not be known");
+        }
+    }
+
+    #[test]
+    fn test_shared_modules_skips_unconfigured_modules() {
+        let mut cfg = AppConfig::default();
+        cfg.modules.start = Some(vec!["taskbar".into()]);
+        cfg.modules.end = Some(vec!["clock".into()]);
+        let shared = SharedModules::new(&cfg);
+        assert!(shared.get("clock").is_some());
+        assert!(shared.get("volume").is_none());
+        assert!(shared.get("memory").is_none());
+        assert!(shared.get("bluetooth").is_none());
+        shared.shutdown();
+    }
+
+    #[test]
+    fn test_module_core_wait_stopped_ignores_notify() {
+        let core = ModuleCore::new();
+        let core_w = core.clone();
+        let handle = crate::runtime::spawn(async move {
+            core_w.wait_stopped().await;
+            true
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        core.notify();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!handle.is_finished(), "notify() must not unblock wait_stopped()");
+        core.shutdown();
+        let res = crate::runtime::handle().block_on(handle).expect("task must complete");
+        assert!(res);
+    }
+
+    #[test]
+    fn test_module_widget_apply_state_diffs_css_classes() {
+        crate::util::run_gtk_test(|| {
+            let button = Button::new();
+            let label = Label::new(None);
+            button.set_child(Some(&label));
+            button.add_css_class("module-item");
+            button.add_css_class("module-clock");
+            button.add_css_class("clickable");
+
+            let s1 = ModuleState {
+                icon: None,
+                text: Some("a".into()),
+                tooltip: None,
+                css_classes: vec!["one".into(), "shared".into()],
+            };
+            ModuleWidget::apply_state(&button, &label, &s1, "clock", Orientation::Vertical);
+            assert!(button.has_css_class("one"));
+            assert!(button.has_css_class("shared"));
+            assert!(button.has_css_class("clickable"));
+
+            let s2 = ModuleState {
+                icon: None,
+                text: Some("b".into()),
+                tooltip: None,
+                css_classes: vec!["shared".into(), "two".into()],
+            };
+            ModuleWidget::apply_state(&button, &label, &s2, "clock", Orientation::Vertical);
+            assert!(!button.has_css_class("one"));
+            assert!(button.has_css_class("shared"));
+            assert!(button.has_css_class("two"));
+            assert!(button.has_css_class("clickable"));
         });
     }
 }

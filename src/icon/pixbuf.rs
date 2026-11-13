@@ -1,8 +1,10 @@
 use gdk_pixbuf::Pixbuf;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 pub(crate) const MAX_ASAR_ICON_BYTES: u64 = 4 * 1024 * 1024;
+const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawIconPixmap {
@@ -96,13 +98,7 @@ pub fn normalize_pixbuf_to_size(pb: Pixbuf, target_size: i32) -> Pixbuf {
     let cropped = if crop_x == 0 && crop_y == 0 && crop_w == w && crop_h == h {
         pb
     } else {
-        match Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, crop_w, crop_h) {
-            Some(canvas) => {
-                pb.copy_area(crop_x, crop_y, crop_w, crop_h, &canvas, 0, 0);
-                canvas
-            }
-            None => pb,
-        }
+        pb.new_subpixbuf(crop_x, crop_y, crop_w, crop_h)
     };
 
     let glyph_max = if target_size >= 16 {
@@ -281,6 +277,15 @@ pub fn fallback_executable_pixbuf(target_size: i32) -> Option<Pixbuf> {
     Some(pb)
 }
 
+/// Peek only the 8-byte PNG header before deciding whether to read a file into memory.
+pub(crate) fn has_png_file_header(path: &Path) -> bool {
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head).is_ok() && head == *PNG_MAGIC
+}
+
 /// Load a file into a `Pixbuf` at `target_size`, enforcing `MAX_ASAR_ICON_BYTES` (4 MB)
 /// and regular-file checks before loading. Uses fast in-process Cairo `libpng16`
 /// decoding for `.png` files so `libglycin` / `bwrap` is never spawned for trusted PNGs.
@@ -290,8 +295,8 @@ pub(crate) fn load_file_pixbuf_fast(path: &Path, target_size: i32) -> Option<Pix
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ASAR_ICON_BYTES {
         return None;
     }
-    if let Ok(bytes) = fs::read(path) {
-        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    if has_png_file_header(path) {
+        if let Ok(bytes) = fs::read(path) {
             if let Some(pb) = decode_png_bytes_to_pixbuf(&bytes, size) {
                 return Some(pb);
             }
@@ -414,5 +419,34 @@ mod tests {
             res.is_none(),
             "Oversized icon file (> 4MB) must be rejected without falling through"
         );
+    }
+
+    #[test]
+    fn test_has_png_file_header_and_crop_preserves_alpha() {
+        let temp_dir = TestTempDir::new("png_hdr");
+        let png_path = temp_dir.join("a.png");
+        let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
+        let mut png_bytes = Vec::new();
+        surf.write_to_png(&mut png_bytes).unwrap();
+        std::fs::write(&png_path, &png_bytes).unwrap();
+
+        let svg_path = temp_dir.join("b.svg");
+        std::fs::write(
+            &svg_path,
+            b"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'/>",
+        )
+        .unwrap();
+
+        assert!(has_png_file_header(&png_path));
+        assert!(!has_png_file_header(&svg_path));
+
+        // Non-transparent corner crop via subpixbuf yields target dimensions cleanly.
+        let pb = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 32, 32).unwrap();
+        pb.fill(0x00000000);
+        let dot = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 8, 8).unwrap();
+        dot.fill(0xff0000ff);
+        dot.copy_area(4, 4, 4, 4, &pb, 20, 20);
+        let norm = normalize_pixbuf_to_size(pb, 24);
+        assert_eq!((norm.width(), norm.height()), (24, 24));
     }
 }
