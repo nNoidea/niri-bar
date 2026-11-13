@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use crate::config::{resolve_mode, NetworkConfig};
 use crate::modules::{
-    dbus_get_property, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState,
-    ScrollDirection,
+    dbus_get_property, spawn_dbus_poller, spawn_dbus_trigger, system_bus, BarModule, DbusPollSpec, ModuleCore,
+    ModuleState,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,16 +76,6 @@ async fn get_dbus_property_string(
     variant_to_string(&inner)
 }
 
-async fn get_dbus_property_objpath(
-    conn: &zbus::Connection,
-    dest: &str,
-    path: &str,
-    interface: &str,
-    prop: &str,
-) -> Option<String> {
-    get_dbus_property_string(conn, dest, path, interface, prop).await
-}
-
 async fn get_dbus_property_objpath_list(
     conn: &zbus::Connection,
     dest: &str,
@@ -114,72 +104,29 @@ fn is_virtual_interface(name: &str) -> bool {
 impl NetworkModule {
     pub fn new(config: NetworkConfig) -> Self {
         let core = ModuleCore::new();
-        let core_worker = core.clone();
         let cfg = config.clone();
         // Fast non-blocking sysfs/procfs seed at construction so `current_state`
         // has real data immediately without blocking startup on NM D-Bus I/O.
         let (initial, _) = Self::read_network_state_sysfs();
         let last: Arc<Mutex<(NetworkType, Option<String>)>> = Arc::new(Mutex::new(initial.clone()));
-        let last_worker = Arc::clone(&last);
 
-        // Background worker loop driven by NetworkManager D-Bus events and periodic timeout.
-        // Unhealthy backends back off (3s→30s idle); triggers stay immediate.
-        // Subscriptions are worker-owned via `DbusSubscriptions` so they are
-        // renewed periodically and unsubscribed automatically on drop.
-        crate::runtime::spawn(async move {
-            if core_worker.is_stopped() {
-                return;
-            }
-            let mut last_cached = initial;
-            let mut fail_streak: u32 = 0;
-            let mut degraded_warned = false;
-            let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-            let mut last_renew = std::time::Instant::now();
-            let mut first_pass = true;
-
-            loop {
-                if first_pass {
-                    first_pass = false;
-                } else {
-                    let wait =
-                        crate::modules::poll_backoff(Duration::from_secs(3), fail_streak, Duration::from_secs(30));
-                    if core_worker.wait_timeout_async(wait).await {
-                        break;
-                    }
-                }
-
-                let ((net_type, ssid), healthy) = NetworkModule::read_network_state_full().await;
-
-                if healthy {
-                    if fail_streak > 0 {
-                        log_info!("network", "Backend recovered");
-                    }
-                    fail_streak = 0;
-                    degraded_warned = false;
-                } else {
-                    fail_streak = fail_streak.saturating_add(1);
-                    if !degraded_warned {
-                        degraded_warned = true;
-                        log_warn!("network", "No usable source (NM down, /sys unreadable); backing off");
-                    }
-                }
-
-                let current = (net_type, ssid);
-                if current != last_cached {
-                    last_cached.clone_from(&current);
-                    (*crate::util::lock(&last_worker)).clone_from(&current);
-                    core_worker.broadcast(|orient| {
-                        NetworkModule::format_state_with_config(&cfg, &current.0, current.1.as_deref(), orient)
-                    });
-                }
-
-                let renew_due = last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3;
-                if renew_due {
-                    _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-                    last_renew = std::time::Instant::now();
-                }
-            }
-        });
+        spawn_dbus_poller(
+            core.clone(),
+            initial,
+            Arc::clone(&last),
+            DbusPollSpec {
+                tag: "network",
+                base_interval: Duration::from_secs(3),
+                max_interval: Duration::from_secs(30),
+                fast_poll_on_notify: false,
+                degraded_msg: "No usable source (NM down, /sys unreadable); backing off",
+                degraded_is_warn: true,
+                is_transitional: |_| false,
+            },
+            Self::subscribe_triggers,
+            Self::read_network_state_full,
+            move |(net_type, ssid), orient| Self::format_state_with_config(&cfg, net_type, ssid.as_deref(), orient),
+        );
 
         Self { config, last, core }
     }
@@ -217,7 +164,7 @@ impl NetworkModule {
         let conn = system_bus().await?;
 
         // 1. Check PrimaryConnection
-        let primary_path = get_dbus_property_objpath(
+        let primary_path = get_dbus_property_string(
             &conn,
             "org.freedesktop.NetworkManager",
             "/org/freedesktop/NetworkManager",
@@ -444,8 +391,6 @@ impl BarModule for NetworkModule {
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
         self.config.click.commands()
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 }
 
 #[cfg(test)]

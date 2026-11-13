@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
 use crate::modules::{
-    spawn_command, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState, MouseButton,
-    ScrollDirection,
+    spawn_command, spawn_dbus_poller, spawn_dbus_trigger, system_bus, BarModule, DbusPollSpec, ModuleCore, ModuleState,
+    MouseButton,
 };
 
 pub(crate) type BluezManagedObjects =
@@ -34,7 +34,6 @@ pub struct BluetoothModule {
 impl BluetoothModule {
     pub fn new(config: BluetoothConfig) -> Self {
         let core = ModuleCore::new();
-        let core_worker = core.clone();
         let cfg = config.clone();
         // Fast non-blocking rfkill seed at construction so `current_state` has
         // real data immediately without blocking startup on BlueZ D-Bus I/O.
@@ -45,79 +44,24 @@ impl BluetoothModule {
             BluetoothState::Absent
         };
         let last: Arc<Mutex<BluetoothState>> = Arc::new(Mutex::new(initial.clone()));
-        let last_worker = Arc::clone(&last);
 
-        // Background worker loop driven by D-Bus signals and triggers.
-        // Unhealthy backends back off (2s→30s idle); triggered reads and
-        // transitional states stay fast. Subscriptions are worker-owned via
-        // `DbusSubscriptions` so they renew periodically and unsubscribe on drop.
-        crate::runtime::spawn(async move {
-            if core_worker.is_stopped() {
-                return;
-            }
-            let mut last_state: Option<BluetoothState> = Some(initial);
-            let mut fast_poll_ticks: usize = 0;
-            let mut fail_streak: u32 = 0;
-            let mut degraded_warned = false;
-            let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-            let mut last_renew = std::time::Instant::now();
-            let mut first_pass = true;
-
-            loop {
-                if first_pass {
-                    first_pass = false;
-                } else {
-                    let wait = if fast_poll_ticks > 0 {
-                        fast_poll_ticks -= 1;
-                        Duration::from_millis(100)
-                    } else {
-                        crate::modules::poll_backoff(Duration::from_secs(2), fail_streak, Duration::from_secs(30))
-                    };
-                    let (stopped, notified) = core_worker.wait_or_notified_async(wait).await;
-                    if stopped {
-                        break;
-                    }
-                    if notified {
-                        fast_poll_ticks = 40; // 40 * 100ms = 4.0s of fast-polling
-                        last_state = None; // Invalidate cache so live state is immediately broadcast
-                    }
-                }
-
-                let (current_state, healthy) = BluetoothModule::read_bluetooth_state_full().await;
-
-                if healthy {
-                    if fail_streak > 0 {
-                        log_info!("bluetooth", "Backend recovered");
-                    }
-                    fail_streak = 0;
-                    degraded_warned = false;
-                } else {
-                    fail_streak = fail_streak.saturating_add(1);
-                    if !degraded_warned {
-                        degraded_warned = true;
-                        log_info!("bluetooth", "No Bluetooth adapter found; hiding module");
-                    }
-                }
-
-                if last_state.as_ref() != Some(&current_state) {
-                    last_state = Some(current_state.clone());
-                    *crate::util::lock(&last_worker) = current_state.clone();
-                    core_worker
-                        .broadcast(|orient| BluetoothModule::format_state_with_config(&cfg, &current_state, orient));
-                }
-
-                // If currently transitioning / loading, keep polling every 100ms until state settles
-                if current_state == BluetoothState::Loading && fast_poll_ticks == 0 {
-                    fast_poll_ticks = 20; // 2.0s more of fast polling
-                }
-
-                let renew_due = last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3;
-                if renew_due {
-                    _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-                    last_renew = std::time::Instant::now();
-                }
-            }
-        });
+        spawn_dbus_poller(
+            core.clone(),
+            initial,
+            Arc::clone(&last),
+            DbusPollSpec {
+                tag: "bluetooth",
+                base_interval: Duration::from_secs(2),
+                max_interval: Duration::from_secs(30),
+                fast_poll_on_notify: true,
+                degraded_msg: "No Bluetooth adapter found; hiding module",
+                degraded_is_warn: false,
+                is_transitional: |s| *s == BluetoothState::Loading,
+            },
+            Self::subscribe_triggers,
+            Self::read_bluetooth_state_full,
+            move |state, orient| Self::format_state_with_config(&cfg, state, orient),
+        );
 
         Self { config, last, core }
     }
@@ -409,43 +353,15 @@ impl BarModule for BluetoothModule {
     }
 
     fn handle_click(&self, button: MouseButton) {
-        match button {
-            MouseButton::Left => {
-                if let Some(ref cmd) = self.config.click.on_click_left {
-                    // Custom command: don't fake a Loading state; the command
-                    // may open a manager instead of toggling.
-                    spawn_command(cmd);
-                } else {
-                    // Default toggle: emit Loading immediately for instant UI
-                    // feedback, then toggle.
-                    {
-                        let mut guard = crate::util::lock(&self.last);
-                        *guard = BluetoothState::Loading;
-                    }
-                    self.core.broadcast(|orient| {
-                        Self::format_state_with_config(&self.config, &BluetoothState::Loading, orient)
-                    });
-                    Self::toggle_bluetooth();
-                }
-
-                self.core.notify();
-            }
-            MouseButton::Right => {
-                if let Some(ref cmd) = self.config.click.on_click_right {
-                    spawn_command(cmd);
-                }
-                self.core.notify();
-            }
-            MouseButton::Middle => {
-                if let Some(ref cmd) = self.config.click.on_click_middle {
-                    spawn_command(cmd);
-                }
-                self.core.notify();
-            }
+        if !self.config.click.try_run(button) && button == MouseButton::Left {
+            // Default toggle: emit Loading immediately for instant UI feedback, then toggle.
+            *crate::util::lock(&self.last) = BluetoothState::Loading;
+            self.core
+                .broadcast(|orient| Self::format_state_with_config(&self.config, &BluetoothState::Loading, orient));
+            Self::toggle_bluetooth();
         }
+        self.core.notify();
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 
     fn is_clickable(&self) -> bool {
         // Left always toggles; right/middle optional.

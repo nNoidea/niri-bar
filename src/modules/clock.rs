@@ -3,15 +3,23 @@ use gtk::Orientation;
 use std::time::Duration;
 
 use crate::config::ClockConfig;
-use crate::modules::{BarModule, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{spawn_dbus_trigger, BarModule, DbusSubscriptions, ModuleCore, ModuleState};
 
 pub struct ClockModule {
     config: ClockConfig,
     core: ModuleCore,
 }
 
+/// Computes duration until the next second (when `per_second` is true) or minute
+/// boundary, adding a 5ms pad so `Local::now()` has rolled into the new tick.
+pub fn duration_until_next_tick(subsec_nanos: u32, second: u32, per_second: bool) -> Duration {
+    let ms_into_sec = u64::from(subsec_nanos.min(999_999_999)) / 1_000_000;
+    let secs_until = if per_second { 1 } else { u64::from(60 - second.min(59)) };
+    Duration::from_millis(secs_until * 1000 - ms_into_sec + 5)
+}
+
 /// Specifiers whose value can change within a minute and therefore require
-/// per-second ticks (250ms poll) instead of per-minute ticks (1s poll).
+/// per-second ticks instead of minute-aligned wakeups.
 /// `%c` / `%+` are included: they render the full locale datetime including seconds.
 pub fn needs_per_second_tick(fmt_vert: &str, fmt_horiz: &str) -> bool {
     ["%S", "%s", "%T", "%r", "%X", "%c", "%+", "%N", "%f"]
@@ -29,6 +37,12 @@ impl ClockModule {
 
         crate::runtime::spawn(async move {
             let mut last_tick = 999;
+            let _sleep_sub = DbusSubscriptions::new(vec![spawn_dbus_trigger(
+                &core_worker,
+                "org.freedesktop.login1",
+                "org.freedesktop.login1.Manager",
+                Some("PrepareForSleep"),
+            )]);
 
             loop {
                 if core_worker.is_stopped() {
@@ -59,10 +73,9 @@ impl ClockModule {
                     });
                 }
 
-                if core_worker
-                    .wait_timeout_async(Duration::from_millis(if has_seconds { 250 } else { 1000 }))
-                    .await
-                {
+                let wait = duration_until_next_tick(now.nanosecond(), now.second(), has_seconds);
+                let (stopped, _) = core_worker.wait_or_notified_async(wait).await;
+                if stopped {
                     break;
                 }
             }
@@ -106,8 +119,6 @@ impl BarModule for ClockModule {
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
         self.config.click.commands()
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 }
 
 #[cfg(test)]
@@ -170,5 +181,18 @@ mod tests {
             during <= before + 4,
             "ClockModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
         );
+    }
+
+    #[test]
+    fn test_duration_until_next_tick_aligns_to_boundary() {
+        assert_eq!(
+            duration_until_next_tick(250_000_000, 12, true),
+            Duration::from_millis(755)
+        );
+        assert_eq!(
+            duration_until_next_tick(500_000_000, 20, false),
+            Duration::from_millis(39_505)
+        );
+        assert_eq!(duration_until_next_tick(0, 59, false), Duration::from_millis(1_005));
     }
 }

@@ -73,23 +73,6 @@ impl AppState {
             }
             Event::WindowClosed { id } => {
                 self.windows.retain(|w| w.id != id);
-                let mut should_reset_drag = false;
-                {
-                    let mut g = crate::util::lock(&drag::GLOBAL_DRAG);
-                    if let Some(ref d) = *g {
-                        if d.window_id == id {
-                            g.take();
-                            should_reset_drag = true;
-                        }
-                    }
-                }
-                // NOTE: background thread — do NOT touch GTK here
-                // (`reset_all_cursors_and_overlay` creates/destroys widgets and
-                // must run on the main thread). We clear the drag state and
-                // request main-thread cleanup via `request_drag_cancel`.
-                if should_reset_drag {
-                    drag::request_drag_cancel(id);
-                }
             }
             Event::WindowFocusChanged { id } => {
                 for w in &mut self.windows {
@@ -129,10 +112,153 @@ impl AppState {
 
 pub struct NiriService {
     pub state: Arc<Mutex<AppState>>,
+    pub drag: Arc<drag::DragController>,
     pub update_tx: async_channel::Sender<()>,
     pub update_rx: async_channel::Receiver<()>,
     running: Arc<AtomicBool>,
     stop_notify: Arc<tokio::sync::Notify>,
+}
+
+/// Apply an IPC event to `state` and cancel any matching drag on `WindowClosed`.
+/// Cancelling outside the `state` lock keeps `AppState` and `DragController` locks disjoint.
+pub(crate) fn apply_state_event_with_drag(state: &Mutex<AppState>, drag: &drag::DragController, event: Event) -> bool {
+    if let Event::WindowClosed { id } = &event {
+        drag.cancel_window(*id);
+    }
+    crate::util::lock(state).apply_event(event)
+}
+
+fn spawn_initial_fetch_task(
+    state: Arc<Mutex<AppState>>,
+    update_tx: async_channel::Sender<()>,
+    running: Arc<AtomicBool>,
+) {
+    crate::runtime::spawn(async move {
+        if !running.load(Ordering::SeqCst) {
+            return;
+        }
+        let outputs = ok_logged(ipc::fetch_outputs().await, "Initial outputs fetch failed");
+        let windows = ok_logged(ipc::fetch_windows().await, "Initial windows fetch failed");
+        if let Some(ref wins) = windows {
+            crate::icon::warm_window_icons_off_thread(wins);
+        }
+        let workspaces = ok_logged(ipc::fetch_workspaces().await, "Initial workspaces fetch failed");
+
+        let mut st = crate::util::lock(&state);
+        if let Some(outputs) = outputs.filter(|_| st.outputs.is_empty()) {
+            st.outputs = outputs;
+        }
+        if let Some(windows) = windows.filter(|_| st.windows.is_empty()) {
+            st.windows = windows;
+        }
+        if let Some(workspaces) = workspaces.filter(|_| st.workspaces.is_empty()) {
+            st.workspaces = workspaces;
+        }
+        drop(st);
+        crate::util::nudge(&update_tx);
+    });
+}
+
+async fn process_ipc_event(
+    event: Event,
+    state: &Arc<Mutex<AppState>>,
+    drag: &drag::DragController,
+    update_tx: &async_channel::Sender<()>,
+) {
+    log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
+    if let Event::OutputsChanged { outputs } = &event {
+        let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
+        let fetched_outputs = if need_fetch_outputs {
+            ok_logged(
+                ipc::fetch_outputs().await,
+                "Outputs refetch failed after OutputsChanged",
+            )
+        } else {
+            None
+        };
+        let fetched_workspaces = ok_logged(
+            ipc::fetch_workspaces().await,
+            "Workspaces refetch failed after OutputsChanged",
+        );
+
+        let mut st = crate::util::lock(state);
+        if let Some(outs) = outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs) {
+            st.outputs = outs;
+        }
+        if let Some(wspaces) = fetched_workspaces {
+            st.workspaces = wspaces;
+        }
+        drop(st);
+        crate::util::nudge(update_tx);
+        return;
+    }
+
+    match &event {
+        Event::WindowsChanged { windows } => crate::icon::warm_window_icons_off_thread(windows),
+        Event::WindowOpenedOrChanged { window } => {
+            crate::icon::warm_window_icons_off_thread(std::slice::from_ref(window));
+        }
+        _ => {}
+    }
+
+    if apply_state_event_with_drag(state, drag, event) {
+        crate::util::nudge(update_tx);
+    }
+}
+
+fn spawn_ipc_listener_task(
+    state: Arc<Mutex<AppState>>,
+    drag: Arc<drag::DragController>,
+    update_tx: async_channel::Sender<()>,
+    running: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
+) {
+    crate::runtime::spawn(async move {
+        while running.load(Ordering::SeqCst) {
+            log_info!("niri", "Starting Niri IPC event listener loop");
+            match ipc::open_event_stream().await {
+                Ok(mut lines) => loop {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let line_res = tokio::select! {
+                        _ = stop_notify.notified() => break,
+                        res = lines.next_line() => res,
+                    };
+                    match line_res {
+                        Ok(Some(line_str)) => {
+                            let Some(event) = ipc::parse_event_line(&line_str) else {
+                                continue;
+                            };
+                            if !running.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            process_ipc_event(event, &state, &drag, &update_tx).await;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log_warn!("niri", "Error reading from Niri socket: {}", e);
+                            break;
+                        }
+                    }
+                },
+                Err(e) => {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
+                }
+            }
+
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::select! {
+                _ = stop_notify.notified() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    });
 }
 
 impl Drop for NiriService {
@@ -166,164 +292,22 @@ impl NiriService {
     pub fn new() -> Self {
         let (update_tx, update_rx) = async_channel::unbounded::<()>();
         let state = Arc::new(Mutex::new(AppState::default()));
+        let drag = Arc::new(drag::DragController::new());
         let running = Arc::new(AtomicBool::new(true));
         let stop_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Initial fetch as an async task: perform non-blocking socket round-trips
-        // BEFORE acquiring `state` so neither the GTK main thread nor the
-        // event-stream listener is stalled.
-        {
-            let state_init = Arc::clone(&state);
-            let tx_init = update_tx.clone();
-            let running_init = Arc::clone(&running);
-            crate::runtime::spawn(async move {
-                if !running_init.load(Ordering::SeqCst) {
-                    return;
-                }
-                let outputs = ipc::fetch_outputs()
-                    .await
-                    .map_err(|e| log_warn!("niri", "Initial outputs fetch failed ({e}); starting empty"))
-                    .ok();
-                let windows = ipc::fetch_windows()
-                    .await
-                    .map_err(|e| log_warn!("niri", "Initial windows fetch failed ({e}); starting empty"))
-                    .ok();
-                if let Some(ref wins) = windows {
-                    crate::icon::warm_window_icons_off_thread(wins);
-                }
-                let workspaces = ipc::fetch_workspaces()
-                    .await
-                    .map_err(|e| log_warn!("niri", "Initial workspaces fetch failed ({e}); starting empty"))
-                    .ok();
-
-                let mut st = crate::util::lock(&state_init);
-                if let Some(outputs) = outputs {
-                    if st.outputs.is_empty() {
-                        st.outputs = outputs;
-                    }
-                }
-                if let Some(windows) = windows {
-                    if st.windows.is_empty() {
-                        st.windows = windows;
-                    }
-                }
-                if let Some(workspaces) = workspaces {
-                    if st.workspaces.is_empty() {
-                        st.workspaces = workspaces;
-                    }
-                }
-                drop(st);
-                crate::util::nudge(&tx_init);
-            });
-        }
-
-        // Spawn background event listener task on the shared Tokio runtime
-        {
-            let state_clone = Arc::clone(&state);
-            let running_clone = Arc::clone(&running);
-            let stop_clone = Arc::clone(&stop_notify);
-            let tx_clone = update_tx.clone();
-
-            crate::runtime::spawn(async move {
-                while running_clone.load(Ordering::SeqCst) {
-                    log_info!("niri", "Starting Niri IPC event listener loop");
-                    match ipc::open_event_stream().await {
-                        Ok(mut lines) => loop {
-                            if !running_clone.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            let line_res = tokio::select! {
-                                _ = stop_clone.notified() => break,
-                                res = lines.next_line() => res,
-                            };
-                            match line_res {
-                                Ok(Some(line_str)) => {
-                                    let Some(event) = ipc::parse_event_line(&line_str) else {
-                                        continue;
-                                    };
-                                    if !running_clone.load(Ordering::SeqCst) {
-                                        break;
-                                    }
-                                    log_debug!("niri", "Received IPC event: {}", event.privacy_summary());
-                                    if let Event::OutputsChanged { outputs } = &event {
-                                        let need_fetch_outputs = outputs.as_ref().map(|o| o.is_empty()).unwrap_or(true);
-                                        let fetched_outputs = if need_fetch_outputs {
-                                            ipc::fetch_outputs()
-                                                .await
-                                                .map_err(|e| {
-                                                    log_warn!(
-                                                        "niri",
-                                                        "Outputs refetch failed after OutputsChanged: {e}"
-                                                    )
-                                                })
-                                                .ok()
-                                        } else {
-                                            None
-                                        };
-                                        let fetched_workspaces = ipc::fetch_workspaces()
-                                            .await
-                                            .map_err(|e| {
-                                                log_warn!("niri", "Workspaces refetch failed after OutputsChanged: {e}")
-                                            })
-                                            .ok();
-
-                                        let mut st = crate::util::lock(&state_clone);
-                                        if let Some(outs) =
-                                            outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs)
-                                        {
-                                            st.outputs = outs;
-                                        }
-                                        if let Some(wspaces) = fetched_workspaces {
-                                            st.workspaces = wspaces;
-                                        }
-                                        drop(st);
-                                        crate::util::nudge(&tx_clone);
-                                        continue;
-                                    }
-
-                                    match &event {
-                                        Event::WindowsChanged { windows } => {
-                                            crate::icon::warm_window_icons_off_thread(windows);
-                                        }
-                                        Event::WindowOpenedOrChanged { window } => {
-                                            crate::icon::warm_window_icons_off_thread(std::slice::from_ref(window));
-                                        }
-                                        _ => {}
-                                    }
-
-                                    let changed = crate::util::lock(&state_clone).apply_event(event);
-                                    if changed {
-                                        crate::util::nudge(&tx_clone);
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    log_warn!("niri", "Error reading from Niri socket: {}", e);
-                                    break;
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            if !running_clone.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            log_warn!("niri", "Niri event stream disconnected: {e}. Retrying in 1s...");
-                        }
-                    }
-
-                    if !running_clone.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = stop_clone.notified() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    }
-                }
-            });
-        }
+        spawn_initial_fetch_task(Arc::clone(&state), update_tx.clone(), Arc::clone(&running));
+        spawn_ipc_listener_task(
+            Arc::clone(&state),
+            Arc::clone(&drag),
+            update_tx.clone(),
+            Arc::clone(&running),
+            Arc::clone(&stop_notify),
+        );
 
         Self {
             state,
+            drag,
             update_tx,
             update_rx,
             running,
@@ -335,10 +319,12 @@ impl NiriService {
     pub fn new_mock() -> Self {
         let (update_tx, update_rx) = async_channel::unbounded::<()>();
         let state = Arc::new(Mutex::new(AppState::default()));
+        let drag = Arc::new(drag::DragController::new());
         let running = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(tokio::sync::Notify::new());
         Self {
             state,
+            drag,
             update_tx,
             update_rx,
             running,
@@ -361,6 +347,15 @@ pub struct MonitorFingerprint {
     pub model: Option<String>,
     pub w_mm: i32,
     pub h_mm: i32,
+}
+
+fn ok_logged<T>(res: Result<T, String>, ctx: &str) -> Option<T> {
+    res.map_err(|e| log_warn!("niri", "{ctx}: {e}")).ok()
+}
+
+fn fuzzy_match(candidate: Option<&str>, target_lower: &str) -> bool {
+    let low = candidate.unwrap_or_default().to_lowercase();
+    !low.is_empty() && (target_lower.contains(&low) || low.contains(target_lower))
 }
 
 /// Pure output matching (steps 1-6). `single_monitor_system` gates the
@@ -427,15 +422,7 @@ pub fn match_output_for_monitor(
 
         for name in &pool {
             let out = &outputs[name];
-            let n_make_low = out.make.as_deref().unwrap_or_default().to_lowercase();
-            let n_model_low = out.model.as_deref().unwrap_or_default().to_lowercase();
-
-            let make_matches =
-                !n_make_low.is_empty() && (g_make_low.contains(&n_make_low) || n_make_low.contains(&g_make_low));
-            let model_matches =
-                !n_model_low.is_empty() && (g_model_low.contains(&n_model_low) || n_model_low.contains(&g_model_low));
-
-            if make_matches && model_matches {
+            if fuzzy_match(out.make.as_deref(), &g_make_low) && fuzzy_match(out.model.as_deref(), &g_model_low) {
                 return Some(name.clone());
             }
         }
@@ -445,9 +432,7 @@ pub fn match_output_for_monitor(
     if let Some(g_model) = &fp.model {
         let g_model_low = g_model.to_lowercase();
         for name in &pool {
-            let out = &outputs[name];
-            let n_model_low = out.model.as_deref().unwrap_or_default().to_lowercase();
-            if !n_model_low.is_empty() && (g_model_low.contains(&n_model_low) || n_model_low.contains(&g_model_low)) {
+            if fuzzy_match(outputs[name].model.as_deref(), &g_model_low) {
                 return Some(name.clone());
             }
         }
@@ -821,5 +806,31 @@ mod tests {
             during <= before + 4,
             "5 active NiriService instances should run on shared Tokio runtime, not spawn OS threads (before: {before}, during: {during})"
         );
+    }
+
+    #[test]
+    fn test_fuzzy_match_helper() {
+        assert!(fuzzy_match(Some("Microstep"), "micro"));
+        assert!(fuzzy_match(Some("LG Display"), "lg display ultra"));
+        assert!(!fuzzy_match(Some(""), "lg"));
+        assert!(!fuzzy_match(None, "lg"));
+        assert!(!fuzzy_match(Some("Dell"), "samsung"));
+    }
+
+    #[test]
+    fn test_window_closed_cancels_matching_drag_only() {
+        let state = Mutex::new(AppState::default());
+        let drag = drag::DragController::new();
+
+        drag.begin_press(42, Some("eDP-1".into()), 0, (0.0, 0.0), (0.0, 0.0));
+        let changed_other = apply_state_event_with_drag(&state, &drag, Event::WindowClosed { id: 99 });
+        assert!(changed_other);
+        assert_eq!(drag.active_window_id(), Some(42));
+        assert!(!drag.should_cleanup_cancel());
+
+        let changed_dragged = apply_state_event_with_drag(&state, &drag, Event::WindowClosed { id: 42 });
+        assert!(changed_dragged);
+        assert_eq!(drag.active_window_id(), None);
+        assert!(drag.should_cleanup_cancel());
     }
 }

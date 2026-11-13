@@ -14,28 +14,43 @@ fn desktop_entries() -> &'static Mutex<Option<HashMap<String, String>>> {
     DESKTOP_ENTRIES.get_or_init(|| Mutex::new(None))
 }
 
-fn get_data_dirs() -> Vec<PathBuf> {
+fn resolve_data_dirs(user_data: Option<&Path>, xdg_data_dirs: Option<&str>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let mut push_unique = |p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
 
-    if let Ok(ref user_data) = data_home {
-        dirs.push(user_data.clone());
-        dirs.push(user_data.join("flatpak/exports/share"));
+    if let Some(user_dir) = user_data {
+        push_unique(user_dir.to_path_buf());
+        push_unique(user_dir.join("flatpak/exports/share"));
     }
-    if let Ok(xdg_data_dirs) = std::env::var("XDG_DATA_DIRS") {
-        for dir in xdg_data_dirs.split(':') {
+    if let Some(xdg) = xdg_data_dirs {
+        for dir in xdg.split(':') {
             if !dir.is_empty() {
-                dirs.push(PathBuf::from(dir));
+                push_unique(PathBuf::from(dir));
             }
         }
     } else {
-        dirs.push(PathBuf::from("/usr/local/share"));
-        dirs.push(PathBuf::from("/usr/share"));
-        dirs.push(PathBuf::from("/var/lib/flatpak/exports/share"));
+        push_unique(PathBuf::from("/usr/local/share"));
+        push_unique(PathBuf::from("/usr/share"));
+        push_unique(PathBuf::from("/var/lib/flatpak/exports/share"));
+    }
+    let system_flatpak = PathBuf::from("/var/lib/flatpak/exports/share");
+    if !dirs.contains(&system_flatpak) && system_flatpak.is_dir() {
+        dirs.push(system_flatpak);
     }
     dirs
+}
+
+fn get_data_dirs() -> Vec<PathBuf> {
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .ok();
+    let xdg_data_dirs = std::env::var("XDG_DATA_DIRS").ok();
+    resolve_data_dirs(data_home.as_deref(), xdg_data_dirs.as_deref())
 }
 
 /// Extracts `(icon, startup_wm_class, name)` from the `[Desktop Entry]` group
@@ -198,6 +213,119 @@ pub(crate) fn resolve_icon_path_or_name(icon: &str) -> Option<String> {
     Some(icon.to_string())
 }
 
+pub(crate) fn resolve_xdg_icon(name: &str) -> Option<PathBuf> {
+    let safe = crate::icon::sanitize_icon_name(name)?;
+    resolve_xdg_icon_in_dirs(&safe, &get_data_dirs())
+}
+
+const XDG_SIZES: &[&str] = &[
+    "64x64", "48x48", "128x128", "32x32", "256x256", "512x512", "24x24", "22x22", "16x16",
+];
+const XDG_CATEGORIES: &[&str] = &[
+    "apps",
+    "status",
+    "devices",
+    "places",
+    "mimetypes",
+    "categories",
+    "legacy",
+];
+const XDG_THEMES: &[&str] = &["hicolor", "AdwaitaLegacy", "Adwaita"];
+
+fn find_in_theme_subdir(subdir: &Path, filenames: &[&str]) -> Option<PathBuf> {
+    if !subdir.is_dir() {
+        return None;
+    }
+    for cat in XDG_CATEGORIES {
+        let cat_dir = subdir.join(cat);
+        for file in filenames {
+            let candidate = cat_dir.join(file);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_in_themes(data_dirs: &[PathBuf], mut probe_theme: impl FnMut(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    for data_dir in data_dirs {
+        let icons_dir = data_dir.join("icons");
+        if icons_dir.is_dir() {
+            for theme in XDG_THEMES {
+                let theme_dir = icons_dir.join(theme);
+                if theme_dir.is_dir() {
+                    if let Some(hit) = probe_theme(&theme_dir) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `Adwaita`, `pixmaps`) for an application icon.
+///
+/// 1. Searches for raster `.png` first across fixed sizes and pixmaps so it can be decoded
+///    directly in-process via `libpng16` with zero background threads.
+/// 2. If no raster PNG is found, searches `scalable/` (and fixed-size dirs / pixmaps) for vector
+///    `.svg` / `.svgz` icons (used by many Flatpak and modern desktop apps).
+/// 3. Falls back to case-insensitive (lowercased) match and symbolic icons.
+pub(crate) fn resolve_xdg_icon_in_dirs(safe_name: &str, data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let lower = safe_name.to_lowercase();
+    let names = if lower != safe_name {
+        vec![safe_name, lower.as_str()]
+    } else {
+        vec![safe_name]
+    };
+
+    // 1. Try raster PNG first (fast in-process decode via libpng16)
+    for name in &names {
+        if let Some(png) = resolve_xdg_png_icon_in_dirs(name, data_dirs) {
+            return Some(png);
+        }
+    }
+
+    // 2. Try scalable / vector SVG icons and pixmaps
+    for name in &names {
+        let scalable_files = [format!("{name}.svg"), format!("{name}.svgz"), format!("{name}.png")];
+        let scalable_refs: Vec<&str> = scalable_files.iter().map(String::as_str).collect();
+        let fixed_svg = [format!("{name}.svg")];
+        let fixed_refs = [fixed_svg[0].as_str()];
+
+        if let Some(hit) = find_in_themes(data_dirs, |theme_dir| {
+            find_in_theme_subdir(&theme_dir.join("scalable"), &scalable_refs).or_else(|| {
+                XDG_SIZES
+                    .iter()
+                    .find_map(|sz| find_in_theme_subdir(&theme_dir.join(sz), &fixed_refs))
+            })
+        }) {
+            return Some(hit);
+        }
+
+        for data_dir in data_dirs {
+            let pixmap_svg = data_dir.join("pixmaps").join(&fixed_svg[0]);
+            if pixmap_svg.is_file() {
+                return Some(pixmap_svg);
+            }
+        }
+    }
+
+    // 3. Fallback: symbolic icons
+    for name in &names {
+        let sym_files = [format!("{name}-symbolic.svg"), format!("{name}.svg")];
+        let sym_refs = [sym_files[0].as_str(), sym_files[1].as_str()];
+        if let Some(hit) = find_in_themes(data_dirs, |theme_dir| {
+            find_in_theme_subdir(&theme_dir.join("symbolic"), &sym_refs)
+        }) {
+            return Some(hit);
+        }
+    }
+
+    None
+}
+
 /// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `pixmaps`) for a raster `.png` icon
 /// matching `name` so it can be decoded directly in-process via `libpng16` without
 /// initializing `GtkIconTheme` or `libglycin`.
@@ -207,38 +335,19 @@ pub(crate) fn resolve_xdg_png_icon(name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn resolve_xdg_png_icon_in_dirs(safe_name: &str, data_dirs: &[PathBuf]) -> Option<PathBuf> {
-    const HICOLOR_SIZES: &[&str] = &[
-        "64x64", "48x48", "128x128", "32x32", "256x256", "512x512", "24x24", "22x22", "16x16",
-    ];
-    const CATEGORIES: &[&str] = &[
-        "apps",
-        "status",
-        "devices",
-        "places",
-        "mimetypes",
-        "categories",
-        "legacy",
-    ];
     let filename = format!("{safe_name}.png");
-
+    let refs = [filename.as_str()];
     for data_dir in data_dirs {
         let icons_dir = data_dir.join("icons");
         if icons_dir.is_dir() {
-            for theme in ["hicolor", "AdwaitaLegacy", "Adwaita"] {
+            for theme in XDG_THEMES {
                 let theme_dir = icons_dir.join(theme);
-                if !theme_dir.is_dir() {
-                    continue;
-                }
-                for sz in HICOLOR_SIZES {
-                    let sz_dir = theme_dir.join(sz);
-                    if !sz_dir.is_dir() {
-                        continue;
-                    }
-                    for cat in CATEGORIES {
-                        let candidate = sz_dir.join(cat).join(&filename);
-                        if candidate.is_file() {
-                            return Some(candidate);
-                        }
+                if theme_dir.is_dir() {
+                    if let Some(hit) = XDG_SIZES
+                        .iter()
+                        .find_map(|sz| find_in_theme_subdir(&theme_dir.join(sz), &refs))
+                    {
+                        return Some(hit);
                     }
                 }
             }
@@ -325,5 +434,61 @@ Icon=list-add
 
         let found = resolve_xdg_png_icon_in_dirs("org.example.App", &[dir.to_path_buf()]);
         assert_eq!(found, Some(png_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_finds_scalable_svg() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_svg");
+        let apps_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let svg_path = apps_dir.join("org.example.ScalableApp.svg");
+        fs::write(&svg_path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="16" fill="blue"/></svg>"#).unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("org.example.ScalableApp", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(svg_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_prefers_raster_png_over_svg() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_pref");
+        let png_dir = dir.join("icons/hicolor/48x48/apps");
+        let svg_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&png_dir).unwrap();
+        fs::create_dir_all(&svg_dir).unwrap();
+        let png_path = png_dir.join("org.example.App.png");
+        let svg_path = svg_dir.join("org.example.App.svg");
+        crate::icon::tests_common::write_test_png(&png_path, 48, 48);
+        fs::write(&svg_path, "<svg></svg>").unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("org.example.App", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(png_path));
+    }
+
+    #[test]
+    fn test_resolve_xdg_icon_case_fallback() {
+        let dir = crate::icon::tests_common::TestTempDir::new("xdg_case");
+        let svg_dir = dir.join("icons/hicolor/scalable/apps");
+        fs::create_dir_all(&svg_dir).unwrap();
+        let svg_path = svg_dir.join("com.example.app.svg");
+        fs::write(&svg_path, "<svg></svg>").unwrap();
+
+        let found = resolve_xdg_icon_in_dirs("com.example.App", &[dir.to_path_buf()]);
+        assert_eq!(found, Some(svg_path));
+    }
+
+    #[test]
+    fn test_resolve_data_dirs_deduplicates_xdg_entries() {
+        let user_dir = PathBuf::from("/tmp/niri_test_data_home");
+        let dirs = resolve_data_dirs(
+            Some(&user_dir),
+            Some("/usr/local/share:/usr/share:/usr/share::/tmp/niri_test_data_home"),
+        );
+        let share_count = dirs.iter().filter(|p| *p == Path::new("/usr/share")).count();
+        let home_count = dirs.iter().filter(|p| *p == user_dir.as_path()).count();
+        assert_eq!(share_count, 1, "Duplicate XDG_DATA_DIRS entries must be deduplicated");
+        assert_eq!(
+            home_count, 1,
+            "User data dir repeated in XDG_DATA_DIRS must appear once"
+        );
     }
 }

@@ -3,6 +3,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+const MAX_IPC_LINE: u64 = 8 * 1024 * 1024;
+const IPC_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Niri socket path from `$NIRI_SOCKET` (set by Niri for its clients).
 pub fn get_socket_path() -> Option<String> {
@@ -36,13 +40,35 @@ pub fn parse_niri_response<T: serde::de::DeserializeOwned>(line: &str) -> Result
     }
 }
 
+async fn write_and_read_line<R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    req_bytes: &[u8],
+    line: &mut String,
+    label: &str,
+) -> Result<(), String> {
+    writer
+        .write_all(req_bytes)
+        .await
+        .map_err(|e| format!("Failed to send {label} to Niri socket: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
+    line.clear();
+    reader
+        .take(MAX_IPC_LINE)
+        .read_line(line)
+        .await
+        .map_err(|e| format!("Failed to read {label} response from Niri socket: {e}"))?;
+    if line.len() >= MAX_IPC_LINE as usize {
+        return Err(format!("{label} response exceeds 8MB cap"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute_actions_at(socket_path: &str, action_payloads: &[serde_json::Value]) -> Result<(), String> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-
-    const MAX_LINE: u64 = 8 * 1024 * 1024;
-    let timeout_dur = Duration::from_millis(1000);
-
-    tokio::time::timeout(timeout_dur, async {
+    tokio::time::timeout(IPC_TIMEOUT, async {
         let mut stream = tokio::net::UnixStream::connect(socket_path)
             .await
             .map_err(|e| format!("Failed to connect to Niri socket at {socket_path}: {e}"))?;
@@ -52,22 +78,7 @@ pub(crate) async fn execute_actions_at(socket_path: &str, action_payloads: &[ser
 
         for payload in action_payloads {
             let req_str = build_action_request(payload.clone());
-            wr.write_all(req_str.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to write to Niri socket: {e}"))?;
-            wr.flush()
-                .await
-                .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
-
-            line.clear();
-            (&mut reader)
-                .take(MAX_LINE)
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("Failed to read action response from Niri socket: {e}"))?;
-            if line.len() >= MAX_LINE as usize {
-                return Err("Action response exceeds 8MB cap".to_string());
-            }
+            write_and_read_line(&mut reader, &mut wr, req_str.as_bytes(), &mut line, "action").await?;
             let _: serde_json::Value = parse_niri_response(&line)?;
         }
         Ok(())
@@ -115,43 +126,30 @@ pub async fn move_window_to_monitor(id: u64, output: &str, target_slot: Option<u
     execute_actions(&actions).await
 }
 
-async fn fetch_niri_resource<T: serde::de::DeserializeOwned>(resource_name: &str) -> Result<T, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-
-    const MAX_LINE: u64 = 8 * 1024 * 1024;
-    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
-    let timeout_dur = Duration::from_millis(1000);
-
-    let line = tokio::time::timeout(timeout_dur, async {
-        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+pub(crate) async fn fetch_niri_resource_at<T: serde::de::DeserializeOwned>(
+    socket_path: &str,
+    resource_name: &str,
+) -> Result<T, String> {
+    let line = tokio::time::timeout(IPC_TIMEOUT, async {
+        let mut stream = tokio::net::UnixStream::connect(socket_path)
             .await
             .map_err(|e| format!("Failed to connect to Niri socket at {socket_path}: {e}"))?;
-        let req = format!("\"{resource_name}\"\n");
-        stream
-            .write_all(req.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to send {resource_name} request to Niri socket: {e}"))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush Niri socket: {e}"))?;
-
-        let reader = tokio::io::BufReader::new(stream);
+        let (rd, mut wr) = stream.split();
+        let mut reader = tokio::io::BufReader::new(rd);
         let mut line = String::new();
-        reader
-            .take(MAX_LINE)
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("Failed to read {resource_name} response from Niri socket: {e}"))?;
-        if line.len() >= MAX_LINE as usize {
-            return Err(format!("{resource_name} response exceeds 8MB cap"));
-        }
-        Ok(line)
+        let req = format!("\"{resource_name}\"\n");
+        write_and_read_line(&mut reader, &mut wr, req.as_bytes(), &mut line, resource_name).await?;
+        Ok::<String, String>(line)
     })
     .await
     .map_err(|_| format!("Timed out fetching {resource_name} from Niri socket"))??;
 
     parse_niri_response(&line)
+}
+
+async fn fetch_niri_resource<T: serde::de::DeserializeOwned>(resource_name: &str) -> Result<T, String> {
+    let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
+    fetch_niri_resource_at(&socket_path, resource_name).await
 }
 
 pub async fn fetch_outputs() -> Result<HashMap<String, OutputInfo>, String> {
@@ -310,6 +308,47 @@ mod tests {
             assert_eq!(received.len(), 2);
             assert_eq!(received[0], "{\"Action\":{\"FocusWindow\":{\"id\":7}}}");
             assert_eq!(received[1], "{\"Action\":{\"MoveColumnToIndex\":{\"index\":3}}}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fetch_niri_resource_at_unix_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = std::env::temp_dir().join(format!("niri-bar-ipc-fetch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock_path = dir.join("niri.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (rd, mut wr) = stream.into_split();
+                let mut lines = BufReader::new(rd).lines();
+                let req = lines.next_line().await.unwrap().unwrap();
+                wr.write_all(b"{\"Ok\":{\"Workspaces\":[{\"id\":9,\"idx\":1,\"output\":\"eDP-1\",\"is_active\":true,\"is_focused\":true}]}}\n")
+                    .await
+                    .unwrap();
+                req
+            });
+
+            #[derive(serde::Deserialize)]
+            struct Payload {
+                #[serde(rename = "Workspaces")]
+                workspaces: Vec<WorkspaceInfo>,
+            }
+            let fetched: Payload = fetch_niri_resource_at(&sock_path.to_string_lossy(), "Workspaces")
+                .await
+                .expect("fetch_niri_resource_at must succeed");
+            assert_eq!(fetched.workspaces.len(), 1);
+            assert_eq!(fetched.workspaces[0].id, 9);
+            assert_eq!(server.await.unwrap(), "\"Workspaces\"");
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

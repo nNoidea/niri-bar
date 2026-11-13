@@ -25,6 +25,7 @@ enum CachedExeIcon {
 
 static EXE_ICON_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedExeIcon>>> = OnceLock::new();
 static APP_ID_EXE_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+static WARMED_PID_APP_CACHE: OnceLock<Mutex<HashMap<u32, Vec<String>>>> = OnceLock::new();
 
 fn exe_icon_cache() -> &'static Mutex<HashMap<PathBuf, CachedExeIcon>> {
     EXE_ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -32,6 +33,10 @@ fn exe_icon_cache() -> &'static Mutex<HashMap<PathBuf, CachedExeIcon>> {
 
 pub(crate) fn app_id_exe_cache() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
     APP_ID_EXE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn warmed_pid_app_cache() -> &'static Mutex<HashMap<u32, Vec<String>>> {
+    WARMED_PID_APP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Resolve `/proc/<pid>/exe` to a clean executable path on Linux.
@@ -204,22 +209,53 @@ fn warm_exe_icon_cache_for_path(exe_path: &Path, app_id: &str) -> CachedExeIcon 
     resolved
 }
 
-/// Pre-warm executable icon caches for a slice of Niri windows on the background
-/// Tokio worker before nudging the GTK main thread.
-pub fn warm_window_icons_off_thread(windows: &[crate::niri::model::WindowInfo]) {
-    for w in windows {
-        let Some(ref app_id) = w.app_id else {
-            continue;
-        };
-        let Some(pid) = w.pid else {
-            continue;
-        };
+pub(crate) fn warm_window_icons_with<F>(windows: &[crate::niri::model::WindowInfo], resolve_pid: &mut F)
+where
+    F: FnMut(u32) -> Option<PathBuf>,
+{
+    let mut misses: Vec<(u32, String)> = Vec::new();
+    {
+        let warmed = crate::util::lock(warmed_pid_app_cache());
+        for w in windows {
+            let (Some(ref app_id), Some(pid)) = (&w.app_id, w.pid) else {
+                continue;
+            };
+            let already_warmed = warmed.get(&pid).is_some_and(|apps| apps.iter().any(|a| a == app_id));
+            let already_queued = misses.iter().any(|(p, a)| *p == pid && a == app_id);
+            if !already_warmed && !already_queued {
+                misses.push((pid, app_id.clone()));
+            }
+        }
+    }
+
+    if misses.is_empty() {
+        return;
+    }
+
+    for (pid, app_id) in &misses {
         // Ensure desktop entries are loaded off-thread first
         let _ = find_app_icon(app_id);
-        if let Some(exe_path) = resolve_pid_exe_path(pid) {
+        if let Some(exe_path) = resolve_pid(*pid) {
             let _ = warm_exe_icon_cache_for_path(&exe_path, app_id);
         }
     }
+
+    let mut warmed = crate::util::lock(warmed_pid_app_cache());
+    if warmed.len() >= MAX_EXE_CACHE_ENTRIES {
+        warmed.clear();
+    }
+    for (pid, app_id) in misses {
+        let entry = warmed.entry(pid).or_default();
+        if !entry.iter().any(|a| a == &app_id) {
+            entry.push(app_id);
+        }
+    }
+}
+
+/// Pre-warm executable icon caches for a slice of Niri windows on the background
+/// Tokio worker before nudging the GTK main thread.
+pub fn warm_window_icons_off_thread(windows: &[crate::niri::model::WindowInfo]) {
+    warm_window_icons_with(windows, &mut resolve_pid_exe_path);
 }
 
 /// Load a normalized square `Pixbuf` from a resolved executable path (cached per executable).
@@ -390,5 +426,39 @@ mod tests {
             pb.is_some(),
             "Should skip non-image .DirIcon and resolve custom package.json icon path from app.asar"
         );
+    }
+
+    #[test]
+    fn test_warm_window_icons_with_skips_duplicate_pid_app_id() {
+        let mut w = crate::niri::model::WindowInfo {
+            id: 1,
+            title: None,
+            app_id: Some("org.example.WarmSkip".to_string()),
+            pid: Some(424242),
+            workspace_id: None,
+            is_focused: false,
+            layout: None,
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let mut resolver = |_pid: u32| -> Option<PathBuf> {
+            calls.set(calls.get() + 1);
+            None
+        };
+        warm_window_icons_with(std::slice::from_ref(&w), &mut resolver);
+        assert_eq!(calls.get(), 1);
+
+        // Second warm with identical (pid, app_id) skips resolver.
+        warm_window_icons_with(std::slice::from_ref(&w), &mut resolver);
+        assert_eq!(calls.get(), 1);
+
+        // New PID with same app_id probes again (anti-spoofing preserved).
+        w.pid = Some(424243);
+        warm_window_icons_with(std::slice::from_ref(&w), &mut resolver);
+        assert_eq!(calls.get(), 2);
+
+        // Same PID with a distinct app_id also warms without colliding on PID key.
+        w.app_id = Some("org.example.WarmSecondApp".to_string());
+        warm_window_icons_with(std::slice::from_ref(&w), &mut resolver);
+        assert_eq!(calls.get(), 3);
     }
 }

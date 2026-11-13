@@ -87,6 +87,123 @@ pub fn extract_icon_bytes_from_asar(asar_path: &Path) -> Option<Vec<u8>> {
     extract_icon_bytes_from_asar_selective(asar_path)
 }
 
+fn resolve_leaf(leaf: Option<&AsarLeafEntry>) -> Option<(u64, u64)> {
+    let l = leaf?;
+    if l.unpacked == Some(true) {
+        return None;
+    }
+    Some((l.offset?, l.size?))
+}
+
+fn lookup_static(top: &AsarTopFiles, rel_path: &str) -> Option<(u64, u64)> {
+    match rel_path {
+        "icon.png" => resolve_leaf(top.icon_png.as_ref()),
+        "icon.svg" => resolve_leaf(top.icon_svg.as_ref()),
+        _ => {
+            let (dir_name, file) = rel_path.split_once('/')?;
+            let dir = match dir_name {
+                "assets" => top.assets.as_ref(),
+                "resources" => top.resources.as_ref(),
+                "build" => top.build.as_ref(),
+                "dist" => top.dist.as_ref(),
+                _ => None,
+            }?;
+            let sub = dir.files.as_ref()?;
+            match file {
+                "icon.png" => resolve_leaf(sub.icon_png.as_ref()),
+                "icon.svg" => resolve_leaf(sub.icon_svg.as_ref()),
+                _ => None,
+            }
+        }
+    }
+}
+
+struct AsarEntrySeed<'a>(&'a [&'a str]);
+
+impl<'de, 'a> serde::de::DeserializeSeed<'de> for AsarEntrySeed<'a> {
+    type Value = Option<(u64, u64)>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.0.is_empty() {
+            let leaf: AsarLeafEntry = serde::Deserialize::deserialize(deserializer)?;
+            return Ok(resolve_leaf(Some(&leaf)));
+        }
+        struct DirVisitor<'a>(&'a [&'a str]);
+        impl<'de, 'a> serde::de::Visitor<'de> for DirVisitor<'a> {
+            type Value = Option<(u64, u64)>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("ASAR directory object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut found = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "files" && found.is_none() {
+                        found = map.next_value_seed(AsarFilesSeed(self.0))?;
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(found)
+            }
+        }
+        deserializer.deserialize_map(DirVisitor(self.0))
+    }
+}
+
+struct AsarFilesSeed<'a>(&'a [&'a str]);
+
+impl<'de, 'a> serde::de::DeserializeSeed<'de> for AsarFilesSeed<'a> {
+    type Value = Option<(u64, u64)>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilesVisitor<'a>(&'a [&'a str]);
+        impl<'de, 'a> serde::de::Visitor<'de> for FilesVisitor<'a> {
+            type Value = Option<(u64, u64)>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("ASAR files map")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut found = None;
+                let (head, tail) = (self.0[0], &self.0[1..]);
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == head && found.is_none() {
+                        found = map.next_value_seed(AsarEntrySeed(tail))?;
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(found)
+            }
+        }
+        deserializer.deserialize_map(FilesVisitor(self.0))
+    }
+}
+
+/// Find `(offset, size)` for a custom relative path inside an ASAR JSON header
+/// without building a DOM tree (skips `node_modules` via `IgnoredAny`).
+fn find_asar_entry_streaming(json: &[u8], rel_path: &str) -> Option<(u64, u64)> {
+    let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() || parts.iter().any(|&p| p == ".." || p == ".") {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_slice(json);
+    serde::de::DeserializeSeed::deserialize(AsarEntrySeed(&parts), &mut de)
+        .ok()
+        .flatten()
+}
+
 pub fn extract_icon_bytes_from_asar_selective(asar_path: &Path) -> Option<Vec<u8>> {
     let mut file = fs::File::open(asar_path).ok()?;
     let file_len = file.metadata().ok()?.len();
@@ -113,30 +230,6 @@ pub fn extract_icon_bytes_from_asar_selective(asar_path: &Path) -> Option<Vec<u8
     let parsed: AsarSelectiveRoot = serde_json::from_slice(&json_buf).ok()?;
     let top = parsed.files?;
 
-    let resolve_leaf = |leaf: Option<&AsarLeafEntry>| -> Option<(u64, u64)> {
-        let l = leaf?;
-        if l.unpacked == Some(true) {
-            return None;
-        }
-        Some((l.offset?, l.size?))
-    };
-
-    let lookup_static = |rel_path: &str| -> Option<(u64, u64)> {
-        match rel_path {
-            "icon.png" => resolve_leaf(top.icon_png.as_ref()),
-            "icon.svg" => resolve_leaf(top.icon_svg.as_ref()),
-            "assets/icon.png" => resolve_leaf(top.assets.as_ref()?.files.as_ref()?.icon_png.as_ref()),
-            "assets/icon.svg" => resolve_leaf(top.assets.as_ref()?.files.as_ref()?.icon_svg.as_ref()),
-            "resources/icon.png" => resolve_leaf(top.resources.as_ref()?.files.as_ref()?.icon_png.as_ref()),
-            "resources/icon.svg" => resolve_leaf(top.resources.as_ref()?.files.as_ref()?.icon_svg.as_ref()),
-            "build/icon.png" => resolve_leaf(top.build.as_ref()?.files.as_ref()?.icon_png.as_ref()),
-            "build/icon.svg" => resolve_leaf(top.build.as_ref()?.files.as_ref()?.icon_svg.as_ref()),
-            "dist/icon.png" => resolve_leaf(top.dist.as_ref()?.files.as_ref()?.icon_png.as_ref()),
-            "dist/icon.svg" => resolve_leaf(top.dist.as_ref()?.files.as_ref()?.icon_svg.as_ref()),
-            _ => None,
-        }
-    };
-
     let read_entry = |file: &mut fs::File, offset: u64, size: u64| -> Option<Vec<u8>> {
         if size == 0 || size > MAX_ASAR_ICON_BYTES {
             return None;
@@ -152,55 +245,36 @@ pub fn extract_icon_bytes_from_asar_selective(asar_path: &Path) -> Option<Vec<u8
         Some(buf)
     };
 
-    // Fast path: check top-level `icon.png` / `icon.svg` first (covers Antigravity 2 and 95% of Electron apps without even reading `package.json`)
+    let try_load = |file: &mut fs::File, rel_path: &str| -> Option<Vec<u8>> {
+        let (off, sz) = lookup_static(&top, rel_path)?;
+        let bytes = read_entry(file, off, sz)?;
+        has_valid_image_magic(&bytes).then_some(bytes)
+    };
+
+    // Fast path: check top-level `icon.png` / `icon.svg` first (covers 95% of Electron apps without reading `package.json`)
     for fast in ["icon.png", "icon.svg"] {
-        if let Some((off, sz)) = lookup_static(fast) {
-            if let Some(bytes) = read_entry(&mut file, off, sz) {
-                if has_valid_image_magic(&bytes) {
-                    return Some(bytes);
-                }
-            }
+        if let Some(bytes) = try_load(&mut file, fast) {
+            return Some(bytes);
         }
     }
 
     // Check if `package.json` specifies a custom `"icon"` path
-    let mut custom_candidate: Option<String> = None;
     if let Some((pkg_off, pkg_sz)) = resolve_leaf(top.package_json.as_ref()) {
         if pkg_sz <= 64 * 1024 {
             if let Some(pkg_bytes) = read_entry(&mut file, pkg_off, pkg_sz) {
                 if let Ok(pkg_val) = serde_json::from_slice::<AsarPackageJson>(&pkg_bytes) {
                     if let Some(ic) = pkg_val.icon {
-                        custom_candidate = Some(ic.trim_start_matches("./").to_string());
+                        let custom = ic.trim_start_matches("./");
+                        if let Some((off, sz)) =
+                            lookup_static(&top, custom).or_else(|| find_asar_entry_streaming(&json_buf, custom))
+                        {
+                            if let Some(bytes) = read_entry(&mut file, off, sz) {
+                                if has_valid_image_magic(&bytes) {
+                                    return Some(bytes);
+                                }
+                            }
+                        }
                     }
-                }
-            }
-        }
-    }
-
-    let lookup_dynamic_custom = |rel_path: &str| -> Option<(u64, u64)> {
-        let root: serde_json::Value = serde_json::from_slice(&json_buf).ok()?;
-        let mut cur = &root;
-        for part in rel_path.split('/').filter(|p| !p.is_empty()) {
-            if part == ".." || part == "." {
-                return None;
-            }
-            cur = cur.get("files")?.get(part)?;
-        }
-        if cur.get("unpacked").and_then(serde_json::Value::as_bool) == Some(true) {
-            return None;
-        }
-        let size = cur.get("size")?.as_u64()?;
-        let offset = cur
-            .get("offset")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()))?;
-        Some((offset, size))
-    };
-
-    if let Some(ref custom) = custom_candidate {
-        if let Some((off, sz)) = lookup_static(custom).or_else(|| lookup_dynamic_custom(custom)) {
-            if let Some(bytes) = read_entry(&mut file, off, sz) {
-                if has_valid_image_magic(&bytes) {
-                    return Some(bytes);
                 }
             }
         }
@@ -216,12 +290,8 @@ pub fn extract_icon_bytes_from_asar_selective(asar_path: &Path) -> Option<Vec<u8
     ];
 
     for candidate in subdir_candidates {
-        if let Some((off, sz)) = lookup_static(candidate) {
-            if let Some(bytes) = read_entry(&mut file, off, sz) {
-                if has_valid_image_magic(&bytes) {
-                    return Some(bytes);
-                }
-            }
+        if let Some(bytes) = try_load(&mut file, candidate) {
+            return Some(bytes);
         }
     }
 
@@ -330,5 +400,17 @@ mod tests {
         let pb = decode_png_bytes_to_pixbuf(&bytes, 24).expect("Must decode fixture PNG via cairo fast path");
         assert_eq!(pb.width(), 24);
         assert_eq!(pb.height(), 24);
+    }
+
+    #[test]
+    fn test_find_asar_entry_streaming_skips_node_modules() {
+        let json = br#"{"files":{"node_modules":{"files":{"dep":{"files":{"icon.png":{"size":10,"offset":"1"}}}}},"deep":{"files":{"nested":{"files":{"logo.png":{"size":42,"offset":"128"},"unpacked.png":{"size":12,"offset":"200","unpacked":true}}}}}}}"#;
+        assert_eq!(find_asar_entry_streaming(json, "deep/nested/logo.png"), Some((128, 42)));
+        assert_eq!(
+            find_asar_entry_streaming(json, "deep/nested/unpacked.png"),
+            None,
+            "unpacked entries must be rejected"
+        );
+        assert_eq!(find_asar_entry_streaming(json, "deep/../logo.png"), None);
     }
 }

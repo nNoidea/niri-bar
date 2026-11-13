@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::config::{resolve_level, BatteryConfig};
 use crate::modules::{
-    dbus_get_property, spawn_dbus_trigger, system_bus, BarModule, DbusSubscriptions, ModuleCore, ModuleState,
-    ScrollDirection,
+    dbus_get_property, spawn_dbus_poller, spawn_dbus_trigger, system_bus, BarModule, DbusPollSpec, ModuleCore,
+    ModuleState,
 };
 
 const UPOWER_DEST: &str = "org.freedesktop.UPower";
@@ -24,76 +24,32 @@ pub struct BatteryModule {
 impl BatteryModule {
     pub fn new(config: BatteryConfig) -> Self {
         let core = ModuleCore::new();
-        let core_worker = core.clone();
         let cfg = config.clone();
         // Fast non-blocking sysfs seed at construction so `current_state` has
         // real data immediately without blocking startup on UPower D-Bus I/O.
         let (initial, _) = Self::read_battery_sysfs();
         let last: Arc<Mutex<Option<(u8, String)>>> = Arc::new(Mutex::new(initial.clone()));
-        let last_worker = Arc::clone(&last);
 
-        // Worker loop driven by UPower D-Bus triggers and 10s fallback.
-        // Unhealthy backends back off (10s→60s idle); triggers stay immediate.
-        // Subscriptions are worker-owned via `DbusSubscriptions` so they are
-        // renewed periodically and always unsubscribed on shutdown.
-        crate::runtime::spawn(async move {
-            if core_worker.is_stopped() {
-                return;
-            }
-            let mut last_cached = initial;
-            let mut fail_streak: u32 = 0;
-            let mut degraded_warned = false;
-            let mut _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-            let mut last_renew = std::time::Instant::now();
-            let mut first_pass = true;
-
-            loop {
-                if first_pass {
-                    first_pass = false;
-                } else {
-                    let wait =
-                        crate::modules::poll_backoff(Duration::from_secs(10), fail_streak, Duration::from_secs(60));
-                    if core_worker.wait_timeout_async(wait).await {
-                        break;
-                    }
-                }
-                let (bat_opt, healthy) = Self::read_battery_full().await;
-                if healthy {
-                    if fail_streak > 0 {
-                        log_info!("battery", "Backend recovered");
-                    }
-                    fail_streak = 0;
-                    degraded_warned = false;
-                } else {
-                    fail_streak = fail_streak.saturating_add(1);
-                    if !degraded_warned {
-                        degraded_warned = true;
-                        log_warn!("battery", "Power sources unreadable; backing off");
-                    }
-                }
-                if bat_opt != last_cached {
-                    last_cached.clone_from(&bat_opt);
-                    (*crate::util::lock(&last_worker)).clone_from(&bat_opt);
-                    let had_battery = bat_opt.is_some();
-                    // No fake 100%: desktops without a battery keep an empty state.
-                    let (cap, status) = bat_opt.unwrap_or((0, "NoBattery".to_string()));
-
-                    core_worker.broadcast(|orient| {
-                        if had_battery {
-                            Self::format_state_static(&cfg, cap, &status, orient)
-                        } else {
-                            Self::no_battery_state()
-                        }
-                    });
-                }
-
-                let renew_due = last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3;
-                if renew_due {
-                    _live_subs = DbusSubscriptions::new(Self::subscribe_triggers(&core_worker));
-                    last_renew = std::time::Instant::now();
-                }
-            }
-        });
+        spawn_dbus_poller(
+            core.clone(),
+            initial,
+            Arc::clone(&last),
+            DbusPollSpec {
+                tag: "battery",
+                base_interval: Duration::from_secs(10),
+                max_interval: Duration::from_secs(60),
+                fast_poll_on_notify: false,
+                degraded_msg: "Power sources unreadable; backing off",
+                degraded_is_warn: true,
+                is_transitional: |_| false,
+            },
+            Self::subscribe_triggers,
+            Self::read_battery_full,
+            move |bat_opt, orient| match bat_opt {
+                Some((cap, status)) => Self::format_state_static(&cfg, *cap, status, orient),
+                None => Self::no_battery_state(),
+            },
+        );
 
         Self { config, last, core }
     }
@@ -292,8 +248,6 @@ impl BarModule for BatteryModule {
     fn click_commands(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
         self.config.click.commands()
     }
-
-    fn handle_scroll(&self, _direction: ScrollDirection) {}
 }
 
 #[cfg(test)]

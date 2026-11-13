@@ -41,34 +41,29 @@ pub fn init_styles() -> Option<String> {
 
     if !css_path.exists() {
         if let Err(e) = fs::create_dir_all(&config_dir) {
-            crate::logger::emit("WARN", "style", &format!("Failed to create {config_dir:?}: {e}"));
+            log_warn!("style", "Failed to create {config_dir:?}: {e}");
         } else if let Err(e) = fs::write(&css_path, DEFAULT_CSS) {
-            crate::logger::emit("WARN", "style", &format!("Failed to write default {css_path:?}: {e}"));
+            log_warn!("style", "Failed to write default {css_path:?}: {e}");
         }
     }
 
-    let (css_content, read_error) = match fs::read_to_string(&css_path) {
+    let (css_content, mut startup_error) = match fs::read_to_string(&css_path) {
         Ok(c) => (c, None),
         Err(e) => {
             let msg = format!("Failed to read {}: {e}", css_path.display());
-            crate::logger::emit("WARN", "style", &format!("{msg}. Using embedded default."));
+            log_warn!("style", "{msg}. Using embedded default.");
             (DEFAULT_CSS.to_string(), Some(format!("CSS error: {msg}")))
         }
     };
 
-    let mut startup_error = read_error;
     let provider = gtk::CssProvider::new();
     if let Err(err_msg) = load_css_checked(&provider, &css_content) {
-        crate::logger::emit(
-            "WARN",
-            "style",
-            &format!("Failed to parse CSS ({err_msg}). Using default theme."),
-        );
+        log_warn!("style", "Failed to parse CSS ({err_msg}). Using default theme.");
         startup_error = Some(err_msg);
-        // Embedded default is tested for balanced braces; if it also fails,
+        // Embedded default is tested for valid syntax; if it also fails,
         // log so the broken build is visible instead of silently unstyled.
         if let Err(e2) = load_css_checked(&provider, DEFAULT_CSS) {
-            crate::logger::emit("WARN", "style", &format!("Embedded default CSS also failed: {e2}"));
+            log_warn!("style", "Embedded default CSS also failed: {e2}");
         }
     }
 
@@ -80,15 +75,59 @@ pub fn init_styles() -> Option<String> {
     startup_error
 }
 
-/// Validate CSS syntax. Checks brace balance in pure Rust, and validates with GTK CssProvider when GTK is initialized.
-pub fn validate_css(css_content: &str) -> Result<(), String> {
-    let open_braces = css_content.matches('{').count();
-    let close_braces = css_content.matches('}').count();
-    if open_braces != close_braces {
+/// Check `{`/`}` balance while ignoring `/* ... */` comments and `'...'`/`"..."` strings.
+fn check_css_braces(css: &str) -> Result<(), String> {
+    let bytes = css.as_bytes();
+    let mut i = 0;
+    let mut open = 0usize;
+    let mut close = 0usize;
+    let mut in_comment = false;
+    let mut quote: Option<u8> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_comment {
+            if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_comment = false;
+                i += 2;
+                continue;
+            }
+        } else if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_comment = true;
+            i += 2;
+            continue;
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'{' {
+            open += 1;
+        } else if b == b'}' {
+            close += 1;
+            if close > open {
+                return Err(format!("CSS error: unexpected '}}' ({open} '{{' vs {close} '}}')"));
+            }
+        }
+        i += 1;
+    }
+
+    if open != close {
         return Err(format!(
-            "CSS error: mismatched curly braces: {open_braces} '{{' vs {close_braces} '}}'"
+            "CSS error: mismatched curly braces: {open} '{{' vs {close} '}}'"
         ));
     }
+    Ok(())
+}
+
+/// Validate CSS syntax. Checks brace balance in pure Rust, and validates with GTK CssProvider when GTK is initialized.
+pub fn validate_css(css_content: &str) -> Result<(), String> {
+    check_css_braces(css_content)?;
 
     if gtk::is_initialized_main_thread() {
         let test_provider = gtk::CssProvider::new();
@@ -97,20 +136,25 @@ pub fn validate_css(css_content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reload CSS from disk. If valid, updates the active provider on screen and returns `Ok(())`.
-/// If invalid or unreadable, returns `Err(error_details)` without touching the active styles.
+/// Reload CSS from disk in a single parse pass. If valid, swaps in the new active provider and returns `Ok(())`.
+/// If invalid or unreadable, leaves the existing active styles untouched.
 pub fn reload_styles() -> Result<(), String> {
     let config_dir = get_config_dir();
     let css_path = config_dir.join("style.css");
     let content = fs::read_to_string(&css_path).map_err(|e| format!("Failed to read {}: {e}", css_path.display()))?;
 
-    validate_css(&content)?;
+    let next_provider = gtk::CssProvider::new();
+    load_css_checked(&next_provider, &content)?;
 
-    ACTIVE_PROVIDER.with(|p| {
-        if let Some(provider) = p.borrow().as_ref() {
-            provider.load_from_data(&content);
-        }
-    });
+    if let Some(display) = gdk::Display::default() {
+        ACTIVE_PROVIDER.with(|p| {
+            let mut slot = p.borrow_mut();
+            if let Some(old) = slot.replace(next_provider.clone()) {
+                gtk::style_context_remove_provider_for_display(&display, &old);
+            }
+            gtk::style_context_add_provider_for_display(&display, &next_provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+        });
+    }
 
     Ok(())
 }
@@ -161,6 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_css_ignores_braces_in_comments_and_strings() {
+        let css = r#"
+            /* disabled rule { keep } extra } */
+            .niri-bar { color: #ffffff; }
+            .badge::after { content: "{"; }
+            .other::before { content: '}'; }
+        "#;
+        assert!(
+            validate_css(css).is_ok(),
+            "braces inside CSS comments or quoted strings must not trigger false errors"
+        );
+    }
+
+    #[test]
     fn test_default_css_valid_for_gtk() {
         crate::util::run_gtk_test(|| {
             let provider = gtk::CssProvider::new();
@@ -187,6 +245,29 @@ mod tests {
             assert!(
                 !DEFAULT_CSS.contains(legacy),
                 "DEFAULT_CSS should not contain legacy GTK3 selector '{legacy}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_css_contains_no_unused_or_unscoped_tray_rules() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let user_css_path = manifest_dir.join(".config/niri-bar/style.css");
+        let user_css = std::fs::read_to_string(&user_css_path).ok();
+
+        let mut targets = vec![("style.default.css", DEFAULT_CSS.to_string())];
+        if let Some(css) = user_css {
+            targets.push(("user style.css", css));
+        }
+
+        for (name, css) in targets {
+            assert!(
+                !css.contains("checkbutton.tray-menu-check"),
+                "{name} must not contain unused checkbutton.tray-menu-check rules (tray uses Button + Label)"
+            );
+            assert!(
+                !css.contains("\nseparator,\nseparator.horizontal,"),
+                "{name} must scope tray menu separator selectors under .tray-menu"
             );
         }
     }

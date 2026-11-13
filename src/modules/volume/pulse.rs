@@ -279,7 +279,7 @@ impl VolumeModule {
             .get(pa_sink.active_port)
             .map(|p| p.name.to_string_lossy().into_owned());
 
-        let (sink_type, is_bluetooth) = Self::classify_sink(
+        let sink_type = Self::classify_sink(
             &name,
             &description,
             form_factor.as_deref(),
@@ -295,7 +295,6 @@ impl VolumeModule {
                 name,
                 description,
                 sink_type,
-                is_bluetooth,
             },
         )
     }
@@ -361,7 +360,6 @@ mod tests {
         assert_eq!(info.name, "bluez_output.01_02.1");
         assert_eq!(info.description, "WH-1000XM4");
         assert_eq!(info.sink_type, SinkType::Bluetooth);
-        assert!(info.is_bluetooth);
     }
 
     #[test]

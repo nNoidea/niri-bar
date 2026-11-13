@@ -1,6 +1,6 @@
 [package]
 name = "niri-bar"
-version = "0.5.1"
+version = "0.5.4"
 edition = "2021"
 rust-version = "1.89"
 authors = ["nNoidea"]
@@ -10,7 +10,7 @@ repository = "https://github.com/nNoidea/niri-bar"
 
 # NOTE: GTK4 is configured with `GSK_RENDERER=cairo` at startup so the bar
 # uses the lightweight Cairo software renderer instead of spinning up a
-# Vulkan/GL context and shader cache, keeping resident RSS minimal (~22 MB).
+# Vulkan/GL context and shader cache.
 
 [[bin]]
 name = "niri-bar"

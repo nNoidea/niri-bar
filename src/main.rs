@@ -34,7 +34,7 @@ use crate::config::load_config_with_error;
 use crate::hotreload::{setup_file_watcher, ActiveError};
 use crate::logger::init_logger;
 use crate::modules::tray::TrayService;
-use crate::monitor::{connect_monitor_and_sleep_signals, make_reconcile_scheduler, ReconcileCtx};
+use crate::monitor::{connect_monitor_and_sleep_signals, make_reconcile_scheduler, ReconcileCtx, ReconcileGate};
 use crate::niri::NiriService;
 use crate::style::init_styles;
 
@@ -69,47 +69,51 @@ fn cli_flags(args: &[String]) -> Option<i32> {
     None
 }
 
+fn check_file_with(
+    label: &str,
+    path: &std::path::Path,
+    missing_hint: &str,
+    validate: impl FnOnce(&str) -> Result<(), String>,
+) -> bool {
+    if !path.exists() {
+        println!("{label}: no file yet ({missing_hint})");
+        return true;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => match validate(&content) {
+            Ok(()) => {
+                println!("{label} OK: {path:?}");
+                true
+            }
+            Err(e) => {
+                eprintln!("{label} ERROR {path:?}: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            eprintln!("{label} READ ERROR {path:?}: {e}");
+            false
+        }
+    }
+}
+
+fn check_config_and_css_in(dir: &std::path::Path) -> bool {
+    // Same parser as startup/live-reload (per-section fallback +
+    // validation), so `--check` agrees with the running bar.
+    let cfg_ok = check_file_with("config", &dir.join("config.toml"), "defaults would be used", |s| {
+        crate::config::reload_config_from_str(s).map(|_| ())
+    });
+    let css_ok = check_file_with(
+        "css",
+        &dir.join("style.css"),
+        "embedded default would be used",
+        crate::style::validate_css,
+    );
+    cfg_ok && css_ok
+}
+
 fn run_check_cli() -> bool {
-    let cfg_path = crate::config::get_config_dir().join("config.toml");
-    let css_path = crate::config::get_config_dir().join("style.css");
-    let mut ok = true;
-    if cfg_path.exists() {
-        // Same parser as startup/live-reload (per-section fallback +
-        // validation), so `--check` agrees with the running bar.
-        match std::fs::read_to_string(&cfg_path) {
-            Ok(content) => match crate::config::reload_config_from_str(&content) {
-                Ok(_) => println!("config OK: {cfg_path:?}"),
-                Err(e) => {
-                    eprintln!("config ERROR {cfg_path:?}: {e}");
-                    ok = false;
-                }
-            },
-            Err(e) => {
-                eprintln!("config READ ERROR {cfg_path:?}: {e}");
-                ok = false;
-            }
-        }
-    } else {
-        println!("config: no file yet (defaults would be used)");
-    }
-    if css_path.exists() {
-        match std::fs::read_to_string(&css_path) {
-            Ok(content) => match crate::style::validate_css(&content) {
-                Ok(()) => println!("css OK: {css_path:?}"),
-                Err(e) => {
-                    eprintln!("css ERROR {css_path:?}: {e}");
-                    ok = false;
-                }
-            },
-            Err(e) => {
-                eprintln!("css READ ERROR {css_path:?}: {e}");
-                ok = false;
-            }
-        }
-    } else {
-        println!("css: no file yet (embedded default would be used)");
-    }
-    ok
+    check_config_and_css_in(&crate::config::get_config_dir())
 }
 
 /// Claim the session-bus instance name. Returns false when another niri-bar
@@ -199,6 +203,69 @@ fn register_embedded_font() {
     }
 }
 
+fn spawn_shutdown_signal_handler(main_loop: &glib::MainLoop) {
+    let (sig_tx, sig_rx) = async_channel::bounded::<&'static str>(1);
+    crate::runtime::spawn(async move {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        async fn recv_or_pending(sig: Option<Signal>) {
+            match sig {
+                Some(mut s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        let sigint = signal(SignalKind::interrupt()).ok();
+        let sigterm = signal(SignalKind::terminate()).ok();
+        let sig_name = tokio::select! {
+            _ = recv_or_pending(sigint) => "SIGINT (Ctrl+C)",
+            _ = recv_or_pending(sigterm) => "SIGTERM (System shutdown / logout)",
+        };
+        let _ = sig_tx.send(sig_name).await;
+    });
+    let loop_quit = main_loop.clone();
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(sig_name) = sig_rx.recv().await {
+            log_info!("lifecycle", "Received {sig_name}. Shutting down niri-bar cleanly...");
+            loop_quit.quit();
+        }
+    });
+}
+
+fn spawn_niri_update_loop(
+    bars: &Rc<RefCell<Vec<BarWindow>>>,
+    niri: &Arc<NiriService>,
+    config: &Rc<RefCell<crate::config::AppConfig>>,
+    schedule_reconcile: &Rc<dyn Fn()>,
+) {
+    let bars_update = Rc::clone(bars);
+    let niri_update = Arc::clone(niri);
+    let config_update = Rc::clone(config);
+    let sched_niri = Rc::clone(schedule_reconcile);
+    let update_rx = niri.update_rx.clone();
+
+    glib::MainContext::default().spawn_local(async move {
+        while update_rx.recv().await.is_ok() {
+            while update_rx.try_recv().is_ok() {}
+            if niri_update.drag.should_cleanup_cancel() {
+                crate::niri::drag::reset_all_cursors_and_overlay(None);
+            }
+            match bars_update.try_borrow_mut() {
+                Ok(mut list) => {
+                    let cfg = config_update.borrow();
+                    for bar in list.iter_mut() {
+                        bar.update(&niri_update, &cfg);
+                    }
+                }
+                Err(e) => {
+                    log_warn!("monitor", "Bar update contended ({e}); scheduling reconcile");
+                    sched_niri();
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if let Some(code) = cli_flags(&argv) {
@@ -222,7 +289,6 @@ fn main() {
         std::env::var("NIRI_SOCKET").ok()
     );
 
-    crate::util::ensure_cairo_renderer();
     if gtk::init().is_err() {
         log_error!("startup", "Failed to initialize GTK.");
         eprintln!(
@@ -247,7 +313,13 @@ fn main() {
     let initial_style_err = init_styles();
 
     let niri = Arc::new(NiriService::new());
-    let tray_service = Arc::new(TrayService::new());
+    let tray_service = Rc::new(RefCell::new(
+        config
+            .borrow()
+            .modules
+            .contains_module("tray")
+            .then(|| Arc::new(TrayService::new())),
+    ));
     let modules = Rc::new(RefCell::new(crate::modules::SharedModules::new(&config.borrow())));
     let bars: Rc<RefCell<Vec<BarWindow>>> = Rc::new(RefCell::new(Vec::new()));
     let initial_err = ActiveError {
@@ -266,92 +338,18 @@ fn main() {
             bars: Rc::clone(&bars),
             config: Rc::clone(&config),
             niri: Arc::clone(&niri),
-            tray_service: Arc::clone(&tray_service),
+            tray_service: Rc::clone(&tray_service),
             modules: Rc::clone(&modules),
-            is_reconciling: Rc::new(RefCell::new(false)),
-            needs_reconcile: Rc::new(RefCell::new(false)),
+            gate: ReconcileGate::default(),
             active_error: Rc::clone(&active_error),
         };
 
         let schedule_reconcile = make_reconcile_scheduler(&ctx);
-
-        // Initial setup
         schedule_reconcile();
-
-        // File monitor for config.toml and style.css live reloading
         _file_monitor = setup_file_watcher(ctx, Rc::clone(&schedule_reconcile));
-
-        // Monitor hotplug and systemd-logind sleep/wakeup listeners
         connect_monitor_and_sleep_signals(&display, &niri, &schedule_reconcile);
-
-        // Clean Shutdown on SIGINT / SIGTERM (e.g. PC shutdown, logout, killall)
-        let (sig_tx, sig_rx) = async_channel::bounded::<&'static str>(1);
-        crate::runtime::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint = signal(SignalKind::interrupt()).ok();
-            let mut sigterm = signal(SignalKind::terminate()).ok();
-            tokio::select! {
-                _ = async {
-                    match sigint.as_mut() {
-                        Some(s) => { s.recv().await; }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    let _ = sig_tx.send("SIGINT (Ctrl+C)").await;
-                }
-                _ = async {
-                    match sigterm.as_mut() {
-                        Some(s) => { s.recv().await; }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    let _ = sig_tx.send("SIGTERM (System shutdown / logout)").await;
-                }
-            }
-        });
-        let loop_quit = main_loop.clone();
-        glib::MainContext::default().spawn_local(async move {
-            if let Ok(sig_name) = sig_rx.recv().await {
-                log_info!("lifecycle", "Received {sig_name}. Shutting down niri-bar cleanly...");
-                loop_quit.quit();
-            }
-        });
-
-        // Subscribe to Niri updates
-        let bars_update = Rc::clone(&bars);
-        let niri_update = Arc::clone(&niri);
-        let config_update = Rc::clone(&config);
-        let sched_niri = Rc::clone(&schedule_reconcile);
-        let update_rx = niri.update_rx.clone();
-
-        glib::MainContext::default().spawn_local(async move {
-            while update_rx.recv().await.is_ok() {
-                while update_rx.try_recv().is_ok() {}
-                // Main thread: deferred drag-cancel GTK cleanup. Only reset
-                // when the cancelled id matches (or no drag is active); a
-                // newer drag B started after A closed must survive.
-                if let Some(cancelled_id) = crate::niri::drag::take_drag_cancel() {
-                    let current_id = crate::util::lock(&crate::niri::drag::GLOBAL_DRAG)
-                        .as_ref()
-                        .map(|d| d.window_id);
-                    if current_id.is_none() || current_id == Some(cancelled_id) {
-                        crate::niri::drag::reset_all_cursors_and_overlay(None);
-                    }
-                }
-                match bars_update.try_borrow_mut() {
-                    Ok(mut list) => {
-                        let cfg = config_update.borrow();
-                        for bar in list.iter_mut() {
-                            bar.update(&niri_update, &cfg);
-                        }
-                    }
-                    Err(e) => {
-                        log_warn!("monitor", "Bar update contended ({e}); scheduling reconcile");
-                        sched_niri();
-                    }
-                }
-            }
-        });
+        spawn_shutdown_signal_handler(&main_loop);
+        spawn_niri_update_loop(&bars, &niri, &config, &schedule_reconcile);
     }
 
     main_loop.run();
@@ -554,5 +552,31 @@ mod tests {
         }
 
         check_dir(&src_dir);
+    }
+
+    #[test]
+    fn test_check_config_and_css_in_isolated_dir() {
+        let tmp = std::env::temp_dir().join(format!("niri_check_cli_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Missing files fall back to embedded defaults -> valid
+        assert!(check_config_and_css_in(&tmp));
+
+        // Valid config + CSS
+        std::fs::write(tmp.join("config.toml"), "position = \"left\"\nsize = 48\n").expect("write cfg");
+        std::fs::write(tmp.join("style.css"), "button { color: #ffffff; }\n").expect("write css");
+        assert!(check_config_and_css_in(&tmp));
+
+        // Broken TOML -> fails check
+        std::fs::write(tmp.join("config.toml"), "position = [unclosed\n").expect("write bad cfg");
+        assert!(!check_config_and_css_in(&tmp));
+
+        // Restore valid TOML, break CSS -> fails check
+        std::fs::write(tmp.join("config.toml"), "position = \"left\"\n").expect("write cfg");
+        std::fs::write(tmp.join("style.css"), "button { color: red;\n").expect("write bad css");
+        assert!(!check_config_and_css_in(&tmp));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

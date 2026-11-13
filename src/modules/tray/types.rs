@@ -54,21 +54,17 @@ pub enum TrayEvent {
     Remove(String),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ActivateKind {
+    Default,
+    Secondary,
+    ContextMenu,
+}
+
 #[derive(Clone, Debug)]
 pub enum ActivateRequest {
-    Default {
-        bus_name: String,
-        object_path: String,
-        x: i32,
-        y: i32,
-    },
-    Secondary {
-        bus_name: String,
-        object_path: String,
-        x: i32,
-        y: i32,
-    },
-    ContextMenu {
+    Activate {
+        kind: ActivateKind,
         bus_name: String,
         object_path: String,
         x: i32,

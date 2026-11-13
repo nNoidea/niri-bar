@@ -5,7 +5,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{resolve_level, BrightnessConfig};
-use crate::modules::{spawn_command_argv, BarModule, ModuleCore, ModuleState, ScrollDirection};
+use crate::modules::{system_bus, BarModule, ModuleCore, ModuleState, ScrollDirection};
+
+pub fn compute_brightness_units(target_pct: u32, max_units: u64) -> u64 {
+    ((max_units as f64 * (f64::from(target_pct) / 100.0)).round() as u64).clamp(1, max_units.max(1))
+}
+
+pub fn brightness_poll_interval(has_device: bool) -> Duration {
+    if has_device {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(10)
+    }
+}
 
 pub struct BrightnessModule {
     config: BrightnessConfig,
@@ -31,8 +43,10 @@ impl BrightnessModule {
                 if core_worker.is_stopped() {
                     break;
                 }
-                match BrightnessModule::read_system_brightness() {
+                let reading = BrightnessModule::read_system_brightness();
+                match reading {
                     Some(b) => {
+                        logged_no_device = false;
                         let old_b = cur_b.load(Ordering::Relaxed);
                         if b != old_b {
                             cur_b.store(b, Ordering::Relaxed);
@@ -45,7 +59,10 @@ impl BrightnessModule {
                     }
                     None => {}
                 }
-                if core_worker.wait_timeout_async(Duration::from_millis(500)).await {
+                if core_worker
+                    .wait_timeout_async(brightness_poll_interval(reading.is_some()))
+                    .await
+                {
                     break;
                 }
             }
@@ -163,12 +180,8 @@ impl BarModule for BrightnessModule {
         self.current_brightness.store(new_b, Ordering::Relaxed);
         self.dispatch_immediate_update();
 
-        // 2. Non-blocking system execution (argv, no shell: device name
-        // never touches a shell parser even though it is charset-validated).
+        // 2. Non-blocking in-process D-Bus call to systemd-logind (`SetBrightness("backlight", dev, u32)`).
         if let Some((dev_name, _, max)) = BrightnessModule::get_backlight_device() {
-            // Device names come from /sys/class/backlight directory names.
-            // Keep the charset check as defense-in-depth; argv exec below
-            // is what actually prevents shell injection.
             if !dev_name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '.')
@@ -177,26 +190,29 @@ impl BarModule for BrightnessModule {
                 log_warn!("brightness", "Refusing to use unexpected backlight device name");
                 return;
             }
-            // Hardware needs >= 1 unit; UI may still show 0%.
-            let target_units = (max as f64 * (f64::from(new_b) / 100.0)).round() as u64;
-            let target_units = target_units.clamp(1, max);
-            let units_str = target_units.to_string();
-
-            spawn_command_argv(
-                "brightness",
-                "busctl",
-                &[
-                    "call",
-                    "org.freedesktop.login1",
-                    "/org/freedesktop/login1/session/auto",
-                    "org.freedesktop.login1.Session",
-                    "SetBrightness",
-                    "ssu",
-                    "backlight",
-                    &dev_name,
-                    &units_str,
-                ],
-            );
+            let target_units = compute_brightness_units(new_b, max).min(u64::from(u32::MAX)) as u32;
+            crate::runtime::spawn(async move {
+                let Some(conn) = system_bus().await else {
+                    log_warn!("brightness", "System bus unavailable for SetBrightness");
+                    return;
+                };
+                match tokio::time::timeout(
+                    Duration::from_millis(500),
+                    conn.call_method(
+                        Some("org.freedesktop.login1"),
+                        "/org/freedesktop/login1/session/auto",
+                        Some("org.freedesktop.login1.Session"),
+                        "SetBrightness",
+                        &("backlight", dev_name.as_str(), target_units),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => log_warn!("brightness", "SetBrightness failed: {e}"),
+                    Err(_) => log_warn!("brightness", "SetBrightness timed out"),
+                }
+            });
         }
     }
 }
@@ -258,5 +274,14 @@ mod tests {
             during <= before + 4,
             "BrightnessModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
         );
+    }
+
+    #[test]
+    fn test_brightness_units_and_absent_backoff() {
+        assert_eq!(compute_brightness_units(0, 1000), 1);
+        assert_eq!(compute_brightness_units(50, 1000), 500);
+        assert_eq!(compute_brightness_units(100, 1000), 1000);
+        assert_eq!(brightness_poll_interval(true), Duration::from_millis(500));
+        assert_eq!(brightness_poll_interval(false), Duration::from_secs(10));
     }
 }

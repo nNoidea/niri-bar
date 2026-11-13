@@ -21,6 +21,7 @@ pub fn setup_overlay_window(window: &Window, monitor: Option<&gdk::Monitor>) {
     window.init_layer_shell();
     window.set_monitor(monitor);
     window.set_layer(Layer::Overlay);
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
     window.set_anchor(Edge::Left, true);
     window.set_anchor(Edge::Right, true);
     window.set_anchor(Edge::Top, true);
