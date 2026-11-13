@@ -511,19 +511,17 @@ pub fn spawn_monitor_overlays(
         let drag_motion = Arc::clone(drag);
         let state_overlay = Arc::clone(state);
         let tx_overlay = update_tx.clone();
-        let wid_overlay = window_id;
-        let mon_overlay = mon.clone();
 
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion(move |_, ox, oy| {
             // Snapshot drag source BEFORE locking state (fixed lock ordering).
-            let Some(src_out) = drag_motion.overlay_drag_source(wid_overlay) else {
+            let Some(src_out) = drag_motion.overlay_drag_source(window_id) else {
                 return;
             };
 
             let (cur_gx, cur_gy, hover) = {
                 let st = crate::util::lock(&state_overlay);
-                let hover = super::detect_monitor_output(&mon_overlay, &st.outputs);
+                let hover = super::detect_monitor_output(&mon, &st.outputs);
                 let (gx, gy) = hover
                     .as_ref()
                     .and_then(|name| st.outputs.get(name))
@@ -533,7 +531,7 @@ pub fn spawn_monitor_overlays(
             };
 
             let (_, new_target) = decide_hover_target(hover, &src_out);
-            drag_motion.store_position(wid_overlay, cur_gx, cur_gy, new_target);
+            drag_motion.store_position(window_id, cur_gx, cur_gy, new_target);
             crate::util::nudge(&tx_overlay);
         });
         overlay.add_controller(motion);
@@ -548,7 +546,7 @@ pub fn spawn_monitor_overlays(
                 event.event_type(),
                 gdk::EventType::ButtonRelease | gdk::EventType::ButtonPress
             ) {
-                complete_overlay_drag(&drag_legacy, wid_overlay, &b_legacy, &tx_legacy);
+                complete_overlay_drag(&drag_legacy, window_id, &b_legacy, &tx_legacy);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -566,9 +564,9 @@ pub fn spawn_monitor_overlays(
             .button(0)
             .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
-        click.connect_released(move |_, _, _, _| complete_overlay_drag(&drag_rel, wid_overlay, &b_rel, &tx_rel));
+        click.connect_released(move |_, _, _, _| complete_overlay_drag(&drag_rel, window_id, &b_rel, &tx_rel));
         click.connect_unpaired_release(move |_, _, _, _, _| {
-            complete_overlay_drag(&drag_unpaired, wid_overlay, &b_unpaired, &tx_unpaired)
+            complete_overlay_drag(&drag_unpaired, window_id, &b_unpaired, &tx_unpaired)
         });
         overlay.add_controller(click);
 
@@ -578,7 +576,7 @@ pub fn spawn_monitor_overlays(
 
         let key_ctrl = gtk::EventControllerKey::new();
         key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
-            if keyval == gdk::Key::Escape && drag_esc.cancel_if_matching(wid_overlay) {
+            if keyval == gdk::Key::Escape && drag_esc.cancel_if_matching(window_id) {
                 reset_all_cursors_and_overlay(Some(&b_overlay_esc));
                 crate::util::nudge(&tx_overlay_esc);
                 return glib::Propagation::Stop;
