@@ -23,6 +23,27 @@ enum TrayLoopEvent {
     Scale(i32),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrayIconSignature {
+    id: String,
+    icon_name: Option<String>,
+    icon_theme_path: Option<String>,
+    icon_pixmap: Option<Vec<crate::icon::RawIconPixmap>>,
+    scale: i32,
+}
+
+impl TrayIconSignature {
+    fn from_item(item: &TrayItem, scale: i32) -> Self {
+        Self {
+            id: item.id.clone(),
+            icon_name: item.icon_name.clone(),
+            icon_theme_path: item.icon_theme_path.clone(),
+            icon_pixmap: item.icon_pixmap.clone(),
+            scale,
+        }
+    }
+}
+
 impl TrayWidget {
     pub fn new(
         tray_service: &Arc<TrayService>,
@@ -43,13 +64,14 @@ impl TrayWidget {
         let (scale_tx, scale_rx) = async_channel::unbounded::<i32>();
         let service = Arc::clone(tray_service);
 
-        let mut buttons: HashMap<String, (Button, Image)> = HashMap::new();
+        let mut buttons: HashMap<String, (Button, Image, TrayIconSignature)> = HashMap::new();
 
         // Add all existing items from the service snapshot for this monitor
         for (key, item, _) in initial_items {
             let (btn, img) = Self::create_button(&key, &item, icon_sz, current_scale, &service, position);
             container.append(&btn);
-            buttons.insert(key, (btn, img));
+            let sig = TrayIconSignature::from_item(&item, current_scale);
+            buttons.insert(key, (btn, img, sig));
         }
 
         #[cfg(test)]
@@ -87,23 +109,28 @@ impl TrayWidget {
                 };
                 match ev {
                     TrayLoopEvent::Service(TrayEvent::Add(key, item)) => {
-                        if let Some((old_btn, _)) = buttons.remove(&key) {
+                        if let Some((old_btn, _, _)) = buttons.remove(&key) {
                             cont.remove(&old_btn);
                         }
                         let (btn, img) =
                             Self::create_button(&key, &item, icon_sz, current_scale, &service_events, position);
                         cont.append(&btn);
-                        buttons.insert(key, (btn, img));
+                        let sig = TrayIconSignature::from_item(&item, current_scale);
+                        buttons.insert(key, (btn, img, sig));
                     }
                     TrayLoopEvent::Service(TrayEvent::Update(key, item)) => {
-                        if let Some((button, image)) = buttons.get(&key) {
-                            Self::update_item_icon(image, &item, icon_sz, current_scale);
+                        if let Some((button, image, prev_sig)) = buttons.get_mut(&key) {
+                            let next_sig = TrayIconSignature::from_item(&item, current_scale);
+                            if *prev_sig != next_sig {
+                                Self::update_item_icon(image, &item, icon_sz, current_scale);
+                                *prev_sig = next_sig;
+                            }
                             let tooltip_text = Self::compute_tooltip(item.title.as_deref(), item.tool_tip.as_ref());
                             button.set_tooltip_text(tooltip_text.as_deref());
                         }
                     }
                     TrayLoopEvent::Service(TrayEvent::Remove(key)) => {
-                        if let Some((btn, _)) = buttons.remove(&key) {
+                        if let Some((btn, _, _)) = buttons.remove(&key) {
                             cont.remove(&btn);
                         }
                     }
@@ -111,9 +138,13 @@ impl TrayWidget {
                         let clamped = new_scale.max(1);
                         if clamped != current_scale {
                             current_scale = clamped;
-                            for (key, (_, image)) in &buttons {
+                            for (key, (_, image, prev_sig)) in &mut buttons {
                                 if let Some(item) = service_events.get_item(key) {
-                                    Self::update_item_icon(image, &item, icon_sz, current_scale);
+                                    let next_sig = TrayIconSignature::from_item(&item, current_scale);
+                                    if *prev_sig != next_sig {
+                                        Self::update_item_icon(image, &item, icon_sz, current_scale);
+                                        *prev_sig = next_sig;
+                                    }
                                 }
                             }
                         }
@@ -160,6 +191,22 @@ impl TrayWidget {
         }
     }
 
+    fn close_open_popover_on(btn: &Button) -> bool {
+        let mut child = btn.first_child();
+        let mut had_open_popover = false;
+        while let Some(c) = child {
+            let next = c.next_sibling();
+            if let Some(existing_popover) = c.downcast_ref::<Popover>() {
+                if existing_popover.is_visible() {
+                    existing_popover.popdown();
+                    had_open_popover = true;
+                }
+            }
+            child = next;
+        }
+        had_open_popover
+    }
+
     fn try_open_tray_menu(
         btn: &Button,
         item: &TrayItem,
@@ -167,6 +214,9 @@ impl TrayWidget {
         svc: &Arc<TrayService>,
         position: BarPosition,
     ) -> bool {
+        if Self::close_open_popover_on(btn) {
+            return true;
+        }
         let (Some(menu_path), Some(menu)) = (item.menu_path.as_ref(), tray_menu) else {
             return false;
         };
@@ -179,7 +229,7 @@ impl TrayWidget {
             id: 0,
         });
         let popover = build_tray_popover(&item.bus_name, menu_path, &menu.submenus, svc);
-        Self::popup_tray_menu(btn, &popover, position);
+        Self::attach_and_popup_tray_menu(btn, &popover, position);
         true
     }
 
@@ -299,24 +349,16 @@ impl TrayWidget {
         (button, image)
     }
 
+    #[cfg(test)]
     fn popup_tray_menu(btn: &Button, popover: &Popover, position: BarPosition) {
         // If an existing popover is currently visible on this button, toggle it closed.
-        let mut child = btn.first_child();
-        let mut had_open_popover = false;
-        while let Some(c) = child {
-            let next = c.next_sibling();
-            if let Some(existing_popover) = c.downcast_ref::<Popover>() {
-                if existing_popover.is_visible() {
-                    existing_popover.popdown();
-                    had_open_popover = true;
-                }
-            }
-            child = next;
-        }
-        if had_open_popover {
+        if Self::close_open_popover_on(btn) {
             return;
         }
+        Self::attach_and_popup_tray_menu(btn, popover, position);
+    }
 
+    fn attach_and_popup_tray_menu(btn: &Button, popover: &Popover, position: BarPosition) {
         let toplevel_opt = btn.root().and_then(|w| w.downcast::<Window>().ok());
 
         let pos_type = match position {
@@ -610,6 +652,8 @@ mod tests {
             win.set_child(Some(&btn));
             win.present();
 
+            assert!(!TrayWidget::close_open_popover_on(&btn));
+
             let pop1 = Popover::new();
             TrayWidget::popup_tray_menu(&btn, &pop1, BarPosition::Left);
             assert!(pop1.is_visible());
@@ -619,6 +663,16 @@ mod tests {
             TrayWidget::popup_tray_menu(&btn, &pop2, BarPosition::Left);
             assert!(!pop1.is_visible());
             assert!(!pop2.is_visible());
+            assert!(!TrayWidget::close_open_popover_on(&btn));
+
+            let ctx = glib::MainContext::default();
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
+            win.close();
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
         });
     }
 
@@ -779,5 +833,55 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn test_tray_item_icon_signature_change_detection() {
+        let base = TrayItem {
+            bus_name: ":1.42".into(),
+            object_path: "/StatusNotifierItem".into(),
+            id: "org.example.SigApp".into(),
+            title: Some("Title 1".into()),
+            icon_name: Some("org.example.Icon".into()),
+            icon_theme_path: None,
+            icon_pixmap: None,
+            tool_tip: Some(TrayTooltip {
+                title: "Tooltip 1".into(),
+                description: "Desc 1".into(),
+            }),
+            item_is_menu: false,
+            menu_path: None,
+        };
+        let sig_base = TrayIconSignature::from_item(&base, 1);
+
+        let mut tooltip_only = base.clone();
+        tooltip_only.title = Some("Title 2".into());
+        tooltip_only.tool_tip = Some(TrayTooltip {
+            title: "Tooltip 2".into(),
+            description: "Desc 2".into(),
+        });
+        assert_eq!(
+            TrayIconSignature::from_item(&tooltip_only, 1),
+            sig_base,
+            "Title/tooltip updates must not change the icon signature"
+        );
+
+        let mut icon_changed = base.clone();
+        icon_changed.icon_name = Some("org.example.OtherIcon".into());
+        assert_ne!(TrayIconSignature::from_item(&icon_changed, 1), sig_base);
+
+        let mut theme_changed = base.clone();
+        theme_changed.icon_theme_path = Some("/tmp/icons".into());
+        assert_ne!(TrayIconSignature::from_item(&theme_changed, 1), sig_base);
+
+        let mut pixmap_changed = base.clone();
+        pixmap_changed.icon_pixmap = Some(vec![crate::icon::RawIconPixmap {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 255],
+        }]);
+        assert_ne!(TrayIconSignature::from_item(&pixmap_changed, 1), sig_base);
+
+        assert_ne!(TrayIconSignature::from_item(&base, 2), sig_base);
     }
 }

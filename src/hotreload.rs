@@ -76,6 +76,16 @@ fn update_error_slot(ctx: &ReconcileCtx, is_style: bool, msg: Option<String>, re
     }
 }
 
+/// Pure event filter for the hot-reload watcher: includes `Deleted` and
+/// `MovedOut` so atomic editor saves go through the 100ms per-file debounce.
+pub fn is_watched_file_event(event: gio::FileMonitorEvent) -> bool {
+    use gio::FileMonitorEvent::*;
+    matches!(
+        event,
+        Changed | Created | ChangesDoneHint | AttributeChanged | Moved | MovedIn | Renamed | Deleted | MovedOut
+    )
+}
+
 pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -> Option<gio::FileMonitor> {
     let config_dir = crate::config::get_config_dir();
     let watch_path = fs::canonicalize(&config_dir).unwrap_or(config_dir);
@@ -99,13 +109,8 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
     let debounce_style: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
     monitor.connect_changed(move |_mon, file, other, event| {
-        use gio::FileMonitorEvent::*;
-        let deleted = matches!(event, Deleted | MovedOut);
-        if !deleted {
-            match event {
-                Changed | Created | ChangesDoneHint | AttributeChanged | Moved | MovedIn | Renamed => {}
-                _ => return,
-            }
+        if !is_watched_file_event(event) {
+            return;
         }
 
         let target_name = match watch_target_for_event(file, other) {
@@ -113,17 +118,6 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
             None => return,
         };
         let is_style = target_name == "style.css";
-
-        if deleted {
-            let msg = format!("{target_name} was deleted");
-            if is_style {
-                log_warn!("style", "Live style reload error: {msg}");
-            } else {
-                log_warn!("config", "Live config reload error: {msg}");
-            }
-            update_error_slot(&ctx, is_style, Some(msg), true);
-            return;
-        }
 
         let deb = Rc::clone(if is_style { &debounce_style } else { &debounce_config });
         let ctx = ctx.clone();
@@ -229,5 +223,28 @@ mod tests {
         assert_eq!(err.message(), Some("toml bad"));
         err.config = None;
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn test_is_watched_file_event_includes_delete_and_move_for_debounce() {
+        use gio::FileMonitorEvent::*;
+        for ev in [
+            Changed,
+            Created,
+            ChangesDoneHint,
+            AttributeChanged,
+            Moved,
+            MovedIn,
+            Renamed,
+            Deleted,
+            MovedOut,
+        ] {
+            assert!(
+                is_watched_file_event(ev),
+                "{ev:?} must go through the debounced reload pipeline"
+            );
+        }
+        assert!(!is_watched_file_event(PreUnmount));
+        assert!(!is_watched_file_event(Unmounted));
     }
 }

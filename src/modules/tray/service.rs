@@ -35,6 +35,13 @@ struct SessionState {
 }
 
 impl SessionState {
+    fn disconnected_keys(&self, name: &str, old_owner: &str) -> Vec<String> {
+        let items = crate::util::lock(&self.items);
+        let registered_items = crate::util::lock(&self.registered_items);
+        let task_keys: Vec<String> = crate::util::lock(&self.item_tasks).keys().cloned().collect();
+        collect_disconnected_keys(&items, &registered_items, &task_keys, name, old_owner)
+    }
+
     fn remove_item(&self, key: &str) {
         crate::util::lock(&self.items).remove(key);
         crate::util::lock(&self.registered_items).remove(key);
@@ -340,9 +347,7 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
         let reg_tx_p = reg_item_tx.clone();
         let state_p = state.clone();
         _session_tasks.0.push(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            probe_and_register_all(&conn_p, &proxy_p, &reg_tx_p, &state_p).await;
-            tokio::time::sleep(Duration::from_millis(450)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             probe_and_register_all(&conn_p, &proxy_p, &reg_tx_p, &state_p).await;
         }));
     }
@@ -371,15 +376,19 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
                 if bus_name.is_empty() || object_path.is_empty() {
                     continue;
                 }
+                if !crate::util::lock(&state.registered_items).contains(&key) {
+                    continue;
+                }
                 if let Some(old) = crate::util::lock(&state.item_tasks).remove(&key) {
                     old.abort();
                 }
                 let conn_c = conn.clone();
                 let items_c = Arc::clone(&state.items);
                 let subs_c = Arc::clone(&state.subs);
+                let reg_items_c = Arc::clone(&state.registered_items);
                 let k_task = key.clone();
                 let handle = tokio::spawn(async move {
-                    process_and_track_item(conn_c, bus_name, object_path, k_task, items_c, subs_c).await;
+                    process_and_track_item(conn_c, bus_name, object_path, k_task, items_c, subs_c, reg_items_c).await;
                 });
                 crate::util::lock(&state.item_tasks).insert(key, handle);
             }
@@ -402,27 +411,32 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
                 let new_owner = args.new_owner.as_deref().unwrap_or("");
 
                 if !old_owner.is_empty() && new_owner.is_empty() {
-                    let removed_keys: Vec<String> = {
-                        let my_items = crate::util::lock(&state.items);
-                        my_items
-                            .iter()
-                            .filter(|(k, (item, _))| belongs_to_disconnected_owner(&item.bus_name, k, name, old_owner))
-                            .map(|(k, _)| k.clone())
-                            .collect()
-                    };
-                    for k in removed_keys {
+                    for k in state.disconnected_keys(name, old_owner) {
                         log_info!("tray", "Process terminated, removing tray item: {}", k);
                         state.remove_item(&k);
                     }
-                } else if old_owner.is_empty() && !new_owner.is_empty() && is_probe_candidate(name) {
+                } else if old_owner.is_empty() && !new_owner.is_empty() && is_live_probe_candidate(name) {
                     let conn_new = conn.clone();
                     let proxy_new = Arc::clone(&dbus_proxy);
                     let reg_tx_new = reg_item_tx.clone();
                     let reg_items_new = Arc::clone(&state.registered_items);
+                    let sem_new = Arc::clone(&state.probe_sem);
                     let n = name.to_string();
+                    let owner = new_owner.to_string();
                     tokio::spawn(async move {
+                        let Ok(_permit) = sem_new.acquire_owned().await else {
+                            return;
+                        };
                         tokio::time::sleep(Duration::from_millis(150)).await;
-                        probe_single_service(&conn_new, &proxy_new, &n, &reg_tx_new, &reg_items_new).await;
+                        probe_single_service(
+                            &conn_new,
+                            Some(proxy_new.as_ref()),
+                            &n,
+                            Some(owner.as_str()),
+                            &reg_tx_new,
+                            &reg_items_new,
+                        )
+                        .await;
                     });
                 }
             }
@@ -433,15 +447,26 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
 }
 
 async fn reconcile_item_owners(dbus_proxy: &DBusProxy<'_>, state: &SessionState) {
-    let keys: Vec<String> = crate::util::lock(&state.items).keys().cloned().collect();
+    let candidates: Vec<(String, String)> = {
+        let mut seen = HashSet::new();
+        let mut list = Vec::new();
+        let items = crate::util::lock(&state.items);
+        for (k, (item, _)) in items.iter() {
+            if seen.insert(k.clone()) {
+                list.push((k.clone(), item.bus_name.clone()));
+            }
+        }
+        let reg = crate::util::lock(&state.registered_items);
+        for k in reg.iter() {
+            if seen.insert(k.clone()) {
+                let bus = k.split_once('/').map_or(k.as_str(), |(b, _)| b).to_string();
+                list.push((k.clone(), bus));
+            }
+        }
+        list
+    };
     let mut removed = 0u32;
-    for key in keys {
-        let Some(bus_name) = crate::util::lock(&state.items)
-            .get(&key)
-            .map(|(item, _)| item.bus_name.clone())
-        else {
-            continue;
-        };
+    for (key, bus_name) in candidates {
         let Ok(name) = zbus::names::BusName::try_from(bus_name.as_str()) else {
             continue;
         };
@@ -467,7 +492,7 @@ async fn probe_and_register_all(
     };
     for name in names {
         let s = name.to_string();
-        if !is_probe_candidate(&s) {
+        if !s.starts_with(':') {
             continue;
         }
         let conn_c = conn.clone();
@@ -478,7 +503,15 @@ async fn probe_and_register_all(
         tokio::spawn(async move {
             // Bound login-storm fan-out; excess probes wait.
             let _permit = sem_c.acquire_owned().await.ok()?;
-            probe_single_service(&conn_c, &proxy_c, &s, &reg_tx_c, &reg_set_c).await;
+            probe_single_service(
+                &conn_c,
+                Some(proxy_c.as_ref()),
+                &s,
+                Some(s.as_str()),
+                &reg_tx_c,
+                &reg_set_c,
+            )
+            .await;
             Some(())
         });
     }
@@ -501,23 +534,39 @@ async fn probe_prop(conn: &Connection, service: &str, path: &str, iface: &str, p
 
 async fn probe_single_service(
     conn: &Connection,
-    dbus_proxy: &DBusProxy<'_>,
+    dbus_proxy: Option<&DBusProxy<'_>>,
     service: &str,
+    owner_hint: Option<&str>,
     reg_tx: &RegTx,
     reg_items_set: &Arc<Mutex<HashSet<String>>>,
 ) {
     // Resolve well-known names to unique bus name to prevent duplicate registration
-    let unique_bus = if !service.starts_with(':') {
-        match zbus::names::BusName::try_from(service) {
-            Ok(bn) => match tokio::time::timeout(Duration::from_millis(100), dbus_proxy.get_name_owner(bn)).await {
-                Ok(Ok(owner)) => owner.to_string(),
-                _ => service.to_string(),
-            },
-            Err(_) => service.to_string(),
+    let unique_bus = if let Some(owner) = owner_hint.filter(|o| !o.is_empty()) {
+        owner.to_string()
+    } else if !service.starts_with(':') {
+        match (dbus_proxy, zbus::names::BusName::try_from(service)) {
+            (Some(proxy), Ok(bn)) => {
+                match tokio::time::timeout(Duration::from_millis(100), proxy.get_name_owner(bn)).await {
+                    Ok(Ok(owner)) => owner.to_string(),
+                    _ => service.to_string(),
+                }
+            }
+            _ => service.to_string(),
         }
     } else {
         service.to_string()
     };
+
+    if conn
+        .unique_name()
+        .is_some_and(|u| u.as_str() == unique_bus || u.as_str() == service)
+    {
+        return;
+    }
+
+    if has_registered_item_for_bus(&crate::util::lock(reg_items_set), service, &unique_bus) {
+        return;
+    }
 
     let mut candidate_paths = candidate_sni_paths(&[]);
 
@@ -559,7 +608,56 @@ async fn probe_single_service(
 
 /// Well-known buses that can never be tray items (hosts/watchers themselves).
 pub fn is_probe_candidate(name: &str) -> bool {
-    !(name.starts_with("org.freedesktop.") || name.starts_with("org.kde."))
+    !(name.starts_with("org.freedesktop.")
+        || name.starts_with("org.kde.")
+        || name.starts_with("org.gnome.")
+        || name.starts_with("org.gtk.")
+        || name.starts_with("org.a11y.")
+        || name.starts_with("ca.desrt."))
+}
+
+/// Live `NameOwnerChanged` probing only targets non-infrastructure well-known
+/// names; bare `:1.xxx` unique connections trigger on every process connecting
+/// to the session bus and are covered by `RegisterStatusNotifierItem`.
+pub fn is_live_probe_candidate(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with(':') && is_probe_candidate(name)
+}
+
+/// True when `reg_items` already holds an SNI path for `service` or `unique_bus`.
+pub fn has_registered_item_for_bus(reg_items: &HashSet<String>, service: &str, unique_bus: &str) -> bool {
+    reg_items
+        .iter()
+        .any(|k| belongs_to_disconnected_owner("", k, service, unique_bus))
+}
+
+/// Collect all keys across `items`, in-flight `registered_items`, and
+/// `item_task_keys` owned by a disconnected D-Bus client (`name` / `old_owner`).
+pub fn collect_disconnected_keys(
+    items: &TrayItemMap,
+    registered_items: &HashSet<String>,
+    item_task_keys: &[String],
+    name: &str,
+    old_owner: &str,
+) -> Vec<String> {
+    let mut keys = HashSet::new();
+    for (k, (item, _)) in items {
+        if belongs_to_disconnected_owner(&item.bus_name, k, name, old_owner) {
+            keys.insert(k.clone());
+        }
+    }
+    for k in registered_items {
+        if belongs_to_disconnected_owner("", k, name, old_owner) {
+            keys.insert(k.clone());
+        }
+    }
+    for k in item_task_keys {
+        if belongs_to_disconnected_owner("", k, name, old_owner) {
+            keys.insert(k.clone());
+        }
+    }
+    let mut sorted: Vec<String> = keys.into_iter().collect();
+    sorted.sort();
+    sorted
 }
 
 /// Whether a tray item belongs to a disconnected D-Bus owner from a
@@ -718,5 +816,171 @@ mod tests {
             ":1.63",
             ":1.63"
         ));
+    }
+
+    #[test]
+    fn test_collect_disconnected_keys_includes_in_flight_registered_and_tasks() {
+        let mut items: TrayItemMap = HashMap::new();
+        items.insert(
+            ":1.50/StatusNotifierItem".to_string(),
+            (
+                TrayItem {
+                    bus_name: ":1.50".to_string(),
+                    object_path: "/StatusNotifierItem".to_string(),
+                    id: "org.example.Discovered".to_string(),
+                    title: None,
+                    icon_name: None,
+                    icon_theme_path: None,
+                    icon_pixmap: None,
+                    tool_tip: None,
+                    item_is_menu: false,
+                    menu_path: None,
+                },
+                None,
+            ),
+        );
+        items.insert(
+            ":1.99/StatusNotifierItem".to_string(),
+            (
+                TrayItem {
+                    bus_name: ":1.99".to_string(),
+                    object_path: "/StatusNotifierItem".to_string(),
+                    id: "org.example.Other".to_string(),
+                    title: None,
+                    icon_name: None,
+                    icon_theme_path: None,
+                    icon_pixmap: None,
+                    tool_tip: None,
+                    item_is_menu: false,
+                    menu_path: None,
+                },
+                None,
+            ),
+        );
+
+        let registered_items = HashSet::from([
+            ":1.50/StatusNotifierItem".to_string(),
+            ":1.50/org/ayatana/NotificationItem/in_flight".to_string(),
+            ":1.99/StatusNotifierItem".to_string(),
+        ]);
+        let item_task_keys = vec![
+            ":1.50/MenuBar".to_string(),
+            "org.example.App/StatusNotifierItem".to_string(),
+            ":1.99/StatusNotifierItem".to_string(),
+        ];
+
+        let mut disconnected =
+            collect_disconnected_keys(&items, &registered_items, &item_task_keys, "org.example.App", ":1.50");
+        disconnected.sort();
+
+        assert_eq!(
+            disconnected,
+            vec![
+                ":1.50/MenuBar".to_string(),
+                ":1.50/StatusNotifierItem".to_string(),
+                ":1.50/org/ayatana/NotificationItem/in_flight".to_string(),
+                "org.example.App/StatusNotifierItem".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_live_probe_candidate_rejects_unique_and_infra_names() {
+        assert!(!is_live_probe_candidate(""));
+        assert!(!is_live_probe_candidate(":1.169"));
+        assert!(!is_live_probe_candidate("org.freedesktop.Notifications"));
+        assert!(!is_live_probe_candidate("org.kde.StatusNotifierWatcher"));
+        assert!(!is_live_probe_candidate("org.gnome.SettingsDaemon"));
+        assert!(!is_live_probe_candidate("org.gtk.vfs.Daemon"));
+        assert!(!is_live_probe_candidate("org.a11y.Bus"));
+        assert!(!is_live_probe_candidate("ca.desrt.dconf"));
+        assert!(is_live_probe_candidate("org.example.TrayApp"));
+    }
+
+    #[test]
+    fn test_has_registered_item_for_bus() {
+        let reg_items = HashSet::from([
+            ":1.42/StatusNotifierItem".to_string(),
+            ":1.77/org/ayatana/NotificationItem/app".to_string(),
+        ]);
+        assert!(has_registered_item_for_bus(&reg_items, "org.example.TrayApp", ":1.42"));
+        assert!(has_registered_item_for_bus(&reg_items, ":1.77", ":1.77"));
+        assert!(!has_registered_item_for_bus(&reg_items, "org.example.Other", ":1.88"));
+        assert!(!has_registered_item_for_bus(&reg_items, ":1.4", ":1.4"));
+    }
+
+    use super::super::test_socket::TestUnixSocket;
+
+    struct CountingSniItem {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl CountingSniItem {
+        #[zbus(property)]
+        fn id(&self) -> String {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            "org.example.TrayApp".to_string()
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> String {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            "Active".to_string()
+        }
+    }
+
+    #[test]
+    fn test_probe_single_service_skips_already_registered_bus_without_dbus_calls() {
+        crate::runtime::handle().block_on(async {
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let client_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let client_conn = zbus::connection::Builder::authenticated_socket(
+                TestUnixSocket::with_counter(client_stream, client_bytes),
+                "0123456789abcdef0123456789abcdef",
+            )
+            .build()
+            .await
+            .unwrap();
+
+            let server_conn = zbus::connection::Builder::authenticated_socket(
+                TestUnixSocket::with_counter(server_stream, Arc::clone(&server_bytes)),
+                "0123456789abcdef0123456789abcdef",
+            )
+            .serve_at(
+                "/StatusNotifierItem",
+                CountingSniItem {
+                    calls: Arc::clone(&prop_calls),
+                },
+            )
+            .build()
+            .await
+            .unwrap();
+
+            let (reg_tx, mut reg_rx) = mpsc::channel(8);
+            let reg_items = Arc::new(Mutex::new(HashSet::from([":1.42/StatusNotifierItem".to_string()])));
+
+            probe_single_service(
+                &client_conn,
+                None,
+                "org.example.TrayApp",
+                Some(":1.42"),
+                &reg_tx,
+                &reg_items,
+            )
+            .await;
+
+            assert_eq!(
+                server_bytes.load(Ordering::Relaxed),
+                0,
+                "Already-registered bus must not receive any D-Bus calls"
+            );
+            assert_eq!(prop_calls.load(Ordering::Relaxed), 0);
+            assert!(reg_rx.try_recv().is_err());
+            drop(server_conn);
+        });
     }
 }

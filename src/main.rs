@@ -113,6 +113,11 @@ fn check_config_and_css_in(dir: &std::path::Path) -> bool {
 }
 
 fn run_check_cli() -> bool {
+    #[cfg(not(test))]
+    if !gtk::is_initialized() {
+        crate::util::ensure_cairo_renderer();
+        let _ = gtk::init();
+    }
     check_config_and_css_in(&crate::config::get_config_dir())
 }
 
@@ -556,27 +561,34 @@ mod tests {
 
     #[test]
     fn test_check_config_and_css_in_isolated_dir() {
-        let tmp = std::env::temp_dir().join(format!("niri_check_cli_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        crate::util::run_gtk_test(|| {
+            let tmp = std::env::temp_dir().join(format!("niri_check_cli_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
 
-        // Missing files fall back to embedded defaults -> valid
-        assert!(check_config_and_css_in(&tmp));
+            // Missing files fall back to embedded defaults -> valid
+            assert!(check_config_and_css_in(&tmp));
 
-        // Valid config + CSS
-        std::fs::write(tmp.join("config.toml"), "position = \"left\"\nsize = 48\n").expect("write cfg");
-        std::fs::write(tmp.join("style.css"), "button { color: #ffffff; }\n").expect("write css");
-        assert!(check_config_and_css_in(&tmp));
+            // Valid config + CSS
+            std::fs::write(tmp.join("config.toml"), "position = \"left\"\nsize = 48\n").expect("write cfg");
+            std::fs::write(tmp.join("style.css"), "button { color: #ffffff; }\n").expect("write css");
+            assert!(check_config_and_css_in(&tmp));
 
-        // Broken TOML -> fails check
-        std::fs::write(tmp.join("config.toml"), "position = [unclosed\n").expect("write bad cfg");
-        assert!(!check_config_and_css_in(&tmp));
+            // Broken TOML -> fails check
+            std::fs::write(tmp.join("config.toml"), "position = [unclosed\n").expect("write bad cfg");
+            assert!(!check_config_and_css_in(&tmp));
 
-        // Restore valid TOML, break CSS -> fails check
-        std::fs::write(tmp.join("config.toml"), "position = \"left\"\n").expect("write cfg");
-        std::fs::write(tmp.join("style.css"), "button { color: red;\n").expect("write bad css");
-        assert!(!check_config_and_css_in(&tmp));
+            // Restore valid TOML, break CSS -> fails check
+            std::fs::write(tmp.join("config.toml"), "position = \"left\"\n").expect("write cfg");
+            std::fs::write(tmp.join("style.css"), "button { color: red;\n").expect("write bad css");
+            assert!(!check_config_and_css_in(&tmp));
 
-        let _ = std::fs::remove_dir_all(&tmp);
+            // Balanced braces with invalid GTK CSS property -> fails check when GTK is active
+            std::fs::write(tmp.join("style.css"), "button { unknown-gtk-property: 123px; }\n")
+                .expect("write bad gtk css");
+            assert!(!check_config_and_css_in(&tmp));
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
     }
 }

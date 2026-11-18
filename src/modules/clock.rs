@@ -74,9 +74,12 @@ impl ClockModule {
                 }
 
                 let wait = duration_until_next_tick(now.nanosecond(), now.second(), has_seconds);
-                let (stopped, _) = core_worker.wait_or_notified_async(wait).await;
+                let (stopped, notified) = core_worker.wait_or_notified_async(wait).await;
                 if stopped {
                     break;
+                }
+                if notified {
+                    last_tick = 999;
                 }
             }
         });
@@ -194,5 +197,27 @@ mod tests {
             Duration::from_millis(39_505)
         );
         assert_eq!(duration_until_next_tick(0, 59, false), Duration::from_millis(1_005));
+    }
+
+    #[test]
+    fn test_clock_notify_triggers_immediate_rebroadcast() {
+        let clock = ClockModule::new(ClockConfig {
+            format_vertical: "%H:%M".to_string(),
+            format_horizontal: "%H:%M".to_string(),
+            ..Default::default()
+        });
+        let rx = clock.subscribe(Orientation::Vertical);
+        crate::runtime::handle().block_on(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            while rx.try_recv().is_ok() {}
+
+            clock.core().notify();
+            let got = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+            assert!(
+                matches!(got, Ok(Ok(state)) if state.text.is_some()),
+                "ClockModule notify() must rebroadcast immediately even within the same minute"
+            );
+        });
+        clock.shutdown();
     }
 }

@@ -167,7 +167,7 @@ jobs:
           fi
 
           echo "Release $TAG does not exist yet. Proceeding with release."
-          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          PREV_TAG=$(gh release list --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
           echo "Previous release tag: ${PREV_TAG:-none}"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate categorized changelog from git commit messages based on simple keywords."""
+"""Generate a flat markdown changelog from git commit messages."""
 
 import os
 import re
@@ -24,26 +24,6 @@ def get_git_repo() -> str | None:
     except Exception:
         pass
     return None
-
-
-def categorize_commit(subject: str) -> str:
-    """Categorize commit message by keyword into: 'feat', 'fix', 'doc', or 'chore'."""
-    lower = subject.lower()
-
-    # Bug fixes
-    if re.search(r"\b(fix|fixes|fixed|bug|bugs|hotfix|patch)\b", lower):
-        return "fix"
-
-    # Features
-    if re.search(r"\b(feat|feature|features|add|added|implement|implemented)\b", lower):
-        return "feat"
-
-    # Documentation
-    if re.search(r"\b(doc|docs|documentation|readme)\b", lower):
-        return "doc"
-
-    # Fallback to chore for everything else
-    return "chore"
 
 
 def get_commits(prev_tag: str | None, current_ref: str = "HEAD") -> list[tuple[str, str]]:
@@ -77,36 +57,21 @@ def generate_markdown(
     current_tag: str | None = None,
     repo: str | None = None,
 ) -> str:
-    """Format categorized commits into markdown."""
+    """Format commit subjects into a flat markdown list."""
     if not commits:
         body = "* Maintenance release with internal updates and fixes."
         if prev_tag and current_tag and repo:
             body += f"\n\n**Full Changelog**: https://github.com/{repo}/compare/{prev_tag}...{current_tag}"
         return body
 
-    categories = {
-        "feat": ("### 🚀 Features", []),
-        "fix": ("### 🐛 Bug Fixes", []),
-        "doc": ("### 📝 Documentation", []),
-        "chore": ("### 🧰 Chores & Maintenance", []),
-    }
-
+    lines = ["### What's Changed"]
     for h, subject in commits:
-        cat = categorize_commit(subject)
-        categories[cat][1].append((h, subject))
+        if repo:
+            lines.append(f"- [{h}](https://github.com/{repo}/commit/{h}) {subject}")
+        else:
+            lines.append(f"- {h} {subject}")
 
-    sections = []
-    for _cat_key, (header, items) in categories.items():
-        if items:
-            lines = [header]
-            for h, subject in items:
-                if repo:
-                    lines.append(f"- [{h}](https://github.com/{repo}/commit/{h}) {subject}")
-                else:
-                    lines.append(f"- {h} {subject}")
-            sections.append("\n".join(lines))
-
-    output = "\n\n".join(sections)
+    output = "\n".join(lines)
 
     if prev_tag and current_tag and repo:
         compare_link = f"\n\n**Full Changelog**: https://github.com/{repo}/compare/{prev_tag}...{current_tag}"

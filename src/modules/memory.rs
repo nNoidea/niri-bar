@@ -1,5 +1,6 @@
 use gtk::Orientation;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::MemoryConfig;
@@ -7,6 +8,7 @@ use crate::modules::{BarModule, ModuleCore, ModuleState};
 
 pub struct MemoryModule {
     config: MemoryConfig,
+    last: Arc<Mutex<(f64, f64)>>,
     core: ModuleCore,
 }
 
@@ -15,6 +17,9 @@ impl MemoryModule {
         let core = ModuleCore::new();
         let core_worker = core.clone();
         let cfg = config.clone();
+        let initial = Self::read_memory_static();
+        let last = Arc::new(Mutex::new(initial));
+        let last_worker = Arc::clone(&last);
 
         crate::runtime::spawn(async move {
             let mut last_used_tenth = -1i64;
@@ -30,6 +35,7 @@ impl MemoryModule {
 
                     if used_tenth != last_used_tenth {
                         last_used_tenth = used_tenth;
+                        *crate::util::lock(&last_worker) = (used_gb, total_gb);
 
                         core_worker
                             .broadcast(|orient| MemoryModule::format_state_static(&cfg, used_gb, total_gb, orient));
@@ -42,7 +48,7 @@ impl MemoryModule {
             }
         });
 
-        Self { config, core }
+        Self { config, last, core }
     }
 
     fn read_memory_static() -> (f64, f64) {
@@ -117,7 +123,7 @@ impl BarModule for MemoryModule {
     }
 
     fn current_state(&self, orientation: Orientation) -> ModuleState {
-        let (used, total) = Self::read_memory_static();
+        let (used, total) = *crate::util::lock(&self.last);
         if total <= 0.0 {
             return ModuleState {
                 icon: None,
@@ -186,5 +192,15 @@ mod tests {
             during <= before + 4,
             "MemoryModule should run on shared Tokio runtime without spawning OS threads (before: {before}, during: {during})"
         );
+    }
+
+    #[test]
+    fn test_memory_current_state_uses_cached_last() {
+        let m = MemoryModule::new(MemoryConfig::default());
+        *crate::util::lock(&m.last) = (123.4, 999.0);
+        let got = m.current_state(Orientation::Vertical);
+        assert_eq!(got.text.as_deref(), Some("󰍛\n123.4G"));
+        assert_eq!(got.tooltip.as_deref(), Some("123.4G / 999.0G (12%)"));
+        m.shutdown();
     }
 }

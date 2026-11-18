@@ -501,7 +501,10 @@ pub fn spawn_command(cmd: &str) {
     }
     let cmd_owned = trimmed.to_string();
     crate::runtime::spawn(async move {
-        match tokio::process::Command::new("sh").args(["-c", &cmd_owned]).spawn() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &cmd_owned]);
+        crate::util::sanitize_child_command(&mut command);
+        match command.spawn() {
             Ok(mut child) => match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {

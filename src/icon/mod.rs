@@ -12,7 +12,7 @@ use gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 use gtk::Image;
 use pixbuf::load_file_pixbuf_fast;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Sanitize a D-Bus/tray icon name: reject absolute paths from untrusted
 /// sources, path separators, `..`, NUL, and overlong names. Returns the
@@ -64,6 +64,40 @@ pub enum IconRequest<'a> {
     },
     /// Simple app or icon name / path
     Named(&'a str),
+}
+
+fn resolve_via_desktop_and_xdg<T>(
+    safe_key: &str,
+    find_desktop: impl FnOnce(&str) -> Option<String>,
+    resolve_xdg: impl Fn(&str) -> Option<PathBuf>,
+    load: impl Fn(&Path) -> Option<T>,
+) -> Option<T> {
+    // 3b. Resolve via desktop entries
+    let resolved = find_desktop(safe_key);
+    if let Some(ref res) = resolved {
+        let res_path = Path::new(res);
+        let candidate = if res_path.is_absolute() && res_path.is_file() {
+            Some(res_path.to_path_buf())
+        } else {
+            resolve_xdg(res)
+        };
+        if let Some(path) = candidate {
+            if let Some(loaded) = load(&path) {
+                return Some(loaded);
+            }
+        }
+    }
+
+    // 3c. Direct XDG icon lookup (resolve_xdg_icon checks exact + lowercased name)
+    if resolved.as_deref() != Some(safe_key) {
+        if let Some(path) = resolve_xdg(safe_key) {
+            if let Some(loaded) = load(&path) {
+                return Some(loaded);
+            }
+        }
+    }
+
+    None
 }
 
 /// Single Source of Truth (SSOT) for resolving any icon request (Taskbar Window, Tray item, or Named asset)
@@ -142,25 +176,9 @@ pub fn resolve_icon_pixbuf(req: &IconRequest, target_size: i32) -> Option<Pixbuf
             }
         }
 
-        // 3b. Resolve via desktop entries
-        if let Some(resolved) = find_app_icon(safe_key) {
-            let res_path = Path::new(&resolved);
-            if res_path.is_absolute() && res_path.is_file() {
-                if let Some(pb) = load_norm(res_path) {
-                    return Some(pb);
-                }
-            } else if let Some(icon_path) = desktop::resolve_xdg_icon(&resolved) {
-                if let Some(pb) = load_norm(&icon_path) {
-                    return Some(pb);
-                }
-            }
-        }
-
-        // 3c. Direct XDG icon lookup (resolve_xdg_icon checks exact + lowercased name)
-        if let Some(icon_path) = desktop::resolve_xdg_icon(safe_key) {
-            if let Some(pb) = load_norm(&icon_path) {
-                return Some(pb);
-            }
+        // 3b & 3c. Resolve via desktop entries, then direct XDG icon lookup
+        if let Some(pb) = resolve_via_desktop_and_xdg(safe_key, find_app_icon, desktop::resolve_xdg_icon, load_norm) {
+            return Some(pb);
         }
 
         // 3d. Process executable directory / Electron .asar heuristic
@@ -474,5 +492,45 @@ mod tests {
         };
         let pb_tray = resolve_icon_pixbuf(&req_tray, 24);
         assert!(pb_tray.is_some(), "SSOT should resolve tray ARGB32 pixmaps");
+    }
+
+    #[test]
+    fn test_resolve_via_desktop_and_xdg_skips_duplicate_xdg_lookup() {
+        use std::cell::RefCell;
+
+        // Case 1: find_desktop returns Some(safe_key) (fallback or same-name Icon=) -> resolve_xdg called ONCE.
+        let calls_same = RefCell::new(Vec::<String>::new());
+        let res = resolve_via_desktop_and_xdg(
+            "org.example.SameName",
+            |k| Some(k.to_string()),
+            |k| {
+                calls_same.borrow_mut().push(k.to_string());
+                None::<PathBuf>
+            },
+            |_| Some(()),
+        );
+        assert!(res.is_none());
+        assert_eq!(
+            calls_same.borrow().as_slice(),
+            &["org.example.SameName".to_string()],
+            "Direct XDG lookup must not be repeated for the exact same icon key"
+        );
+
+        // Case 2: find_desktop returns a distinct icon name that fails -> direct XDG lookup tries safe_key.
+        let calls_diff = RefCell::new(Vec::<String>::new());
+        let res2 = resolve_via_desktop_and_xdg(
+            "org.example.App",
+            |_| Some("custom-desktop-icon".to_string()),
+            |k| {
+                calls_diff.borrow_mut().push(k.to_string());
+                (k == "org.example.App").then(|| PathBuf::from("/tmp/app.png"))
+            },
+            |_| Some(()),
+        );
+        assert_eq!(res2, Some(()));
+        assert_eq!(
+            calls_diff.borrow().as_slice(),
+            &["custom-desktop-icon".to_string(), "org.example.App".to_string()]
+        );
     }
 }

@@ -11,7 +11,7 @@ URL:            https://github.com/nNoidea/niri-bar
 Source0:        {{{ git_dir_pack }}}
 
 BuildRequires:  cargo
-BuildRequires:  rust >= 1.85
+BuildRequires:  rust >= 1.89
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(gtk4-layer-shell-0)
 BuildRequires:  gcc

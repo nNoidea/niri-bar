@@ -36,9 +36,11 @@ pub fn nudge(tx: &async_channel::Sender<()>) {
 pub fn ensure_cairo_renderer() {
     if std::env::var_os("GSK_RENDERER").is_none() {
         std::env::set_var("GSK_RENDERER", "cairo");
+        std::env::set_var("NIRI_BAR_SET_GSK_RENDERER", "1");
     }
     if std::env::var_os("GTK_A11Y").is_none() {
         std::env::set_var("GTK_A11Y", "none");
+        std::env::set_var("NIRI_BAR_SET_GTK_A11Y", "1");
     }
 }
 
@@ -50,8 +52,10 @@ pub fn ensure_optimal_process_env(argv: &[String]) {
     ensure_cairo_renderer();
     if std::env::var_os("NIRI_BAR_ENV_TUNED").is_none() && std::env::var_os("MALLOC_ARENA_MAX").is_none() {
         std::env::set_var("MALLOC_ARENA_MAX", "2");
+        std::env::set_var("NIRI_BAR_SET_MALLOC_ARENA_MAX", "1");
         if std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none() {
             std::env::set_var("MALLOC_TRIM_THRESHOLD_", "65536");
+            std::env::set_var("NIRI_BAR_SET_MALLOC_TRIM", "1");
         }
         std::env::set_var("NIRI_BAR_ENV_TUNED", "1");
         if let Ok(exe) = std::env::current_exe() {
@@ -60,6 +64,25 @@ pub fn ensure_optimal_process_env(argv: &[String]) {
             let _ = std::process::Command::new(exe).args(args).exec();
         }
     }
+}
+
+/// Strip internal `niri-bar` environment overrides (`GSK_RENDERER`, `GTK_A11Y`,
+/// `MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`, `NIRI_BAR_ENV_TUNED`) from child
+/// commands spawned via user click actions, while preserving values explicitly
+/// provided by the user's session environment.
+pub fn sanitize_child_command(cmd: &mut tokio::process::Command) {
+    for (marker, var) in [
+        ("NIRI_BAR_SET_GSK_RENDERER", "GSK_RENDERER"),
+        ("NIRI_BAR_SET_GTK_A11Y", "GTK_A11Y"),
+        ("NIRI_BAR_SET_MALLOC_ARENA_MAX", "MALLOC_ARENA_MAX"),
+        ("NIRI_BAR_SET_MALLOC_TRIM", "MALLOC_TRIM_THRESHOLD_"),
+    ] {
+        if std::env::var_os(marker).is_some() {
+            cmd.env_remove(var);
+            cmd.env_remove(marker);
+        }
+    }
+    cmd.env_remove("NIRI_BAR_ENV_TUNED");
 }
 
 /// Collect the direct child widgets of `parent` in order (`first_child` .. `next_sibling`).
@@ -246,6 +269,11 @@ mod tests {
             vars: vec![
                 ("GSK_RENDERER", std::env::var_os("GSK_RENDERER")),
                 ("GTK_A11Y", std::env::var_os("GTK_A11Y")),
+                (
+                    "NIRI_BAR_SET_GSK_RENDERER",
+                    std::env::var_os("NIRI_BAR_SET_GSK_RENDERER"),
+                ),
+                ("NIRI_BAR_SET_GTK_A11Y", std::env::var_os("NIRI_BAR_SET_GTK_A11Y")),
             ],
         };
         ensure_cairo_renderer();
@@ -319,13 +347,80 @@ mod tests {
             vars: vec![
                 ("GSK_RENDERER", std::env::var_os("GSK_RENDERER")),
                 ("GTK_A11Y", std::env::var_os("GTK_A11Y")),
+                (
+                    "NIRI_BAR_SET_GSK_RENDERER",
+                    std::env::var_os("NIRI_BAR_SET_GSK_RENDERER"),
+                ),
+                ("NIRI_BAR_SET_GTK_A11Y", std::env::var_os("NIRI_BAR_SET_GTK_A11Y")),
             ],
         };
         std::env::remove_var("GSK_RENDERER");
         std::env::remove_var("GTK_A11Y");
+        std::env::remove_var("NIRI_BAR_SET_GSK_RENDERER");
+        std::env::remove_var("NIRI_BAR_SET_GTK_A11Y");
         ensure_cairo_renderer();
         assert_eq!(std::env::var("GSK_RENDERER").as_deref(), Ok("cairo"));
         assert_eq!(std::env::var("GTK_A11Y").as_deref(), Ok("none"));
+    }
+
+    #[test]
+    fn test_sanitize_child_command_strips_injected_env_only() {
+        let _lock = lock(&ENV_TEST_LOCK);
+        let _restore = EnvRestoreGuard {
+            vars: vec![
+                ("GSK_RENDERER", std::env::var_os("GSK_RENDERER")),
+                ("GTK_A11Y", std::env::var_os("GTK_A11Y")),
+                ("MALLOC_ARENA_MAX", std::env::var_os("MALLOC_ARENA_MAX")),
+                ("MALLOC_TRIM_THRESHOLD_", std::env::var_os("MALLOC_TRIM_THRESHOLD_")),
+                ("NIRI_BAR_ENV_TUNED", std::env::var_os("NIRI_BAR_ENV_TUNED")),
+                (
+                    "NIRI_BAR_SET_GSK_RENDERER",
+                    std::env::var_os("NIRI_BAR_SET_GSK_RENDERER"),
+                ),
+                ("NIRI_BAR_SET_GTK_A11Y", std::env::var_os("NIRI_BAR_SET_GTK_A11Y")),
+                (
+                    "NIRI_BAR_SET_MALLOC_ARENA_MAX",
+                    std::env::var_os("NIRI_BAR_SET_MALLOC_ARENA_MAX"),
+                ),
+                ("NIRI_BAR_SET_MALLOC_TRIM", std::env::var_os("NIRI_BAR_SET_MALLOC_TRIM")),
+            ],
+        };
+
+        // 1. Injected defaults must be stripped from child commands
+        std::env::remove_var("GSK_RENDERER");
+        std::env::remove_var("GTK_A11Y");
+        std::env::remove_var("NIRI_BAR_SET_GSK_RENDERER");
+        std::env::remove_var("NIRI_BAR_SET_GTK_A11Y");
+        std::env::set_var("NIRI_BAR_ENV_TUNED", "1");
+        ensure_cairo_renderer();
+
+        let out = crate::runtime::handle().block_on(async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args([
+                "-c",
+                "printf '%s|%s|%s' \"${GSK_RENDERER:-}\" \"${GTK_A11Y:-}\" \"${NIRI_BAR_ENV_TUNED:-}\"",
+            ]);
+            sanitize_child_command(&mut cmd);
+            let output = cmd.output().await.expect("sh must run");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        });
+        assert_eq!(out, "||");
+
+        // 2. User-provided GSK_RENDERER before ensure_cairo_renderer must be preserved
+        std::env::remove_var("NIRI_BAR_SET_GSK_RENDERER");
+        std::env::remove_var("NIRI_BAR_SET_GTK_A11Y");
+        std::env::set_var("GSK_RENDERER", "ngl");
+        std::env::remove_var("GTK_A11Y");
+        ensure_cairo_renderer();
+
+        let out_user = crate::runtime::handle().block_on(async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args(["-c", "printf '%s|%s' \"${GSK_RENDERER:-}\" \"${GTK_A11Y:-}\""]);
+            sanitize_child_command(&mut cmd);
+            let output = cmd.output().await.expect("sh must run");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        });
+        assert_eq!(out_user, "ngl|");
     }
 
     #[test]

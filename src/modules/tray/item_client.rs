@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -239,6 +239,19 @@ struct RawSniProps {
     menu_path: Option<zbus::OwnedVariant>,
 }
 
+impl RawSniProps {
+    fn has_any_data(&self) -> bool {
+        self.id.is_some()
+            || self.title.is_some()
+            || self.icon_name.is_some()
+            || self.icon_theme_path.is_some()
+            || self.icon_pixmap.is_some()
+            || self.tool_tip.is_some()
+            || self.item_is_menu.is_some()
+            || self.menu_path.is_some()
+    }
+}
+
 fn assemble_tray_item(bus: &str, path: &str, props: RawSniProps) -> TrayItem {
     TrayItem {
         bus_name: bus.to_string(),
@@ -254,7 +267,7 @@ fn assemble_tray_item(bus: &str, path: &str, props: RawSniProps) -> TrayItem {
     }
 }
 
-async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> TrayItem {
+async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Option<(TrayItem, &'static str)> {
     let kde_iface = "org.kde.StatusNotifierItem";
     let fdo_iface = "org.freedesktop.StatusNotifierItem";
 
@@ -277,20 +290,25 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Tray
 
     let icon_pixmap = fetch_sni_icon_pixmap(conn, bus, path, iface).await;
 
-    assemble_tray_item(
-        bus,
-        path,
-        RawSniProps {
-            id: id_val,
-            title: title_val,
-            icon_name: icon_name_val,
-            icon_theme_path: theme_val,
-            icon_pixmap,
-            tool_tip: tooltip_val,
-            item_is_menu: is_menu_val,
-            menu_path: menu_val,
-        },
-    )
+    let props = RawSniProps {
+        id: id_val,
+        title: title_val,
+        icon_name: icon_name_val,
+        icon_theme_path: theme_val,
+        icon_pixmap,
+        tool_tip: tooltip_val,
+        item_is_menu: is_menu_val,
+        menu_path: menu_val,
+    };
+
+    if !props.has_any_data() {
+        if dbus_get_property(conn, bus, path, kde_iface, "Status").await.is_some() {
+            return Some((assemble_tray_item(bus, path, props), kde_iface));
+        }
+        return None;
+    }
+
+    Some((assemble_tray_item(bus, path, props), iface))
 }
 
 type RawMenuTuple = (i32, HashMap<String, zbus::OwnedVariant>, Vec<zbus::OwnedVariant>);
@@ -388,7 +406,9 @@ async fn refresh_item_and_broadcast(
     items_map: &Arc<Mutex<TrayItemMap>>,
     subs_map: &Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>>,
 ) {
-    let fresh_item = fetch_item_properties(conn, bus, path).await;
+    let Some((fresh_item, _)) = fetch_item_properties(conn, bus, path).await else {
+        return;
+    };
     apply_refreshed_item(items_map, key, &fresh_item);
     TrayService::broadcast(subs_map, TrayEvent::Update(key.to_string(), Box::new(fresh_item)));
 }
@@ -400,13 +420,26 @@ pub(super) async fn process_and_track_item(
     key: String,
     items_map: Arc<Mutex<TrayItemMap>>,
     subs_map: Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>>,
+    registered_items: Arc<Mutex<HashSet<String>>>,
 ) {
-    let item = fetch_item_properties(&conn, &bus_name, &object_path).await;
+    let Some((item, sni_iface)) = fetch_item_properties(&conn, &bus_name, &object_path).await else {
+        log_debug!("tray", "Ignoring unreachable or disconnected tray item: {key}");
+        crate::util::lock(&registered_items).remove(&key);
+        return;
+    };
+    if !crate::util::lock(&registered_items).contains(&key) {
+        return;
+    }
+
     let menu = if let Some(ref m_path) = item.menu_path {
         fetch_menu_layout(&conn, &bus_name, m_path).await
     } else {
         None
     };
+
+    if !crate::util::lock(&registered_items).contains(&key) {
+        return;
+    }
 
     log_info!(
         "tray",
@@ -421,7 +454,7 @@ pub(super) async fn process_and_track_item(
     crate::util::lock(&items_map).insert(key.clone(), (item.clone(), menu));
     TrayService::broadcast(&subs_map, TrayEvent::Add(key.clone(), Box::new(item.clone())));
 
-    let mut stream_sni = signal_stream(&conn, &bus_name, &object_path, "org.kde.StatusNotifierItem").await;
+    let mut stream_sni = signal_stream(&conn, &bus_name, &object_path, sni_iface).await;
     let mut stream_props = signal_stream(&conn, &bus_name, &object_path, "org.freedesktop.DBus.Properties").await;
     let mut stream_menu = if let Some(ref m_path) = item.menu_path {
         signal_stream(&conn, &bus_name, m_path, "com.canonical.dbusmenu").await
@@ -607,5 +640,50 @@ mod tests {
         assert!(is_menu_layout_signal("LayoutUpdated"));
         assert!(is_menu_layout_signal("ItemsPropertiesUpdated"));
         assert!(!is_menu_layout_signal("ActivationRequested"));
+    }
+
+    #[test]
+    fn test_process_and_track_item_drops_disconnected_peer_without_adding_ghost_item() {
+        crate::runtime::handle().block_on(async {
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let conn = zbus::connection::Builder::authenticated_socket(
+                super::super::test_socket::TestUnixSocket::new(client_stream),
+                "0123456789abcdef0123456789abcdef",
+            )
+            .build()
+            .await
+            .unwrap();
+            drop(server_stream);
+
+            let key = ":1.99/StatusNotifierItem".to_string();
+            let items_map: Arc<Mutex<TrayItemMap>> = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, rx) = async_channel::unbounded();
+            let subs_map: Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>> = Arc::new(Mutex::new(vec![tx]));
+            let registered_items = Arc::new(Mutex::new(std::collections::HashSet::from([key.clone()])));
+
+            process_and_track_item(
+                conn,
+                ":1.99".to_string(),
+                "/StatusNotifierItem".to_string(),
+                key.clone(),
+                Arc::clone(&items_map),
+                subs_map,
+                Arc::clone(&registered_items),
+            )
+            .await;
+
+            assert!(
+                !crate::util::lock(&items_map).contains_key(&key),
+                "Disconnected peer must not produce a ghost item in items_map"
+            );
+            assert!(
+                !crate::util::lock(&registered_items).contains(&key),
+                "Disconnected peer key must be cleared from registered_items"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "Disconnected peer must not broadcast TrayEvent::Add"
+            );
+        });
     }
 }

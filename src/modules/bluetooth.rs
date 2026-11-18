@@ -246,6 +246,18 @@ impl BluetoothModule {
         }
     }
 
+    pub fn toggle_command_for_state(state: &BluetoothState) -> Option<String> {
+        let btctl = crate::modules::resolve_helper("bluetoothctl");
+        let rfkill = crate::modules::resolve_helper("rfkill");
+        match state {
+            BluetoothState::On | BluetoothState::Connected { .. } => Some(format!("{btctl} power off")),
+            BluetoothState::Off | BluetoothState::Loading => {
+                Some(format!("{rfkill} unblock bluetooth && {btctl} power on"))
+            }
+            BluetoothState::Absent => None,
+        }
+    }
+
     pub fn toggle_bluetooth() {
         // Decide off-thread on the shared Tokio runtime.
         crate::runtime::spawn(async {
@@ -254,14 +266,8 @@ impl BluetoothModule {
                 log_warn!("bluetooth", "Toggle ignored: no bluetooth adapter found");
                 return;
             }
-            match state {
-                BluetoothState::On | BluetoothState::Connected { .. } => {
-                    spawn_command("bluetoothctl power off && rfkill block bluetooth");
-                }
-                BluetoothState::Off | BluetoothState::Loading => {
-                    spawn_command("rfkill unblock bluetooth && bluetoothctl power on");
-                }
-                BluetoothState::Absent => {}
+            if let Some(cmd) = Self::toggle_command_for_state(&state) {
+                spawn_command(&cmd);
             }
         });
     }
@@ -536,5 +542,31 @@ mod tests {
                 device_name: Some("AirPods Pro".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn test_bluetooth_toggle_command_for_state() {
+        let on_cmd = BluetoothModule::toggle_command_for_state(&BluetoothState::On).expect("On must toggle");
+        assert!(on_cmd.contains("power off"));
+        assert!(!on_cmd.contains("rfkill block"));
+
+        let conn_cmd = BluetoothModule::toggle_command_for_state(&BluetoothState::Connected {
+            count: 1,
+            device_name: Some("Headset".into()),
+        })
+        .expect("Connected must toggle");
+        assert!(conn_cmd.contains("power off"));
+        assert!(!conn_cmd.contains("rfkill block"));
+
+        let off_cmd = BluetoothModule::toggle_command_for_state(&BluetoothState::Off).expect("Off must toggle");
+        assert!(off_cmd.contains("unblock bluetooth"));
+        assert!(off_cmd.contains("power on"));
+
+        let load_cmd =
+            BluetoothModule::toggle_command_for_state(&BluetoothState::Loading).expect("Loading must toggle");
+        assert!(load_cmd.contains("unblock bluetooth"));
+        assert!(load_cmd.contains("power on"));
+
+        assert_eq!(BluetoothModule::toggle_command_for_state(&BluetoothState::Absent), None);
     }
 }

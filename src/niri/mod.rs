@@ -19,6 +19,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn activate_workspace(&mut self, id: u64, focused: bool) {
+        let ws_output = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == id)
+            .and_then(|ws| ws.output.clone());
+        for ws in &mut self.workspaces {
+            if ws.id == id {
+                ws.is_active = true;
+                if focused {
+                    ws.is_focused = true;
+                }
+            } else {
+                if ws_output.is_some() && ws.output == ws_output {
+                    ws.is_active = false;
+                }
+                if focused {
+                    ws.is_focused = false;
+                }
+            }
+        }
+    }
+
     /// Apply a Niri IPC event to the in-memory state.
     ///
     /// Returns `true` if the state was updated and listeners should be nudged.
@@ -28,28 +51,7 @@ impl AppState {
                 self.workspaces = workspaces;
             }
             Event::WorkspaceActivated { id, focused } => {
-                let mut ws_output = None;
-                for ws in &mut self.workspaces {
-                    if ws.id == id {
-                        ws_output.clone_from(&ws.output);
-                        ws.is_active = true;
-                        if focused {
-                            ws.is_focused = true;
-                        }
-                    }
-                }
-                if let Some(out) = ws_output {
-                    for ws in &mut self.workspaces {
-                        if ws.output.as_ref() == Some(&out) && ws.id != id {
-                            ws.is_active = false;
-                            if focused {
-                                ws.is_focused = false;
-                            }
-                        } else if focused && ws.id != id {
-                            ws.is_focused = false;
-                        }
-                    }
-                }
+                self.activate_workspace(id, focused);
             }
             Event::OutputsChanged { outputs } => {
                 if let Some(outs) = outputs.filter(|o| !o.is_empty()) {
@@ -63,6 +65,9 @@ impl AppState {
                 if window.is_focused {
                     for w in &mut self.windows {
                         w.is_focused = w.id == window.id;
+                    }
+                    if let Some(ws_id) = window.workspace_id {
+                        self.activate_workspace(ws_id, true);
                     }
                 }
                 if let Some(idx) = self.windows.iter().position(|w| w.id == window.id) {
@@ -85,14 +90,7 @@ impl AppState {
                         .find(|w| w.id == win_id)
                         .and_then(|w| w.workspace_id)
                     {
-                        for ws in &mut self.workspaces {
-                            if ws.id == ws_id {
-                                ws.is_focused = true;
-                                ws.is_active = true;
-                            } else {
-                                ws.is_focused = false;
-                            }
-                        }
+                        self.activate_workspace(ws_id, true);
                     }
                 }
             }
@@ -832,5 +830,77 @@ mod tests {
         assert!(changed_dragged);
         assert_eq!(drag.active_window_id(), None);
         assert!(drag.should_cleanup_cancel());
+    }
+
+    #[test]
+    fn test_window_focus_changed_deactivates_previous_workspace_on_same_output() {
+        let mut state = AppState {
+            workspaces: vec![
+                WorkspaceInfo {
+                    id: 1,
+                    idx: 1,
+                    output: Some("eDP-1".to_string()),
+                    is_active: true,
+                    is_focused: true,
+                },
+                WorkspaceInfo {
+                    id: 2,
+                    idx: 2,
+                    output: Some("eDP-1".to_string()),
+                    is_active: false,
+                    is_focused: false,
+                },
+                WorkspaceInfo {
+                    id: 3,
+                    idx: 1,
+                    output: Some("DP-1".to_string()),
+                    is_active: true,
+                    is_focused: false,
+                },
+            ],
+            windows: vec![
+                WindowInfo {
+                    id: 10,
+                    title: Some("One".to_string()),
+                    app_id: Some("org.example.One".to_string()),
+                    pid: None,
+                    workspace_id: Some(1),
+                    is_focused: true,
+                    layout: None,
+                },
+                WindowInfo {
+                    id: 20,
+                    title: Some("Two".to_string()),
+                    app_id: Some("org.example.Two".to_string()),
+                    pid: None,
+                    workspace_id: Some(2),
+                    is_focused: false,
+                    layout: None,
+                },
+                WindowInfo {
+                    id: 30,
+                    title: Some("Three".to_string()),
+                    app_id: Some("org.example.Three".to_string()),
+                    pid: None,
+                    workspace_id: Some(3),
+                    is_focused: false,
+                    layout: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Focus window 20 on eDP-1 (WS 2), then move focus to window 30 on DP-1 (WS 3).
+        assert!(state.apply_event(Event::WindowFocusChanged { id: Some(20) }));
+        assert!(state.apply_event(Event::WindowFocusChanged { id: Some(30) }));
+
+        assert!(!state.workspaces[0].is_active, "WS 1 on eDP-1 must be deactivated");
+        assert!(state.workspaces[1].is_active, "WS 2 on eDP-1 must remain active");
+        assert!(!state.workspaces[1].is_focused);
+        assert!(state.workspaces[2].is_active);
+        assert!(state.workspaces[2].is_focused);
+
+        let active_map = crate::niri::taskbar::active_workspace_per_output(&state.workspaces);
+        assert_eq!(active_map.get("eDP-1"), Some(&2));
     }
 }
