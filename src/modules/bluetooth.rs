@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::config::{resolve_mode, BluetoothConfig};
 use crate::modules::{
-    spawn_command, spawn_dbus_poller, spawn_dbus_trigger, system_bus, BarModule, DbusPollSpec, ModuleCore, ModuleState,
-    MouseButton,
+    run_shell_command_async, spawn_dbus_poller, spawn_dbus_trigger, system_bus, BarModule, DbusPollSpec, ModuleCore,
+    ModuleState, MouseButton,
 };
 
 pub(crate) type BluezManagedObjects =
@@ -145,22 +145,28 @@ impl BluetoothModule {
     }
 
     pub(crate) fn parse_managed_objects(objects: &BluezManagedObjects) -> Option<BluetoothState> {
+        let mut sorted: Vec<_> = objects.iter().collect();
+        sorted.sort_by_key(|(path, _)| path.as_str());
+
         let mut adapter_found = false;
-        let mut adapter_powered = false;
-        let mut adapter_power_state = None;
+        let mut any_powered = false;
+        let mut any_loading = false;
         let mut devices = Vec::new();
 
-        for ifaces in objects.values() {
+        for (_, ifaces) in sorted {
             if let Some(props) = ifaces.get("org.bluez.Adapter1") {
                 adapter_found = true;
                 if let Some(v) = props.get("Powered") {
                     if let zbus::Variant::Bool(b) = v.deref() {
-                        adapter_powered = *b;
+                        any_powered |= *b;
                     }
                 }
                 if let Some(v) = props.get("PowerState") {
                     if let zbus::Variant::Str(s) = v.deref() {
-                        adapter_power_state = Some(s.as_str().to_string());
+                        let st = s.as_str();
+                        if st.contains("enabling") || st.contains("disabling") {
+                            any_loading = true;
+                        }
                     }
                 }
             }
@@ -190,8 +196,8 @@ impl BluetoothModule {
 
         let dev_refs: Vec<(&str, bool)> = devices.iter().map(|(n, c)| (n.as_str(), *c)).collect();
         Some(Self::parse_bluez_properties(
-            adapter_powered,
-            adapter_power_state.as_deref(),
+            any_powered,
+            any_loading.then_some("enabling"),
             &dev_refs,
         ))
     }
@@ -258,16 +264,18 @@ impl BluetoothModule {
         }
     }
 
-    pub fn toggle_bluetooth() {
+    fn toggle_bluetooth(core: ModuleCore) {
         // Decide off-thread on the shared Tokio runtime.
-        crate::runtime::spawn(async {
+        crate::runtime::spawn(async move {
             let (state, healthy) = Self::read_bluetooth_state_full().await;
             if !healthy || state == BluetoothState::Absent {
                 log_warn!("bluetooth", "Toggle ignored: no bluetooth adapter found");
+                core.notify();
                 return;
             }
             if let Some(cmd) = Self::toggle_command_for_state(&state) {
-                spawn_command(&cmd);
+                run_shell_command_async(&cmd).await;
+                core.notify_fast();
             }
         });
     }
@@ -359,14 +367,15 @@ impl BarModule for BluetoothModule {
     }
 
     fn handle_click(&self, button: MouseButton) {
-        if !self.config.click.try_run(button) && button == MouseButton::Left {
+        if self.config.click.try_run(button) {
+            self.core.notify();
+        } else if button == MouseButton::Left {
             // Default toggle: emit Loading immediately for instant UI feedback, then toggle.
             *crate::util::lock(&self.last) = BluetoothState::Loading;
             self.core
                 .broadcast(|orient| Self::format_state_with_config(&self.config, &BluetoothState::Loading, orient));
-            Self::toggle_bluetooth();
+            Self::toggle_bluetooth(self.core.clone());
         }
-        self.core.notify();
     }
 
     fn is_clickable(&self) -> bool {
@@ -568,5 +577,84 @@ mod tests {
         assert!(load_cmd.contains("power on"));
 
         assert_eq!(BluetoothModule::toggle_command_for_state(&BluetoothState::Absent), None);
+    }
+
+    #[test]
+    fn test_parse_managed_objects_multi_adapter_and_multi_device_deterministic() {
+        use std::collections::HashMap;
+        let make_adapter = |powered: bool, pstate: &str| {
+            let mut props = HashMap::new();
+            props.insert(
+                "Powered".to_string(),
+                zbus::OwnedVariant::try_from(zbus::Variant::from(powered)).unwrap(),
+            );
+            props.insert(
+                "PowerState".to_string(),
+                zbus::OwnedVariant::try_from(zbus::Variant::from(pstate)).unwrap(),
+            );
+            let mut ifaces = HashMap::new();
+            ifaces.insert("org.bluez.Adapter1".to_string(), props);
+            ifaces
+        };
+        let make_device = |alias: &str, connected: bool| {
+            let mut props = HashMap::new();
+            props.insert(
+                "Connected".to_string(),
+                zbus::OwnedVariant::try_from(zbus::Variant::from(connected)).unwrap(),
+            );
+            props.insert(
+                "Alias".to_string(),
+                zbus::OwnedVariant::try_from(zbus::Variant::from(alias)).unwrap(),
+            );
+            let mut ifaces = HashMap::new();
+            ifaces.insert("org.bluez.Device1".to_string(), props);
+            ifaces
+        };
+
+        // Run repeatedly across random HashMap seeds to confirm deterministic outcome
+        for _ in 0..20 {
+            let mut objects: BluezManagedObjects = HashMap::new();
+            // hci0 is powered on, hci1 is powered off
+            objects.insert(
+                zbus::OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
+                make_adapter(true, "on"),
+            );
+            objects.insert(
+                zbus::OwnedObjectPath::try_from("/org/bluez/hci1").unwrap(),
+                make_adapter(false, "off"),
+            );
+            objects.insert(
+                zbus::OwnedObjectPath::try_from("/org/bluez/hci0/dev_ZZ_YY").unwrap(),
+                make_device("Zebra Device", true),
+            );
+            objects.insert(
+                zbus::OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB").unwrap(),
+                make_device("Alpha Device", true),
+            );
+
+            let state = BluetoothModule::parse_managed_objects(&objects).unwrap();
+            assert_eq!(
+                state,
+                BluetoothState::Connected {
+                    count: 2,
+                    device_name: Some("Alpha Device".to_string()),
+                }
+            );
+        }
+
+        // If any adapter is enabling/disabling, report Loading
+        let mut loading_objs: BluezManagedObjects = HashMap::new();
+        loading_objs.insert(
+            zbus::OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
+            make_adapter(false, "off-enabling"),
+        );
+        loading_objs.insert(
+            zbus::OwnedObjectPath::try_from("/org/bluez/hci1").unwrap(),
+            make_adapter(true, "on"),
+        );
+        assert_eq!(
+            BluetoothModule::parse_managed_objects(&loading_objs),
+            Some(BluetoothState::Loading)
+        );
     }
 }

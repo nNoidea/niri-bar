@@ -130,10 +130,46 @@ button#bar-error-badge:backdrop {
     border-style: solid;
     border-width: 2px;
     border-radius: 4px;
-    padding: 2px 8px;
-    margin: 4px 2px;
+    padding: 1px 8px;
+    margin: 2px 4px;
+    min-width: 0;
+    min-height: 0;
     box-shadow: none;
     text-shadow: none;
+}
+
+#bar-error-badge.vertical,
+button#bar-error-badge.vertical,
+#bar-error-badge.vertical:backdrop,
+button#bar-error-badge.vertical:backdrop {
+    padding: 3px 2px;
+    margin: 4px 2px;
+}
+
+#bar-error-badge.horizontal,
+button#bar-error-badge.horizontal,
+#bar-error-badge.horizontal:backdrop,
+button#bar-error-badge.horizontal:backdrop {
+    padding: 1px 8px;
+    margin: 2px 4px;
+}
+
+#bar-error-badge.compact,
+button#bar-error-badge.compact,
+#bar-error-badge.compact:backdrop,
+button#bar-error-badge.compact:backdrop {
+    border-width: 1px;
+    border-radius: 3px;
+    padding: 1px 1px;
+    margin: 2px 1px;
+}
+
+#bar-error-badge.horizontal.compact,
+button#bar-error-badge.horizontal.compact,
+#bar-error-badge.horizontal.compact:backdrop,
+button#bar-error-badge.horizontal.compact:backdrop {
+    padding: 0 4px;
+    margin: 1px 2px;
 }
 
 #bar-error-badge:hover,
@@ -144,7 +180,6 @@ button#bar-error-badge:hover:backdrop {
     background-image: none;
     border-color: #ff6666;
     border-style: solid;
-    border-width: 2px;
 }
 
 #bar-error-badge:active,
@@ -153,7 +188,6 @@ button#bar-error-badge:active {
     background-image: none;
     border-color: #ff8888;
     border-style: solid;
-    border-width: 2px;
 }
 
 #bar-error-badge label,
@@ -163,22 +197,100 @@ button#bar-error-badge label:backdrop {
     color: #ff3333;
     font-weight: bold;
     text-shadow: none;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
 }";
 
+#[cfg(test)]
 pub const ERROR_LABEL_MARKUP: &str = r##"<span foreground="#ff3333" weight="bold">ERROR</span>"##;
-pub const ERROR_LABEL_COPIED_MARKUP: &str = r##"<span foreground="#55ff55" weight="bold">COPIED!</span>"##;
+
+const ERROR_CANDIDATES: &[(&str, Option<i32>)] = &[
+    ("ERROR", None),
+    ("ERROR", Some(11)),
+    ("ERROR", Some(10)),
+    ("ERROR", Some(9)),
+    ("ERR", Some(10)),
+    ("ERR", Some(9)),
+    ("!", Some(10)),
+    ("!", Some(8)),
+];
+
+const COPIED_CANDIDATES: &[(&str, Option<i32>)] = &[
+    ("COPIED!", None),
+    ("COPIED!", Some(11)),
+    ("COPIED!", Some(10)),
+    ("COPIED", Some(10)),
+    ("COPIED", Some(9)),
+    ("OK!", Some(10)),
+    ("OK!", Some(9)),
+    ("OK", Some(9)),
+    ("OK", Some(8)),
+];
+
+fn error_badge_is_compact(orientation: Orientation, bar_size: i32) -> bool {
+    if orientation == Orientation::Vertical {
+        bar_size < 36
+    } else {
+        bar_size < 30
+    }
+}
+
+fn error_badge_text_budget(orientation: Orientation, bar_size: i32) -> (i32, i32) {
+    let compact = error_badge_is_compact(orientation, bar_size);
+    if orientation == Orientation::Vertical {
+        let chrome_h = if compact { 6 } else { 12 };
+        ((bar_size - chrome_h - 2).max(1), i32::MAX)
+    } else {
+        let chrome_v = if compact { 4 } else { 10 };
+        (i32::MAX, (bar_size - chrome_v - 2).max(1))
+    }
+}
+
+fn format_badge_markup(text: &str, color: &str, font_size_px: Option<i32>) -> String {
+    match font_size_px {
+        None => format!(r##"<span foreground="{color}" weight="bold">{text}</span>"##),
+        Some(px) => {
+            let pango_units = px * 768;
+            format!(r##"<span foreground="{color}" weight="bold" size="{pango_units}">{text}</span>"##)
+        }
+    }
+}
+
+fn pick_fitting_badge_markup(label: &gtk::Label, orientation: Orientation, bar_size: i32, copied: bool) -> String {
+    let (max_w, max_h) = error_badge_text_budget(orientation, bar_size);
+    let (color, candidates) = if copied {
+        ("#55ff55", COPIED_CANDIDATES)
+    } else {
+        ("#ff3333", ERROR_CANDIDATES)
+    };
+    let layout = label.create_pango_layout(None);
+    let mut fallback = String::new();
+    for &(text, size_px) in candidates {
+        let markup = format_badge_markup(text, color, size_px);
+        layout.set_markup(&markup);
+        let (w, h) = layout.pixel_size();
+        if w <= max_w && h <= max_h {
+            return markup;
+        }
+        fallback = markup;
+    }
+    fallback
+}
 
 /// Self-contained live error indicator badge with black background and red text.
 ///
-/// Designed to be completely self-contained without needing any custom rules in
-/// the user's stylesheet. It displays in red `#ff3333` over a solid black `#000000`
-/// background, provides a hover tooltip with the exact error details, and copies
-/// the error to clipboard when clicked while temporarily displaying green "COPIED!".
+/// Adapts CSS padding, font scale, and label text to the bar's orientation
+/// and configured size so text and borders never overflow narrow vertical or
+/// thin horizontal bars.
 #[derive(Clone)]
 pub struct ErrorBadge {
     pub button: gtk::Button,
     pub label: gtk::Label,
     pub current_error: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    orientation: Orientation,
+    bar_size: i32,
 }
 
 // GTK objects are not `Sync`, so the once-flag is thread-local —
@@ -188,11 +300,35 @@ thread_local! {
 }
 
 impl ErrorBadge {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_for_bar(Orientation::Horizontal, 50)
+    }
+
+    pub fn new_for_bar(orientation: Orientation, bar_size: i32) -> Self {
         let current_error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
         let button = gtk::Button::new();
+        button.set_has_frame(false);
+        button.set_focusable(false);
         button.set_widget_name("bar-error-badge");
         button.add_css_class("clickable");
+        button.add_css_class(if orientation == Orientation::Vertical {
+            "vertical"
+        } else {
+            "horizontal"
+        });
+        if error_badge_is_compact(orientation, bar_size) {
+            button.add_css_class("compact");
+        }
+        if orientation == Orientation::Vertical {
+            button.set_halign(gtk::Align::Fill);
+            button.set_valign(gtk::Align::Center);
+            button.set_hexpand(true);
+        } else {
+            button.set_halign(gtk::Align::Center);
+            button.set_valign(gtk::Align::Fill);
+            button.set_vexpand(true);
+        }
         crate::modules::enable_hover_cursor(&button);
         button.set_visible(false);
 
@@ -215,7 +351,17 @@ impl ErrorBadge {
         });
 
         let label = gtk::Label::new(None);
-        label.set_markup(ERROR_LABEL_MARKUP);
+        label.set_justify(gtk::Justification::Center);
+        label.set_xalign(0.5);
+        label.set_yalign(0.5);
+        label.set_halign(gtk::Align::Fill);
+        label.set_valign(gtk::Align::Center);
+        label.set_hexpand(true);
+        label.set_single_line_mode(true);
+        if orientation == Orientation::Vertical {
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
+        label.set_markup(&pick_fitting_badge_markup(&label, orientation, bar_size, false));
         button.set_child(Some(&label));
 
         let err_clone = std::rc::Rc::clone(&current_error);
@@ -224,11 +370,11 @@ impl ErrorBadge {
             if let Some(err) = err_clone.borrow().as_ref() {
                 copy_to_clipboard(err);
                 if let Some(err_lbl) = err_lbl_weak.upgrade() {
-                    err_lbl.set_markup(ERROR_LABEL_COPIED_MARKUP);
+                    err_lbl.set_markup(&pick_fitting_badge_markup(&err_lbl, orientation, bar_size, true));
                     let lbl_weak = err_lbl.downgrade();
                     glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
                         if let Some(lbl) = lbl_weak.upgrade() {
-                            lbl.set_markup(ERROR_LABEL_MARKUP);
+                            lbl.set_markup(&pick_fitting_badge_markup(&lbl, orientation, bar_size, false));
                         }
                     });
                 }
@@ -239,13 +385,24 @@ impl ErrorBadge {
             button,
             label,
             current_error,
+            orientation,
+            bar_size,
         }
+    }
+
+    fn apply_markup(&self, copied: bool) {
+        self.label.set_markup(&pick_fitting_badge_markup(
+            &self.label,
+            self.orientation,
+            self.bar_size,
+            copied,
+        ));
     }
 
     /// Display error on badge with tooltip and red Pango markup.
     pub fn show_error(&self, error: &str) {
         *self.current_error.borrow_mut() = Some(error.to_string());
-        self.label.set_markup(ERROR_LABEL_MARKUP);
+        self.apply_markup(false);
         self.button
             .set_tooltip_text(Some(&format!("Click to copy error below:\n\n{error}")));
         self.button.set_visible(true);
@@ -254,7 +411,7 @@ impl ErrorBadge {
     /// Clear error badge when configuration or CSS is valid again.
     pub fn clear_error(&self) {
         *self.current_error.borrow_mut() = None;
-        self.label.set_markup(ERROR_LABEL_MARKUP);
+        self.apply_markup(false);
         self.button.set_visible(false);
     }
 }
@@ -406,7 +563,7 @@ impl BarWindow {
         populate_bar_section(&end_box, &config.modules.end_modules(), &section_ctx);
 
         // Live config / style error badge (black background, red text, self-contained without external CSS)
-        let error_badge = ErrorBadge::new();
+        let error_badge = ErrorBadge::new_for_bar(box_orient, config.size);
         end_box.append(&error_badge.button);
 
         window.set_visible(true);
@@ -649,6 +806,99 @@ mod tests {
             assert!(overlay.is_visible());
             assert!(start_box.is_visible());
             assert!(end_box.is_visible());
+        });
+    }
+
+    struct CssProviderGuard {
+        provider: gtk::CssProvider,
+    }
+
+    impl Drop for CssProviderGuard {
+        fn drop(&mut self) {
+            if let Some(display) = gdk::Display::default() {
+                gtk::style_context_remove_provider_for_display(&display, &self.provider);
+            }
+        }
+    }
+
+    #[test]
+    fn test_error_badge_fits_vertical_and_horizontal_bar_sizes() {
+        crate::util::run_gtk_test(|| {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(crate::style::DEFAULT_CSS);
+            if let Some(display) = gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+            }
+            let _guard = CssProviderGuard { provider };
+
+            for bar_size in [50, 40, 32, 24] {
+                let win = Window::new();
+                win.add_css_class("niri-bar");
+                win.add_css_class("vertical");
+                let bx = GtkBox::new(Orientation::Vertical, 0);
+                let badge = ErrorBadge::new_for_bar(Orientation::Vertical, bar_size);
+                bx.append(&badge.button);
+                win.set_child(Some(&bx));
+
+                badge.show_error("CSS syntax error");
+                let (min_req, nat_req) = badge.button.preferred_size();
+                assert!(
+                    min_req.width() <= bar_size && nat_req.width() <= bar_size,
+                    "Vertical {bar_size}px error badge overflowed: min={} nat={} text={:?}",
+                    min_req.width(),
+                    nat_req.width(),
+                    badge.label.text()
+                );
+                assert!(!badge.label.text().is_empty());
+
+                badge.apply_markup(true);
+                let (min_copied, nat_copied) = badge.button.preferred_size();
+                assert!(
+                    min_copied.width() <= bar_size && nat_copied.width() <= bar_size,
+                    "Vertical {bar_size}px copied badge overflowed: min={} nat={} text={:?}",
+                    min_copied.width(),
+                    nat_copied.width(),
+                    badge.label.text()
+                );
+                assert!(!badge.label.text().is_empty());
+
+                win.close();
+            }
+
+            for bar_size in [50, 28, 22] {
+                let win = Window::new();
+                win.add_css_class("niri-bar");
+                win.add_css_class("horizontal");
+                let bx = GtkBox::new(Orientation::Horizontal, 0);
+                let badge = ErrorBadge::new_for_bar(Orientation::Horizontal, bar_size);
+                bx.append(&badge.button);
+                win.set_child(Some(&bx));
+
+                badge.show_error("CSS syntax error");
+                let (min_req, nat_req) = badge.button.preferred_size();
+                assert!(
+                    min_req.height() <= bar_size && nat_req.height() <= bar_size,
+                    "Horizontal {bar_size}px error badge overflowed: min={} nat={} text={:?}",
+                    min_req.height(),
+                    nat_req.height(),
+                    badge.label.text()
+                );
+                if bar_size == 50 {
+                    assert_eq!(badge.label.text(), "ERROR");
+                }
+
+                badge.apply_markup(true);
+                let (min_copied, nat_copied) = badge.button.preferred_size();
+                assert!(
+                    min_copied.height() <= bar_size && nat_copied.height() <= bar_size,
+                    "Horizontal {bar_size}px copied badge overflowed: min={} nat={} text={:?}",
+                    min_copied.height(),
+                    nat_copied.height(),
+                    badge.label.text()
+                );
+
+                win.close();
+            }
         });
     }
 }

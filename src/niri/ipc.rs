@@ -185,25 +185,56 @@ pub async fn fetch_workspaces() -> Result<Vec<WorkspaceInfo>, String> {
     Ok(payload.workspaces.unwrap_or_default())
 }
 
-pub async fn open_event_stream() -> Result<tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>>, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+pub async fn open_event_stream() -> Result<tokio::io::BufReader<tokio::net::UnixStream>, String> {
+    use tokio::io::AsyncWriteExt;
 
     let socket_path = get_socket_path().ok_or_else(|| "NIRI_SOCKET environment variable not set".to_string())?;
-    let mut stream = tokio::net::UnixStream::connect(&socket_path)
-        .await
-        .map_err(|e| format!("Failed to connect to Niri socket at {}: {}", socket_path, e))?;
+    let stream = tokio::time::timeout(IPC_TIMEOUT, async {
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| format!("Failed to connect to Niri socket at {}: {}", socket_path, e))?;
 
-    stream
-        .write_all(b"\"EventStream\"\n")
-        .await
-        .map_err(|e| format!("Failed to send EventStream request to Niri socket: {}", e))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("Failed to flush Niri socket stream: {}", e))?;
+        stream
+            .write_all(b"\"EventStream\"\n")
+            .await
+            .map_err(|e| format!("Failed to send EventStream request to Niri socket: {}", e))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush Niri socket stream: {}", e))?;
+        Ok::<_, String>(stream)
+    })
+    .await
+    .map_err(|_| "Timed out opening Niri event stream".to_string())??;
 
-    let reader = tokio::io::BufReader::new(stream);
-    Ok(reader.lines())
+    Ok(tokio::io::BufReader::new(stream))
+}
+
+pub async fn read_event_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: u64,
+) -> Result<Option<()>, String> {
+    buf.clear();
+    let n = reader
+        .take(max_bytes)
+        .read_line(buf)
+        .await
+        .map_err(|e| format!("Failed to read Niri event: {e}"))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() >= max_bytes as usize && !buf.ends_with('\n') {
+        return Err(format!("Niri event line exceeds {max_bytes}-byte cap"));
+    }
+    Ok(Some(()))
+}
+
+pub async fn read_event_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+) -> Result<Option<()>, String> {
+    read_event_line_bounded(reader, buf, MAX_IPC_LINE).await
 }
 
 pub fn parse_event_line(line_str: &str) -> Option<Event> {
@@ -351,5 +382,24 @@ mod tests {
             assert_eq!(server.await.unwrap(), "\"Workspaces\"");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_event_line_bounded_enforces_cap_and_eof() {
+        crate::runtime::handle().block_on(async {
+            let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"{\"Other\":{}}\n".to_vec()));
+            let mut line = String::new();
+            assert_eq!(
+                read_event_line_bounded(&mut reader, &mut line, 1024).await,
+                Ok(Some(()))
+            );
+            assert_eq!(line, "{\"Other\":{}}\n");
+            assert_eq!(read_event_line_bounded(&mut reader, &mut line, 1024).await, Ok(None));
+
+            let huge = format!("{}\n", "x".repeat(256));
+            let mut huge_reader = tokio::io::BufReader::new(std::io::Cursor::new(huge.into_bytes()));
+            let res = read_event_line_bounded(&mut huge_reader, &mut line, 64).await;
+            assert!(res.is_err(), "Event line exceeding max_bytes cap must return Err");
+        });
     }
 }

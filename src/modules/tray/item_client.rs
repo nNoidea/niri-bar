@@ -207,21 +207,12 @@ async fn fetch_sni_icon_pixmap(
 }
 
 fn variant_str(opt: Option<&zbus::OwnedVariant>) -> Option<String> {
-    opt.and_then(|v| match v.deref() {
-        zbus::Variant::Str(s) => Some(s.as_str().to_string()),
-        zbus::Variant::ObjectPath(p) => Some(p.as_str().to_string()),
-        _ => None,
-    })
+    opt.and_then(|v| crate::modules::dbus_variant_str_or_path(v.deref()).map(str::to_string))
 }
 
 fn variant_is_menu(opt: Option<&zbus::OwnedVariant>) -> bool {
-    opt.and_then(|v| match v.deref() {
-        zbus::Variant::Bool(b) => Some(*b),
-        zbus::Variant::I32(i) => Some(*i != 0),
-        zbus::Variant::U32(u) => Some(*u != 0),
-        _ => None,
-    })
-    .unwrap_or(false)
+    opt.and_then(|v| crate::modules::dbus_variant_bool(v.deref()))
+        .unwrap_or(false)
 }
 
 fn normalize_menu_path(opt: Option<&zbus::OwnedVariant>) -> Option<String> {
@@ -267,7 +258,12 @@ fn assemble_tray_item(bus: &str, path: &str, props: RawSniProps) -> TrayItem {
     }
 }
 
-async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Option<(TrayItem, &'static str)> {
+async fn fetch_item_properties(
+    conn: &Connection,
+    bus: &str,
+    path: &str,
+    fetch_pixmap: bool,
+) -> Option<(TrayItem, &'static str)> {
     let kde_iface = "org.kde.StatusNotifierItem";
     let fdo_iface = "org.freedesktop.StatusNotifierItem";
 
@@ -288,7 +284,11 @@ async fn fetch_item_properties(conn: &Connection, bus: &str, path: &str) -> Opti
         dbus_get_property(conn, bus, path, iface, "Menu"),
     );
 
-    let icon_pixmap = fetch_sni_icon_pixmap(conn, bus, path, iface).await;
+    let icon_pixmap = if fetch_pixmap {
+        fetch_sni_icon_pixmap(conn, bus, path, iface).await
+    } else {
+        None
+    };
 
     let props = RawSniProps {
         id: id_val,
@@ -379,11 +379,46 @@ async fn signal_stream(
     proxy.receive_all_signals().await.ok()
 }
 
-async fn next_opt_signal(stream: Option<&mut zbus::proxy::SignalStream<'static>>) -> Option<zbus::Message> {
+#[derive(Debug, PartialEq, Eq)]
+enum ThreeStreamEvent<A, B, C> {
+    First(A),
+    Second(B),
+    Third(C),
+}
+
+async fn next_from_three_streams<S1, S2, S3>(
+    s1: &mut Option<S1>,
+    s2: &mut Option<S2>,
+    s3: &mut Option<S3>,
+) -> Option<ThreeStreamEvent<S1::Item, S2::Item, S3::Item>>
+where
+    S1: futures_util::Stream + Unpin,
+    S2: futures_util::Stream + Unpin,
+    S3: futures_util::Stream + Unpin,
+{
     use futures_util::StreamExt;
-    match stream {
-        Some(s) => s.next().await,
-        None => std::future::pending().await,
+    async fn next_opt<S: futures_util::Stream + Unpin>(opt: Option<&mut S>) -> Option<S::Item> {
+        match opt {
+            Some(s) => s.next().await,
+            None => std::future::pending().await,
+        }
+    }
+    loop {
+        tokio::select! {
+            res = next_opt(s1.as_mut()), if s1.is_some() => match res {
+                Some(v) => return Some(ThreeStreamEvent::First(v)),
+                None => *s1 = None,
+            },
+            res = next_opt(s2.as_mut()), if s2.is_some() => match res {
+                Some(v) => return Some(ThreeStreamEvent::Second(v)),
+                None => *s2 = None,
+            },
+            res = next_opt(s3.as_mut()), if s3.is_some() => match res {
+                Some(v) => return Some(ThreeStreamEvent::Third(v)),
+                None => *s3 = None,
+            },
+            else => return None,
+        }
     }
 }
 
@@ -405,12 +440,52 @@ async fn refresh_item_and_broadcast(
     key: &str,
     items_map: &Arc<Mutex<TrayItemMap>>,
     subs_map: &Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>>,
-) {
-    let Some((fresh_item, _)) = fetch_item_properties(conn, bus, path).await else {
-        return;
-    };
+    fetch_pixmap: bool,
+) -> Option<TrayItem> {
+    let (mut fresh_item, _) = fetch_item_properties(conn, bus, path, fetch_pixmap).await?;
+    if !fetch_pixmap {
+        let guard = crate::util::lock(items_map);
+        if let Some((existing, _)) = guard.get(key) {
+            fresh_item.icon_pixmap.clone_from(&existing.icon_pixmap);
+        }
+    }
     apply_refreshed_item(items_map, key, &fresh_item);
-    TrayService::broadcast(subs_map, TrayEvent::Update(key.to_string(), Box::new(fresh_item)));
+    TrayService::broadcast(
+        subs_map,
+        TrayEvent::Update(key.to_string(), Box::new(fresh_item.clone())),
+    );
+    Some(fresh_item)
+}
+
+async fn sync_menu_stream_if_changed(
+    conn: &Connection,
+    bus_name: &str,
+    key: &str,
+    items_map: &Arc<Mutex<TrayItemMap>>,
+    current_menu_path: &mut Option<String>,
+    stream_menu: &mut Option<zbus::proxy::SignalStream<'static>>,
+    new_menu_path: Option<String>,
+) {
+    if new_menu_path == *current_menu_path {
+        return;
+    }
+    *current_menu_path = new_menu_path;
+    match current_menu_path {
+        Some(m_path) => {
+            *stream_menu = signal_stream(conn, bus_name, m_path, "com.canonical.dbusmenu").await;
+            if let Some(fresh_menu) = fetch_menu_layout(conn, bus_name, m_path).await {
+                if let Some((_, m)) = crate::util::lock(items_map).get_mut(key) {
+                    *m = Some(fresh_menu);
+                }
+            }
+        }
+        None => {
+            *stream_menu = None;
+            if let Some((_, m)) = crate::util::lock(items_map).get_mut(key) {
+                *m = None;
+            }
+        }
+    }
 }
 
 pub(super) async fn process_and_track_item(
@@ -422,7 +497,7 @@ pub(super) async fn process_and_track_item(
     subs_map: Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>>,
     registered_items: Arc<Mutex<HashSet<String>>>,
 ) {
-    let Some((item, sni_iface)) = fetch_item_properties(&conn, &bus_name, &object_path).await else {
+    let Some((item, sni_iface)) = fetch_item_properties(&conn, &bus_name, &object_path, true).await else {
         log_debug!("tray", "Ignoring unreachable or disconnected tray item: {key}");
         crate::util::lock(&registered_items).remove(&key);
         return;
@@ -451,32 +526,69 @@ pub(super) async fn process_and_track_item(
         item.menu_path
     );
 
+    let mut current_menu_path = item.menu_path.clone();
     crate::util::lock(&items_map).insert(key.clone(), (item.clone(), menu));
     TrayService::broadcast(&subs_map, TrayEvent::Add(key.clone(), Box::new(item.clone())));
 
     let mut stream_sni = signal_stream(&conn, &bus_name, &object_path, sni_iface).await;
     let mut stream_props = signal_stream(&conn, &bus_name, &object_path, "org.freedesktop.DBus.Properties").await;
-    let mut stream_menu = if let Some(ref m_path) = item.menu_path {
+    let mut stream_menu = if let Some(ref m_path) = current_menu_path {
         signal_stream(&conn, &bus_name, m_path, "com.canonical.dbusmenu").await
     } else {
         None
     };
 
-    loop {
-        tokio::select! {
-            Some(msg) = next_opt_signal(stream_sni.as_mut()) => {
+    while let Some(ev) = next_from_three_streams(&mut stream_sni, &mut stream_props, &mut stream_menu).await {
+        match ev {
+            ThreeStreamEvent::First(msg) => {
                 let hdr = msg.header();
                 let member = hdr.member().map(|m| m.as_str()).unwrap_or("");
                 log_debug!("tray", "Received SNI signal '{member}' for item {key}");
-                refresh_item_and_broadcast(&conn, &bus_name, &object_path, &key, &items_map, &subs_map).await;
-            }
-            Some(msg) = next_opt_signal(stream_props.as_mut()) => {
-                if msg.header().member().is_some_and(|m| m.as_str() == "PropertiesChanged") {
-                    log_debug!("tray", "Received PropertiesChanged for item {key}");
-                    refresh_item_and_broadcast(&conn, &bus_name, &object_path, &key, &items_map, &subs_map).await;
+                let fetch_pixmap = !matches!(member, "NewTitle" | "NewToolTip");
+                if let Some(fresh) = refresh_item_and_broadcast(
+                    &conn,
+                    &bus_name,
+                    &object_path,
+                    &key,
+                    &items_map,
+                    &subs_map,
+                    fetch_pixmap,
+                )
+                .await
+                {
+                    sync_menu_stream_if_changed(
+                        &conn,
+                        &bus_name,
+                        &key,
+                        &items_map,
+                        &mut current_menu_path,
+                        &mut stream_menu,
+                        fresh.menu_path,
+                    )
+                    .await;
                 }
             }
-            Some(msg) = next_opt_signal(stream_menu.as_mut()) => {
+            ThreeStreamEvent::Second(msg) => {
+                if msg.header().member().is_some_and(|m| m.as_str() == "PropertiesChanged") {
+                    log_debug!("tray", "Received PropertiesChanged for item {key}");
+                    if let Some(fresh) =
+                        refresh_item_and_broadcast(&conn, &bus_name, &object_path, &key, &items_map, &subs_map, true)
+                            .await
+                    {
+                        sync_menu_stream_if_changed(
+                            &conn,
+                            &bus_name,
+                            &key,
+                            &items_map,
+                            &mut current_menu_path,
+                            &mut stream_menu,
+                            fresh.menu_path,
+                        )
+                        .await;
+                    }
+                }
+            }
+            ThreeStreamEvent::Third(msg) => {
                 let hdr = msg.header();
                 let member = hdr.member().map(|m| m.as_str()).unwrap_or("");
                 if is_menu_layout_signal(member) {
@@ -510,7 +622,6 @@ pub(super) async fn process_and_track_item(
                     }
                 }
             }
-            else => break,
         }
     }
 }
@@ -685,5 +796,90 @@ mod tests {
                 "Disconnected peer must not broadcast TrayEvent::Add"
             );
         });
+    }
+
+    struct CountingEmptyStream {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl futures_util::Stream for CountingEmptyStream {
+        type Item = u8;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    #[test]
+    fn test_stream_loop_exits_when_optional_stream_is_none_and_active_streams_end() {
+        crate::runtime::handle().block_on(async {
+            let mut s1 = Some(futures_util::stream::iter(vec![1u8]));
+            let mut s2 = Some(futures_util::stream::iter(Vec::<u8>::new()));
+            let mut s3: Option<futures_util::stream::Iter<std::vec::IntoIter<u8>>> = None;
+
+            let mut received = Vec::new();
+            let res = tokio::time::timeout(Duration::from_millis(200), async {
+                while let Some(ev) = next_from_three_streams(&mut s1, &mut s2, &mut s3).await {
+                    received.push(ev);
+                }
+            })
+            .await;
+
+            assert!(
+                res.is_ok(),
+                "Stream loop must exit once active streams end even when s3 is None"
+            );
+            assert_eq!(received, vec![ThreeStreamEvent::First(1)]);
+        });
+    }
+
+    #[test]
+    fn test_stream_loop_does_not_repoll_exhausted_stream() {
+        crate::runtime::handle().block_on(async {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut s1 = Some(CountingEmptyStream {
+                polls: Arc::clone(&polls),
+            });
+            let (tx2, rx2) = async_channel::unbounded::<u8>();
+            let mut s2 = Some(Box::pin(rx2));
+            let mut s3: Option<CountingEmptyStream> = None;
+
+            tx2.send(10).await.unwrap();
+            tx2.send(20).await.unwrap();
+            tx2.close();
+
+            let mut received = Vec::new();
+            let res = tokio::time::timeout(Duration::from_millis(200), async {
+                while let Some(ev) = next_from_three_streams(&mut s1, &mut s2, &mut s3).await {
+                    if let ThreeStreamEvent::Second(v) = ev {
+                        received.push(v);
+                    }
+                }
+            })
+            .await;
+
+            assert!(res.is_ok(), "Stream loop must exit once all streams terminate");
+            assert_eq!(received, vec![10, 20]);
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "Exhausted stream must be cleared and polled only once"
+            );
+        });
+    }
+
+    #[test]
+    fn test_variant_extractors_unwrap_nested_variants() {
+        let nested_str =
+            zbus::OwnedVariant::try_from(zbus::Variant::Variant(Box::new(zbus::Variant::from("nested-icon")))).unwrap();
+        assert_eq!(variant_str(Some(&nested_str)).as_deref(), Some("nested-icon"));
+
+        let nested_bool =
+            zbus::OwnedVariant::try_from(zbus::Variant::Variant(Box::new(zbus::Variant::from(true)))).unwrap();
+        assert!(variant_is_menu(Some(&nested_bool)));
     }
 }

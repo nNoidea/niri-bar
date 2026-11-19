@@ -99,9 +99,14 @@ fn check_file_with(
 
 fn check_config_and_css_in(dir: &std::path::Path) -> bool {
     // Same parser as startup/live-reload (per-section fallback +
-    // validation), so `--check` agrees with the running bar.
+    // validation), and treat any config warnings as validation errors.
     let cfg_ok = check_file_with("config", &dir.join("config.toml"), "defaults would be used", |s| {
-        crate::config::reload_config_from_str(s).map(|_| ())
+        let (_cfg, warnings) = crate::config::reload_config_from_str_with_warnings(s)?;
+        if warnings.is_empty() {
+            Ok(())
+        } else {
+            Err(warnings.join("; "))
+        }
     });
     let css_ok = check_file_with(
         "css",
@@ -170,11 +175,7 @@ fn ensure_single_instance() -> bool {
 }
 
 fn register_embedded_font() {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")));
-
-    if let Ok(data_dir) = data_home {
+    if let Some(data_dir) = crate::util::xdg_data_home() {
         let font_dir = data_dir.join("fonts/niri-bar");
         let font_path = font_dir.join("NerdFont-Regular.ttf");
 
@@ -336,26 +337,30 @@ fn main() {
     let mut _file_monitor = None;
 
     let main_loop = glib::MainLoop::new(None, false);
+    spawn_shutdown_signal_handler(&main_loop);
 
-    if let Some(display) = gdk::Display::default() {
-        let ctx = ReconcileCtx {
-            display: display.clone(),
-            bars: Rc::clone(&bars),
-            config: Rc::clone(&config),
-            niri: Arc::clone(&niri),
-            tray_service: Rc::clone(&tray_service),
-            modules: Rc::clone(&modules),
-            gate: ReconcileGate::default(),
-            active_error: Rc::clone(&active_error),
-        };
+    let Some(display) = gdk::Display::default() else {
+        log_error!("startup", "No default GDK display available; exiting.");
+        eprintln!("\x1b[1;31merror:\x1b[0m No Wayland/GDK display available.");
+        std::process::exit(1);
+    };
 
-        let schedule_reconcile = make_reconcile_scheduler(&ctx);
-        schedule_reconcile();
-        _file_monitor = setup_file_watcher(ctx, Rc::clone(&schedule_reconcile));
-        connect_monitor_and_sleep_signals(&display, &niri, &schedule_reconcile);
-        spawn_shutdown_signal_handler(&main_loop);
-        spawn_niri_update_loop(&bars, &niri, &config, &schedule_reconcile);
-    }
+    let ctx = ReconcileCtx {
+        display: display.clone(),
+        bars: Rc::clone(&bars),
+        config: Rc::clone(&config),
+        niri: Arc::clone(&niri),
+        tray_service: Rc::clone(&tray_service),
+        modules: Rc::clone(&modules),
+        gate: ReconcileGate::default(),
+        active_error: Rc::clone(&active_error),
+    };
+
+    let schedule_reconcile = make_reconcile_scheduler(&ctx);
+    schedule_reconcile();
+    _file_monitor = setup_file_watcher(ctx, Rc::clone(&schedule_reconcile));
+    connect_monitor_and_sleep_signals(&display, &niri, &schedule_reconcile);
+    spawn_niri_update_loop(&bars, &niri, &config, &schedule_reconcile);
 
     main_loop.run();
 
@@ -587,6 +592,22 @@ mod tests {
             std::fs::write(tmp.join("style.css"), "button { unknown-gtk-property: 123px; }\n")
                 .expect("write bad gtk css");
             assert!(!check_config_and_css_in(&tmp));
+
+            // Restore valid CSS, test config warnings fail --check
+            std::fs::write(tmp.join("style.css"), "button { color: #ffffff; }\n").expect("write css");
+            for bad_cfg in [
+                "positon = \"left\"\n",
+                "position = \"centre\"\n",
+                "[clock]\nformat_vertical = \"%Q\"\n",
+                "[modules]\nend = [\"clok\"]\n",
+                "spacing = -1\n",
+            ] {
+                std::fs::write(tmp.join("config.toml"), bad_cfg).expect("write warning cfg");
+                assert!(
+                    !check_config_and_css_in(&tmp),
+                    "expected --check to fail on config warning: {bad_cfg}"
+                );
+            }
 
             let _ = std::fs::remove_dir_all(&tmp);
         });

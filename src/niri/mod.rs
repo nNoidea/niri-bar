@@ -138,7 +138,9 @@ fn spawn_initial_fetch_task(
         let outputs = ok_logged(ipc::fetch_outputs().await, "Initial outputs fetch failed");
         let windows = ok_logged(ipc::fetch_windows().await, "Initial windows fetch failed");
         if let Some(ref wins) = windows {
-            crate::icon::warm_window_icons_off_thread(wins);
+            let wins_clone = wins.clone();
+            let _ =
+                crate::runtime::spawn_blocking(move || crate::icon::warm_window_icons_off_thread(&wins_clone)).await;
         }
         let workspaces = ok_logged(ipc::fetch_workspaces().await, "Initial workspaces fetch failed");
 
@@ -180,11 +182,12 @@ async fn process_ipc_event(
         );
 
         let mut st = crate::util::lock(state);
-        if let Some(outs) = outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs) {
-            st.outputs = outs;
-        }
+        let effective_outputs = outputs.clone().filter(|o| !o.is_empty()).or(fetched_outputs);
+        st.apply_event(Event::OutputsChanged {
+            outputs: effective_outputs,
+        });
         if let Some(wspaces) = fetched_workspaces {
-            st.workspaces = wspaces;
+            st.apply_event(Event::WorkspacesChanged { workspaces: wspaces });
         }
         drop(st);
         crate::util::nudge(update_tx);
@@ -192,15 +195,34 @@ async fn process_ipc_event(
     }
 
     match &event {
-        Event::WindowsChanged { windows } => crate::icon::warm_window_icons_off_thread(windows),
+        Event::WindowsChanged { windows } => {
+            let wins = windows.clone();
+            let _ = crate::runtime::spawn_blocking(move || crate::icon::warm_window_icons_off_thread(&wins)).await;
+        }
         Event::WindowOpenedOrChanged { window } => {
-            crate::icon::warm_window_icons_off_thread(std::slice::from_ref(window));
+            let win = window.clone();
+            let _ = crate::runtime::spawn_blocking(move || {
+                crate::icon::warm_window_icons_off_thread(std::slice::from_ref(&win));
+            })
+            .await;
         }
         _ => {}
     }
 
     if apply_state_event_with_drag(state, drag, event) {
         crate::util::nudge(update_tx);
+    }
+}
+
+/// Race-free shutdown waiter: registers on `stop_notify` before checking `running`.
+pub(crate) async fn wait_stopped(running: &AtomicBool, stop_notify: &tokio::sync::Notify) {
+    let notified = stop_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    while running.load(Ordering::SeqCst) {
+        notified.as_mut().await;
+        notified.set(stop_notify.notified());
+        notified.as_mut().enable();
     }
 }
 
@@ -212,20 +234,25 @@ fn spawn_ipc_listener_task(
     stop_notify: Arc<tokio::sync::Notify>,
 ) {
     crate::runtime::spawn(async move {
+        let mut line_buf = String::new();
         while running.load(Ordering::SeqCst) {
             log_info!("niri", "Starting Niri IPC event listener loop");
-            match ipc::open_event_stream().await {
-                Ok(mut lines) => loop {
+            let open_res = tokio::select! {
+                _ = wait_stopped(&running, &stop_notify) => break,
+                res = ipc::open_event_stream() => res,
+            };
+            match open_res {
+                Ok(mut reader) => loop {
                     if !running.load(Ordering::SeqCst) {
                         break;
                     }
                     let line_res = tokio::select! {
-                        _ = stop_notify.notified() => break,
-                        res = lines.next_line() => res,
+                        _ = wait_stopped(&running, &stop_notify) => break,
+                        res = ipc::read_event_line(&mut reader, &mut line_buf) => res,
                     };
                     match line_res {
-                        Ok(Some(line_str)) => {
-                            let Some(event) = ipc::parse_event_line(&line_str) else {
+                        Ok(Some(())) => {
+                            let Some(event) = ipc::parse_event_line(&line_buf) else {
                                 continue;
                             };
                             if !running.load(Ordering::SeqCst) {
@@ -252,7 +279,7 @@ fn spawn_ipc_listener_task(
                 break;
             }
             tokio::select! {
-                _ = stop_notify.notified() => break,
+                _ = wait_stopped(&running, &stop_notify) => break,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
@@ -902,5 +929,38 @@ mod tests {
 
         let active_map = crate::niri::taskbar::active_workspace_per_output(&state.workspaces);
         assert_eq!(active_map.get("eDP-1"), Some(&2));
+    }
+
+    #[test]
+    fn test_niri_listener_shutdown_does_not_lose_wakeup_between_check_and_select() {
+        crate::runtime::handle().block_on(async {
+            let running = AtomicBool::new(true);
+            let stop_notify = tokio::sync::Notify::new();
+
+            // Simulate Drop firing right after `if !running.load()` checked true,
+            // before `tokio::select!` starts polling.
+            let before_select_running = running.load(Ordering::SeqCst);
+            assert!(before_select_running);
+            running.store(false, Ordering::SeqCst);
+            stop_notify.notify_waiters();
+
+            let (_rd_end, _wr_end) = tokio::net::UnixStream::pair().unwrap();
+            let mut reader = tokio::io::BufReader::new(_rd_end);
+            let mut line = String::new();
+
+            let res = tokio::time::timeout(Duration::from_millis(150), async {
+                tokio::select! {
+                    _ = wait_stopped(&running, &stop_notify) => true,
+                    _ = ipc::read_event_line_bounded(&mut reader, &mut line, 1024) => false,
+                }
+            })
+            .await;
+
+            assert_eq!(
+                res,
+                Ok(true),
+                "Listener select must exit immediately when stopped before polling select!"
+            );
+        });
     }
 }

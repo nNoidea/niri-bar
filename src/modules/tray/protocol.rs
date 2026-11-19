@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 use super::types::{MenuItem, ToggleType, TrayIconPixmap, TrayTooltip};
+use crate::modules::{dbus_variant_bool, dbus_variant_i32, dbus_variant_str};
+use crate::util::truncate_str;
 
 pub fn parse_item_address(service: &str, sender_opt: Option<&str>) -> (String, String, String) {
     let s = service.trim();
@@ -160,14 +162,6 @@ pub fn parse_icon_pixmap_dbus_body(data: &[u8], is_le: bool) -> Option<Vec<TrayI
     }])
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
-
 pub fn parse_tooltip(val: &zbus::Variant<'_>) -> Option<TrayTooltip> {
     const MAX_TOOLTIP: usize = 512;
     match val {
@@ -176,12 +170,12 @@ pub fn parse_tooltip(val: &zbus::Variant<'_>) -> Option<TrayTooltip> {
             let fields = s.fields();
             let title = fields
                 .get(2)
-                .and_then(extract_val_str)
+                .and_then(dbus_variant_str)
                 .map(|st| truncate_str(st, MAX_TOOLTIP))
                 .unwrap_or_default();
             let description = fields
                 .get(3)
-                .and_then(extract_val_str)
+                .and_then(dbus_variant_str)
                 .map(|st| truncate_str(st, MAX_TOOLTIP))
                 .unwrap_or_default();
             Some(TrayTooltip { title, description })
@@ -193,34 +187,6 @@ pub fn parse_tooltip(val: &zbus::Variant<'_>) -> Option<TrayTooltip> {
                 description: text,
             })
         }
-        _ => None,
-    }
-}
-
-fn extract_val_str<'a>(val: &'a zbus::Variant<'a>) -> Option<&'a str> {
-    match val {
-        zbus::Variant::Str(s) => Some(s.as_str()),
-        zbus::Variant::Variant(inner) => extract_val_str(inner),
-        _ => None,
-    }
-}
-
-fn extract_val_bool(val: &zbus::Variant<'_>) -> Option<bool> {
-    match val {
-        zbus::Variant::Bool(b) => Some(*b),
-        zbus::Variant::I32(i) => Some(*i != 0),
-        zbus::Variant::U32(u) => Some(*u != 0),
-        zbus::Variant::Variant(inner) => extract_val_bool(inner),
-        _ => None,
-    }
-}
-
-fn extract_val_i32(val: &zbus::Variant<'_>) -> Option<i32> {
-    match val {
-        zbus::Variant::I32(i) => Some(*i),
-        zbus::Variant::U32(u) => Some(*u as i32),
-        zbus::Variant::Bool(b) => Some(if *b { 1 } else { 0 }),
-        zbus::Variant::Variant(inner) => extract_val_i32(inner),
         _ => None,
     }
 }
@@ -243,27 +209,27 @@ fn build_menu_item<'a>(
 
     for (k, v) in props_iter {
         match k {
-            "label" => label = extract_val_str(v).map(|s| truncate_str(s, MAX_LABEL_LEN)),
-            "type" => is_separator = extract_val_str(v) == Some("separator"),
+            "label" => label = dbus_variant_str(v).map(|s| truncate_str(s, MAX_LABEL_LEN)),
+            "type" => is_separator = dbus_variant_str(v) == Some("separator"),
             "enabled" => {
-                if let Some(b) = extract_val_bool(v) {
+                if let Some(b) = dbus_variant_bool(v) {
                     enabled = b;
                 }
             }
             "visible" => {
-                if let Some(b) = extract_val_bool(v) {
+                if let Some(b) = dbus_variant_bool(v) {
                     visible = b;
                 }
             }
             "toggle-type" => {
-                toggle_type = match extract_val_str(v) {
+                toggle_type = match dbus_variant_str(v) {
                     Some("checkmark") => Some(ToggleType::Checkmark),
                     Some("radio") => Some(ToggleType::Radio),
                     _ => None,
                 };
             }
             "toggle-state" => {
-                if let Some(s) = extract_val_i32(v) {
+                if let Some(s) = dbus_variant_i32(v) {
                     toggle_state = s;
                 }
             }
@@ -288,7 +254,7 @@ fn parse_menu_variant(val: &zbus::Variant<'_>, depth: u8) -> Option<MenuItem> {
         zbus::Variant::Variant(inner) => parse_menu_variant(inner, depth),
         zbus::Variant::Structure(s) => {
             let fields = s.fields();
-            let id = extract_val_i32(fields.first()?)?;
+            let id = dbus_variant_i32(fields.first()?)?;
             let props_iter = fields
                 .get(1)
                 .into_iter()
@@ -333,11 +299,22 @@ pub fn parse_dbusmenu_tuple(
     build_menu_item(id, props.iter().map(|(k, v)| (k.as_str(), v.deref())), submenu)
 }
 
-/// Strip DBusMenu mnemonic underscores (`_Preferences` → `Preferences`)
-/// and surrounding whitespace. Used by the GTK menu builder so labels
-/// render without mnemonics and duplicates collapse.
+/// Strip DBusMenu mnemonic underscores (`_Preferences` → `Preferences`,
+/// escaped `__` → `_`) and surrounding whitespace.
 pub fn clean_menu_label(raw: &str) -> String {
-    raw.replace('_', "").trim().to_string()
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            if chars.peek() == Some(&'_') {
+                chars.next();
+                out.push('_');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 #[cfg(test)]
@@ -456,7 +433,8 @@ mod tests {
     #[test]
     fn test_clean_menu_label() {
         assert_eq!(clean_menu_label("_Preferences..."), "Preferences...");
-        assert_eq!(clean_menu_label("__Double__Under__"), "DoubleUnder");
+        assert_eq!(clean_menu_label("__Double__Under__"), "_Double_Under_");
+        assert_eq!(clean_menu_label("my__file_name"), "my_filename");
         assert_eq!(clean_menu_label("  _File_  "), "File");
         assert_eq!(clean_menu_label("_"), "");
     }

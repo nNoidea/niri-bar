@@ -1,9 +1,12 @@
 use pulseaudio::protocol::{self, Prop, Props, SubscriptionMask};
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{SinkInfo, VolumeModule};
+
+const PULSE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PulseAction {
@@ -17,6 +20,9 @@ pub(super) struct PulseSession {
     protocol_version: u16,
     seq: u32,
     buf: Vec<u8>,
+    rx_buf: Vec<u8>,
+    rx_filled: usize,
+    rx_target: usize,
     pub(super) pending_event: bool,
     default_sink_name: Option<CString>,
     default_channels: u8,
@@ -29,6 +35,9 @@ impl PulseSession {
             protocol_version: protocol::MAX_VERSION,
             seq: 0,
             buf: Vec::with_capacity(4096),
+            rx_buf: vec![0u8; protocol::DESCRIPTOR_SIZE],
+            rx_filled: 0,
+            rx_target: protocol::DESCRIPTOR_SIZE,
             pending_event: false,
             default_sink_name: None,
             default_channels: 2,
@@ -73,50 +82,87 @@ impl PulseSession {
         self.seq = self.seq.wrapping_add(1);
         self.buf.clear();
         protocol::write_command_message(&mut self.buf, seq, cmd, self.protocol_version).map_err(|e| e.to_string())?;
-        self.stream.write_all(&self.buf).await.map_err(|e| e.to_string())?;
+        tokio::time::timeout(PULSE_IO_TIMEOUT, self.stream.write_all(&self.buf))
+            .await
+            .map_err(|_| "PulseAudio write timed out".to_string())?
+            .map_err(|e| e.to_string())?;
         Ok(seq)
     }
 
+    /// Cancel-safe frame reader: preserves partial header/payload bytes in `rx_buf`
+    /// across `tokio::select!` cancellations so interleaved user commands never
+    /// desynchronize PulseAudio packet framing.
     pub(super) async fn read_next_frame(&mut self) -> Result<(), String> {
-        let mut hdr = [0u8; protocol::DESCRIPTOR_SIZE];
-        self.stream.read_exact(&mut hdr).await.map_err(|e| e.to_string())?;
-        let desc = protocol::read_descriptor(&mut &hdr[..]).map_err(|e| e.to_string())?;
-        let len = desc.length as usize;
-        if len > protocol::MAX_MEMBLOCKQ_LENGTH {
-            return Err(format!("PulseAudio frame too large: {len} bytes"));
+        while self.rx_filled < protocol::DESCRIPTOR_SIZE {
+            let n = self
+                .stream
+                .read(&mut self.rx_buf[self.rx_filled..protocol::DESCRIPTOR_SIZE])
+                .await
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("PulseAudio stream closed (EOF)".to_string());
+            }
+            self.rx_filled += n;
         }
+
+        if self.rx_target == protocol::DESCRIPTOR_SIZE {
+            let desc =
+                protocol::read_descriptor(&mut &self.rx_buf[..protocol::DESCRIPTOR_SIZE]).map_err(|e| e.to_string())?;
+            let len = desc.length as usize;
+            if len > protocol::MAX_MEMBLOCKQ_LENGTH {
+                return Err(format!("PulseAudio frame too large: {len} bytes"));
+            }
+            self.rx_target = protocol::DESCRIPTOR_SIZE + len;
+            if self.rx_buf.len() < self.rx_target {
+                self.rx_buf.resize(self.rx_target, 0);
+            }
+        }
+
+        while self.rx_filled < self.rx_target {
+            let n = self
+                .stream
+                .read(&mut self.rx_buf[self.rx_filled..self.rx_target])
+                .await
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("PulseAudio stream closed (EOF)".to_string());
+            }
+            self.rx_filled += n;
+        }
+
         self.buf.clear();
-        self.buf.reserve(protocol::DESCRIPTOR_SIZE + len);
-        self.buf.extend_from_slice(&hdr);
-        self.buf.resize(protocol::DESCRIPTOR_SIZE + len, 0);
-        self.stream
-            .read_exact(&mut self.buf[protocol::DESCRIPTOR_SIZE..])
-            .await
-            .map_err(|e| e.to_string())?;
+        self.buf.extend_from_slice(&self.rx_buf[..self.rx_target]);
+        self.rx_filled = 0;
+        self.rx_target = protocol::DESCRIPTOR_SIZE;
+        self.rx_buf.resize(protocol::DESCRIPTOR_SIZE, 0);
         Ok(())
     }
 
     async fn wait_for_reply_frame(&mut self, expected_seq: u32) -> Result<(), String> {
-        loop {
-            self.read_next_frame().await?;
-            let mut payload = &self.buf[protocol::DESCRIPTOR_SIZE..];
-            let mut ts = protocol::TagStructReader::new(&mut payload, self.protocol_version);
-            let cmd_tag: protocol::CommandTag = ts.read_enum().map_err(|e| e.to_string())?;
-            let seq = ts.read_u32().map_err(|e| e.to_string())?;
-            match cmd_tag {
-                protocol::CommandTag::SubscribeEvent => {
-                    self.pending_event = true;
-                }
-                protocol::CommandTag::Reply if seq == expected_seq => return Ok(()),
-                protocol::CommandTag::Error if seq == expected_seq => {
-                    let err: protocol::PulseError = ts.read_enum().map_err(|e| e.to_string())?;
-                    return Err(format!("PulseAudio server error: {err}"));
-                }
-                other => {
-                    log_debug!("volume", "Ignoring PulseAudio frame {other:?} (seq {seq})");
+        tokio::time::timeout(PULSE_IO_TIMEOUT, async {
+            loop {
+                self.read_next_frame().await?;
+                let mut payload = &self.buf[protocol::DESCRIPTOR_SIZE..];
+                let mut ts = protocol::TagStructReader::new(&mut payload, self.protocol_version);
+                let cmd_tag: protocol::CommandTag = ts.read_enum().map_err(|e| e.to_string())?;
+                let seq = ts.read_u32().map_err(|e| e.to_string())?;
+                match cmd_tag {
+                    protocol::CommandTag::SubscribeEvent => {
+                        self.pending_event = true;
+                    }
+                    protocol::CommandTag::Reply if seq == expected_seq => return Ok(()),
+                    protocol::CommandTag::Error if seq == expected_seq => {
+                        let err: protocol::PulseError = ts.read_enum().map_err(|e| e.to_string())?;
+                        return Err(format!("PulseAudio server error: {err}"));
+                    }
+                    other => {
+                        log_debug!("volume", "Ignoring PulseAudio frame {other:?} (seq {seq})");
+                    }
                 }
             }
-        }
+        })
+        .await
+        .map_err(|_| "PulseAudio reply timed out".to_string())?
     }
 
     async fn wait_for_ack(&mut self, expected_seq: u32) -> Result<(), String> {
@@ -509,6 +555,124 @@ mod tests {
             assert_eq!(sink.description, "Built-in Speaker");
             assert_eq!(sink.sink_type, SinkType::Speaker);
             server_task.await.expect("server task finishes cleanly");
+        });
+    }
+
+    #[test]
+    fn test_read_next_frame_is_cancel_safe_across_partial_reads() {
+        crate::runtime::handle().block_on(async move {
+            let (client_sock, mut server_sock) = tokio::net::UnixStream::pair().unwrap();
+
+            let server_task = crate::runtime::spawn(async move {
+                let ver = protocol::MAX_VERSION;
+                let mut hdr = [0u8; protocol::DESCRIPTOR_SIZE];
+                let mut buf = Vec::new();
+                let mut out = Vec::new();
+
+                // Auth, SetClientName, Subscribe
+                for step in 0..3 {
+                    server_sock.read_exact(&mut hdr).await.unwrap();
+                    let desc = protocol::read_descriptor(&mut &hdr[..]).unwrap();
+                    buf.resize(protocol::DESCRIPTOR_SIZE + desc.length as usize, 0);
+                    buf[..protocol::DESCRIPTOR_SIZE].copy_from_slice(&hdr);
+                    server_sock
+                        .read_exact(&mut buf[protocol::DESCRIPTOR_SIZE..])
+                        .await
+                        .unwrap();
+                    let (seq, _) = protocol::read_command_message(&mut &buf[..], ver).unwrap();
+                    out.clear();
+                    match step {
+                        0 => protocol::write_reply_message(
+                            &mut out,
+                            seq,
+                            &protocol::AuthReply {
+                                version: ver,
+                                use_shm: false,
+                                use_memfd: false,
+                            },
+                            ver,
+                        )
+                        .unwrap(),
+                        1 => protocol::write_reply_message(
+                            &mut out,
+                            seq,
+                            &protocol::SetClientNameReply { client_id: 1 },
+                            ver,
+                        )
+                        .unwrap(),
+                        _ => protocol::write_ack_message(&mut out, seq).unwrap(),
+                    }
+                    server_sock.write_all(&out).await.unwrap();
+                }
+
+                // Send first 8 bytes of a SubscribeEvent frame so read_next_frame starts reading,
+                // gets cancelled inside select!, then finishes after delay.
+                let mut sub_evt = Vec::new();
+                protocol::write_command_message(
+                    &mut sub_evt,
+                    u32::MAX,
+                    &protocol::Command::SubscribeEvent(protocol::SubscriptionEvent {
+                        event_facility: protocol::SubscriptionEventFacility::Sink,
+                        event_type: protocol::SubscriptionEventType::Changed,
+                        index: Some(1),
+                    }),
+                    ver,
+                )
+                .unwrap();
+                server_sock.write_all(&sub_evt[..8]).await.unwrap();
+                server_sock.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                server_sock.write_all(&sub_evt[8..]).await.unwrap();
+                server_sock.flush().await.unwrap();
+
+                // Now serve GetServerInfo and GetSinkInfoList
+                for _ in 0..2 {
+                    server_sock.read_exact(&mut hdr).await.unwrap();
+                    let desc = protocol::read_descriptor(&mut &hdr[..]).unwrap();
+                    buf.resize(protocol::DESCRIPTOR_SIZE + desc.length as usize, 0);
+                    buf[..protocol::DESCRIPTOR_SIZE].copy_from_slice(&hdr);
+                    server_sock
+                        .read_exact(&mut buf[protocol::DESCRIPTOR_SIZE..])
+                        .await
+                        .unwrap();
+                    let (seq, cmd) = protocol::read_command_message(&mut &buf[..], ver).unwrap();
+                    out.clear();
+                    match cmd {
+                        protocol::Command::GetServerInfo => {
+                            let srv = protocol::ServerInfo {
+                                default_sink_name: Some(c"alsa_output.speaker".to_owned()),
+                                ..Default::default()
+                            };
+                            protocol::write_reply_message(&mut out, seq, &srv, ver).unwrap();
+                        }
+                        protocol::Command::GetSinkInfoList => {
+                            let mut sink = protocol::SinkInfo::new_dummy(1);
+                            sink.name = c"alsa_output.speaker".to_owned();
+                            sink.cvolume = VolumeModule::pct_to_channel_volume(42, 2);
+                            protocol::write_reply_message(&mut out, seq, &vec![sink], ver).unwrap();
+                        }
+                        other => panic!("Unexpected command after cancelled read: {other:?}"),
+                    }
+                    server_sock.write_all(&out).await.unwrap();
+                }
+            });
+
+            let mut session = PulseSession::connect(client_sock).await.expect("connect succeeds");
+            tokio::select! {
+                res = session.read_next_frame() => panic!("Expected cancellation before frame completed, got {res:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(15)) => {}
+            }
+
+            let (vol, _, _) = session
+                .fetch_state()
+                .await
+                .expect("fetch_state must succeed after cancelled read_next_frame");
+            assert_eq!(vol, 42);
+            assert!(
+                session.pending_event,
+                "Cancelled partial SubscribeEvent must still be delivered completely"
+            );
+            server_task.await.unwrap();
         });
     }
 }

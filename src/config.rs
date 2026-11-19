@@ -102,17 +102,7 @@ impl ClickActions {
     }
 
     pub fn try_run(&self, button: crate::modules::MouseButton) -> bool {
-        let cmd = match button {
-            crate::modules::MouseButton::Left => self.on_click_left.as_deref(),
-            crate::modules::MouseButton::Right => self.on_click_right.as_deref(),
-            crate::modules::MouseButton::Middle => self.on_click_middle.as_deref(),
-        };
-        if let Some(c) = cmd.map(str::trim).filter(|c| !c.is_empty()) {
-            crate::modules::spawn_command(c);
-            true
-        } else {
-            false
-        }
+        crate::modules::run_click_command(self.commands(), button)
     }
 }
 
@@ -462,8 +452,11 @@ pub fn load_config_with_error_in(config_dir: &std::path::Path) -> (AppConfig, Op
         }
     };
 
-    match reload_config_from_str(&content) {
-        Ok(cfg) => (cfg, None),
+    match reload_config_from_str_with_warnings(&content) {
+        Ok((cfg, warnings)) => {
+            let warn_opt = (!warnings.is_empty()).then(|| warnings.join("\n"));
+            (cfg, warn_opt)
+        }
         Err(err) => {
             crate::logger::emit(
                 "WARN",
@@ -478,26 +471,35 @@ pub fn load_config_with_error_in(config_dir: &std::path::Path) -> (AppConfig, Op
     }
 }
 
-/// Parse a TOML string into an [`AppConfig`], returning an error message with line/details on failure.
-pub fn reload_config_from_str(content: &str) -> Result<AppConfig, String> {
+/// Parse a TOML string into an [`AppConfig`] plus any non-fatal validation warnings.
+pub fn reload_config_from_str_with_warnings(content: &str) -> Result<(AppConfig, Vec<String>), String> {
     let table: toml::Table = toml::from_str(content).map_err(|e| format!("Syntax error in config.toml: {e}"))?;
-    Ok(parse_config_table(&table))
+    Ok(parse_config_table_with_warnings(&table))
 }
 
-/// Read and parse the on-disk `config.toml`, returning `Ok(AppConfig)` or `Err(error_details)`.
-pub fn reload_config() -> Result<AppConfig, String> {
+/// Parse a TOML string into an [`AppConfig`], returning an error message with line/details on failure.
+#[cfg(test)]
+pub fn reload_config_from_str(content: &str) -> Result<AppConfig, String> {
+    reload_config_from_str_with_warnings(content).map(|(cfg, _)| cfg)
+}
+
+/// Read and parse the on-disk `config.toml`, returning `Ok((AppConfig, warnings))` or `Err(error_details)`.
+pub fn reload_config_with_warnings() -> Result<(AppConfig, Vec<String>), String> {
     let config_dir = get_config_dir();
     let config_path = config_dir.join("config.toml");
     let content =
         fs::read_to_string(&config_path).map_err(|e| format!("Failed to read {}: {e}", config_path.display()))?;
-    reload_config_from_str(&content)
+    reload_config_from_str_with_warnings(&content)
+}
+
+fn push_config_warning(warnings: &mut Vec<String>, msg: String) {
+    crate::logger::emit("WARN", "config", &msg);
+    warnings.push(msg);
 }
 
 /// Build [`AppConfig`] from an already-parsed TOML table with per-section
-/// fallback: one bad value (e.g. `position = "centre"`) resets only its
-/// section, never the whole bar. Pure apart from warning logs, so tests
-/// can exercise typo resilience without touching the filesystem.
-pub fn parse_config_table(table: &toml::Table) -> AppConfig {
+/// fallback, returning both the effective config and any warnings emitted.
+pub fn parse_config_table_with_warnings(table: &toml::Table) -> (AppConfig, Vec<String>) {
     const KNOWN: &[&str] = &[
         "position",
         "size",
@@ -514,12 +516,13 @@ pub fn parse_config_table(table: &toml::Table) -> AppConfig {
         "clock",
         "spacer",
     ];
+    let mut warnings = Vec::new();
     for key in table.keys() {
         if !KNOWN.contains(&key.as_str()) {
-            crate::logger::emit("WARN", "config", &format!("Unknown config key '{key}', ignoring"));
+            push_config_warning(&mut warnings, format!("Unknown config key '{key}', ignoring"));
         }
     }
-    fn section<T>(table: &toml::Table, key: &str) -> T
+    fn section<T>(table: &toml::Table, key: &str, warnings: &mut Vec<String>) -> T
     where
         T: for<'de> serde::Deserialize<'de> + Default,
     {
@@ -538,75 +541,102 @@ pub fn parse_config_table(table: &toml::Table) -> AppConfig {
                 let mut candidate = map.clone();
                 candidate.remove(k);
                 if let Ok(s) = toml::Value::Table(candidate).try_into() {
-                    crate::logger::emit(
-                        "WARN",
-                        "config",
-                        &format!("Invalid [{key}] field '{k}'; using default for it"),
-                    );
+                    push_config_warning(warnings, format!("Invalid [{key}] field '{k}'; using default for it"));
                     return s;
                 }
             }
         }
         // Unsalvageable (multiple bad fields, or section isn't a table):
         // default the section, keep the rest of the file.
-        crate::logger::emit(
-            "WARN",
-            "config",
-            &format!("Invalid [{key}] section; using defaults for it"),
-        );
+        push_config_warning(warnings, format!("Invalid [{key}] section; using defaults for it"));
         T::default()
     }
-    // Scalar type errors (e.g. `size = "big"`) fall back with a hint.
-    let parse_int = |key: &str, default: i32| -> i32 {
+    // Scalar type / range errors (e.g. `size = "big"` or i64 overflow) fall back with a hint.
+    let mut parse_int = |key: &str, default: i32| -> i32 {
         match table.get(key) {
-            Some(v) => v.as_integer().map(|n| n as i32).unwrap_or_else(|| {
-                crate::log_warn!("config", "Invalid `{key}`, using {default}");
+            Some(v) => v.as_integer().and_then(|n| i32::try_from(n).ok()).unwrap_or_else(|| {
+                push_config_warning(&mut warnings, format!("Invalid `{key}`, using {default}"));
                 default
             }),
             None => default,
         }
     };
+    let size = parse_int("size", 50);
+    let spacing = parse_int("spacing", 0);
     let cfg = AppConfig {
-        position: section(table, "position"),
-        size: parse_int("size", 50),
-        spacing: parse_int("spacing", 0),
-        taskbar: section(table, "taskbar"),
-        tray: section(table, "tray"),
-        modules: section(table, "modules"),
-        volume: section(table, "volume"),
-        bluetooth: section(table, "bluetooth"),
-        network: section(table, "network"),
-        memory: section(table, "memory"),
-        brightness: section(table, "brightness"),
-        battery: section(table, "battery"),
-        clock: section(table, "clock"),
-        spacer: section(table, "spacer"),
+        position: section(table, "position", &mut warnings),
+        size,
+        spacing,
+        taskbar: section(table, "taskbar", &mut warnings),
+        tray: section(table, "tray", &mut warnings),
+        modules: section(table, "modules", &mut warnings),
+        volume: section(table, "volume", &mut warnings),
+        bluetooth: section(table, "bluetooth", &mut warnings),
+        network: section(table, "network", &mut warnings),
+        memory: section(table, "memory", &mut warnings),
+        brightness: section(table, "brightness", &mut warnings),
+        battery: section(table, "battery", &mut warnings),
+        clock: section(table, "clock", &mut warnings),
+        spacer: section(table, "spacer", &mut warnings),
     };
-    cfg.validated()
+    let validated = cfg.validated_with_warnings(&mut warnings);
+    (validated, warnings)
+}
+
+/// Build [`AppConfig`] from an already-parsed TOML table with per-section
+/// fallback: one bad value (e.g. `position = "centre"`) resets only its
+/// section, never the whole bar.
+#[cfg(test)]
+pub fn parse_config_table(table: &toml::Table) -> AppConfig {
+    parse_config_table_with_warnings(table).0
 }
 
 impl AppConfig {
-    /// Clamp invalid numerics with warnings instead of broken layout.
-    /// `step = 0` / `max_volume = 0` are handled at the use sites
-    /// (`volume`/`brightness` treat 0 as 10 / 100).
-    pub fn validated(mut self) -> Self {
-        fn clamp_range(val: &mut i32, range: std::ops::RangeInclusive<i32>, default: i32, name: &str) {
+    /// Clamp invalid numerics and formats with warnings instead of broken layout.
+    pub fn validated_with_warnings(mut self, warnings: &mut Vec<String>) -> Self {
+        fn clamp_range(
+            val: &mut i32,
+            range: std::ops::RangeInclusive<i32>,
+            default: i32,
+            name: &str,
+            warnings: &mut Vec<String>,
+        ) {
             if !range.contains(val) {
-                crate::log_warn!("config", "Invalid {name} {}, using {default}", *val);
+                push_config_warning(warnings, format!("Invalid {name} {}, using {default}", *val));
                 *val = default;
             }
         }
-        clamp_range(&mut self.size, 1..=500, 50, "size");
-        clamp_range(&mut self.spacing, 0..=100, 0, "spacing");
-        clamp_range(&mut self.taskbar.icon_size, 1..=256, 32, "taskbar.icon_size");
-        clamp_range(&mut self.tray.icon_size, 1..=256, 22, "tray.icon_size");
-        clamp_range(&mut self.tray.spacing, 0..=100, 4, "tray.spacing");
-        clamp_range(&mut self.spacer.size, 0..=500, 5, "spacer.size");
+        clamp_range(&mut self.size, 1..=500, 50, "size", warnings);
+        clamp_range(&mut self.spacing, 0..=100, 0, "spacing", warnings);
+        clamp_range(&mut self.taskbar.icon_size, 1..=256, 32, "taskbar.icon_size", warnings);
+        clamp_range(&mut self.tray.icon_size, 1..=256, 22, "tray.icon_size", warnings);
+        clamp_range(&mut self.tray.spacing, 0..=100, 4, "tray.spacing", warnings);
+        clamp_range(&mut self.spacer.size, 0..=500, 5, "spacer.size", warnings);
+
+        if self.battery.warning_threshold > 100 {
+            push_config_warning(
+                warnings,
+                format!(
+                    "battery.warning_threshold ({}) exceeds 100; clamping to 100",
+                    self.battery.warning_threshold
+                ),
+            );
+            self.battery.warning_threshold = 100;
+        }
+        if self.battery.critical_threshold > 100 {
+            push_config_warning(
+                warnings,
+                format!(
+                    "battery.critical_threshold ({}) exceeds 100; clamping to 100",
+                    self.battery.critical_threshold
+                ),
+            );
+            self.battery.critical_threshold = 100;
+        }
         if self.battery.warning_threshold < self.battery.critical_threshold {
-            crate::logger::emit(
-                "WARN",
-                "config",
-                &format!(
+            push_config_warning(
+                warnings,
+                format!(
                     "battery.warning_threshold ({}) must exceed critical ({}); swapping",
                     self.battery.warning_threshold, self.battery.critical_threshold
                 ),
@@ -616,10 +646,9 @@ impl AppConfig {
                 &mut self.battery.critical_threshold,
             );
         } else if self.battery.warning_threshold == self.battery.critical_threshold {
-            crate::logger::emit(
-                "WARN",
-                "config",
-                &format!(
+            push_config_warning(
+                warnings,
+                format!(
                     "battery.warning_threshold ({}) equals critical; resetting to 30/15",
                     self.battery.warning_threshold
                 ),
@@ -627,7 +656,45 @@ impl AppConfig {
             self.battery.warning_threshold = 30;
             self.battery.critical_threshold = 15;
         }
+
+        if !crate::modules::clock::is_valid_strftime(&self.clock.format_vertical) {
+            push_config_warning(
+                warnings,
+                format!(
+                    "Invalid clock.format_vertical '{}'; using default",
+                    self.clock.format_vertical
+                ),
+            );
+            self.clock.format_vertical = ClockConfig::default().format_vertical;
+        }
+        if !crate::modules::clock::is_valid_strftime(&self.clock.format_horizontal) {
+            push_config_warning(
+                warnings,
+                format!(
+                    "Invalid clock.format_horizontal '{}'; using default",
+                    self.clock.format_horizontal
+                ),
+            );
+            self.clock.format_horizontal = ClockConfig::default().format_horizontal;
+        }
+
+        for name in self
+            .modules
+            .start_modules()
+            .into_iter()
+            .chain(self.modules.end_modules())
+        {
+            if crate::bar::resolve_module_placement(&name).is_none() {
+                push_config_warning(warnings, format!("Unknown module '{name}' in [modules], ignoring"));
+            }
+        }
+
         self
+    }
+
+    pub fn validated(self) -> Self {
+        let mut warnings = Vec::new();
+        self.validated_with_warnings(&mut warnings)
     }
 }
 
@@ -1196,5 +1263,69 @@ mod tests {
             Some("bt %v")
         );
         assert!(cfg.get_levels_for_sink(false, false, false).is_none());
+    }
+
+    #[test]
+    fn test_parse_config_table_with_warnings_catches_typos_overflow_thresholds_and_clock_format() {
+        // Default config parses with zero warnings
+        let (_def_cfg, def_warnings) = reload_config_from_str_with_warnings(DEFAULT_CONFIG_TOML).unwrap();
+        assert!(
+            def_warnings.is_empty(),
+            "DEFAULT_CONFIG_TOML produced unexpected warnings: {def_warnings:?}"
+        );
+
+        let table: toml::Table = toml::from_str(
+            r#"
+            positon = "left"
+            position = "centre"
+            size = 9999999999
+            spacing = -1
+
+            [volume]
+            step = 5
+            max_volume = "loud"
+
+            [battery]
+            warning_threshold = 150
+            critical_threshold = 120
+
+            [clock]
+            format_vertical = "%Q"
+            format_horizontal = "%"
+
+            [modules]
+            start = ["taskbar"]
+            end = ["clok", "tray"]
+            "#,
+        )
+        .unwrap();
+
+        let (cfg, warnings) = parse_config_table_with_warnings(&table);
+        assert_eq!(cfg.position, BarPosition::Left);
+        assert_eq!(cfg.size, 50, "i64 overflow must fall back to 50, not wrap");
+        assert_eq!(cfg.spacing, 0);
+        assert_eq!(cfg.volume.step, 5);
+        assert_eq!(cfg.volume.max_volume, 150);
+        assert_eq!(cfg.battery.warning_threshold, 30);
+        assert_eq!(cfg.battery.critical_threshold, 15);
+        assert_eq!(cfg.clock.format_vertical, ClockConfig::default().format_vertical);
+        assert_eq!(cfg.clock.format_horizontal, ClockConfig::default().format_horizontal);
+
+        let joined = warnings.join("\n");
+        assert!(joined.contains("positon"), "missing unknown key warning: {joined}");
+        assert!(joined.contains("position"), "missing position warning: {joined}");
+        assert!(joined.contains("size"), "missing size overflow warning: {joined}");
+        assert!(joined.contains("spacing"), "missing spacing warning: {joined}");
+        assert!(joined.contains("max_volume"), "missing volume field warning: {joined}");
+        assert!(joined.contains("150"), "missing battery >100 warning: {joined}");
+        assert!(
+            joined.contains("format_vertical"),
+            "missing format_vertical warning: {joined}"
+        );
+        assert!(
+            joined.contains("format_horizontal"),
+            "missing format_horizontal warning: {joined}"
+        );
+        assert!(joined.contains("clok"), "missing unknown module warning: {joined}");
     }
 }

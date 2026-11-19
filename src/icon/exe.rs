@@ -23,11 +23,11 @@ enum CachedExeIcon {
     MemoryBytes(Vec<u8>),
 }
 
-static EXE_ICON_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedExeIcon>>> = OnceLock::new();
+static EXE_ICON_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedExeIcon>>> = OnceLock::new();
 static APP_ID_EXE_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 static WARMED_PID_APP_CACHE: OnceLock<Mutex<HashMap<u32, Vec<String>>>> = OnceLock::new();
 
-fn exe_icon_cache() -> &'static Mutex<HashMap<PathBuf, CachedExeIcon>> {
+fn exe_icon_cache() -> &'static Mutex<HashMap<(PathBuf, String), CachedExeIcon>> {
     EXE_ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -170,9 +170,10 @@ fn has_cached_exe_decision(app_id: &str) -> bool {
 /// Populate `EXE_ICON_CACHE` and `APP_ID_EXE_CACHE` for `(exe_path, app_id)` without
 /// touching any GTK objects (safe to call from background Tokio worker threads).
 fn warm_exe_icon_cache_for_path(exe_path: &Path, app_id: &str) -> CachedExeIcon {
+    let cache_key = (exe_path.to_path_buf(), app_id.to_lowercase());
     let cached = {
         let cache = crate::util::lock(exe_icon_cache());
-        cache.get(exe_path).cloned()
+        cache.get(&cache_key).cloned()
     };
 
     let resolved = match cached {
@@ -183,7 +184,7 @@ fn warm_exe_icon_cache_for_path(exe_path: &Path, app_id: &str) -> CachedExeIcon 
             if cache.len() >= MAX_EXE_CACHE_ENTRIES {
                 cache.clear();
             }
-            cache.insert(exe_path.to_path_buf(), found.clone());
+            cache.insert(cache_key, found.clone());
             found
         }
     };
@@ -460,5 +461,30 @@ mod tests {
         w.app_id = Some("org.example.WarmSecondApp".to_string());
         warm_window_icons_with(std::slice::from_ref(&w), &mut resolver);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn test_exe_icon_cache_separates_distinct_app_ids_for_same_exe() {
+        let temp_dir = TestTempDir::new("exe_multi_app");
+        let app_dir = temp_dir.join("shared-host");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let host_exe = app_dir.join("webhost");
+        std::fs::write(&host_exe, b"").unwrap();
+
+        let icon_a = app_dir.join("org.example.appa.png");
+        let icon_b = app_dir.join("org.example.appb.png");
+        write_test_png(&icon_a, 16, 16);
+        write_test_png(&icon_b, 24, 24);
+
+        let res_a = warm_exe_icon_cache_for_path(&host_exe, "org.example.AppA");
+        let res_b = warm_exe_icon_cache_for_path(&host_exe, "org.example.AppB");
+
+        match (res_a, res_b) {
+            (CachedExeIcon::FilePath(pa), CachedExeIcon::FilePath(pb)) => {
+                assert_eq!(pa, icon_a);
+                assert_eq!(pb, icon_b);
+            }
+            other => panic!("Expected two distinct FilePath entries, got {other:?}"),
+        }
     }
 }

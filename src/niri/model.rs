@@ -49,16 +49,6 @@ pub struct WindowLayout {
     pub pos_in_scrolling_layout: Option<(usize, usize)>,
 }
 
-fn truncate_opt(s: Option<String>) -> Option<String> {
-    s.map(|v| {
-        if v.len() <= 512 {
-            v
-        } else {
-            v.chars().take(512).collect()
-        }
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct WindowInfo {
     #[serde(default)]
@@ -82,7 +72,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(d)?;
-    Ok(truncate_opt(opt))
+    Ok(crate::util::truncate_opt(opt, 512))
 }
 
 #[derive(Debug, Clone, PartialEq)]

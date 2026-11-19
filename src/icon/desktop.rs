@@ -45,10 +45,7 @@ fn resolve_data_dirs(user_data: Option<&Path>, xdg_data_dirs: Option<&str>) -> V
 }
 
 fn get_data_dirs() -> Vec<PathBuf> {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok();
+    let data_home = crate::util::xdg_data_home();
     let xdg_data_dirs = std::env::var("XDG_DATA_DIRS").ok();
     resolve_data_dirs(data_home.as_deref(), xdg_data_dirs.as_deref())
 }
@@ -188,7 +185,7 @@ pub fn find_app_icon(app_id: &str) -> Option<String> {
 
 /// Preload desktop entries off the GTK thread at startup.
 pub fn preload_desktop_entries_async() {
-    crate::runtime::spawn(async {
+    crate::runtime::spawn_blocking(|| {
         let mut entries_lock = crate::util::lock(desktop_entries());
         entries_lock.get_or_insert_with(load_desktop_entries);
     });
@@ -248,21 +245,25 @@ fn find_in_theme_subdir(subdir: &Path, filenames: &[&str]) -> Option<PathBuf> {
     None
 }
 
-fn find_in_themes(data_dirs: &[PathBuf], mut probe_theme: impl FnMut(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
-    for data_dir in data_dirs {
-        let icons_dir = data_dir.join("icons");
-        if icons_dir.is_dir() {
-            for theme in XDG_THEMES {
-                let theme_dir = icons_dir.join(theme);
-                if theme_dir.is_dir() {
-                    if let Some(hit) = probe_theme(&theme_dir) {
-                        return Some(hit);
-                    }
+fn find_in_dir_themes(data_dir: &Path, mut probe_theme: impl FnMut(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    let icons_dir = data_dir.join("icons");
+    if icons_dir.is_dir() {
+        for theme in XDG_THEMES {
+            let theme_dir = icons_dir.join(theme);
+            if theme_dir.is_dir() {
+                if let Some(hit) = probe_theme(&theme_dir) {
+                    return Some(hit);
                 }
             }
         }
     }
     None
+}
+
+fn find_in_themes(data_dirs: &[PathBuf], mut probe_theme: impl FnMut(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    data_dirs
+        .iter()
+        .find_map(|data_dir| find_in_dir_themes(data_dir, &mut probe_theme))
 }
 
 /// Search XDG data dirs (`hicolor`, `AdwaitaLegacy`, `Adwaita`, `pixmaps`) for an application icon.
@@ -338,19 +339,12 @@ pub(crate) fn resolve_xdg_png_icon_in_dirs(safe_name: &str, data_dirs: &[PathBuf
     let filename = format!("{safe_name}.png");
     let refs = [filename.as_str()];
     for data_dir in data_dirs {
-        let icons_dir = data_dir.join("icons");
-        if icons_dir.is_dir() {
-            for theme in XDG_THEMES {
-                let theme_dir = icons_dir.join(theme);
-                if theme_dir.is_dir() {
-                    if let Some(hit) = XDG_SIZES
-                        .iter()
-                        .find_map(|sz| find_in_theme_subdir(&theme_dir.join(sz), &refs))
-                    {
-                        return Some(hit);
-                    }
-                }
-            }
+        if let Some(hit) = find_in_dir_themes(data_dir, |theme_dir| {
+            XDG_SIZES
+                .iter()
+                .find_map(|sz| find_in_theme_subdir(&theme_dir.join(sz), &refs))
+        }) {
+            return Some(hit);
         }
         let pixmap = data_dir.join("pixmaps").join(&filename);
         if pixmap.is_file() {

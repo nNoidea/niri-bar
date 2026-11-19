@@ -326,7 +326,9 @@ fn apply_existing_widget_state(
             widget.button.remove_css_class("is-dragging");
             widget.button.remove_css_class("drag-source-away");
             widget.button.set_opacity(1.0);
-            widget.button.set_cursor_from_name(Some("pointer"));
+            if widget.button.cursor().and_then(|c| c.name()).as_deref() != Some("pointer") {
+                widget.button.set_cursor_from_name(Some("pointer"));
+            }
         }
     }
 

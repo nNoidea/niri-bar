@@ -8,6 +8,8 @@ use zbus::fdo::DBusProxy;
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, Connection};
 
+use crate::modules::DbusSubscriptions;
+
 use super::item_client::{handle_activate_request, process_and_track_item};
 use super::protocol::parse_item_address;
 use super::types::{ActivateRequest, TrayEvent, TrayItem, TrayItemMap, TrayItemSnapshot, TrayMenu};
@@ -59,14 +61,14 @@ impl SessionState {
     }
 }
 
-struct AbortOnDrop(Vec<JoinHandle<()>>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        for h in self.0.drain(..) {
-            h.abort();
-        }
-    }
+fn compute_tray_backoff(prev_secs: u64, session_elapsed: Duration) -> (u64, u64) {
+    let sleep_secs = if session_elapsed >= Duration::from_secs(10) {
+        1
+    } else {
+        prev_secs
+    };
+    let next_secs = (sleep_secs * 2).min(30);
+    (sleep_secs, next_secs)
 }
 
 impl Drop for TrayService {
@@ -97,20 +99,26 @@ impl TrayService {
         crate::runtime::spawn(async move {
             let mut backoff_secs: u64 = 1;
             while !state.stopped.load(Ordering::Acquire) {
+                let session_started = std::time::Instant::now();
                 let session_result = run_tray_session(&state, &mut act_rx).await;
                 state.abort_item_tasks();
                 let Some(reason) = session_result else {
                     break;
                 };
-                log_warn!("tray", "Tray session lost ({reason}); reconnecting in {backoff_secs}s");
-                let sleep = tokio::time::sleep(Duration::from_secs(backoff_secs));
+                let (sleep_secs, next_secs) = compute_tray_backoff(backoff_secs, session_started.elapsed());
+                backoff_secs = next_secs;
+                log_warn!("tray", "Tray session lost ({reason}); reconnecting in {sleep_secs}s");
+                let sleep = tokio::time::sleep(Duration::from_secs(sleep_secs));
                 tokio::pin!(sleep);
                 loop {
+                    let notified = state.stop_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if state.stopped.load(Ordering::Acquire) {
                         return;
                     }
                     tokio::select! {
-                        _ = state.stop_notify.notified() => return,
+                        _ = notified => return,
                         _ = &mut sleep => break,
                         maybe_req = act_rx.recv() => {
                             if maybe_req.is_none() {
@@ -120,7 +128,6 @@ impl TrayService {
                         }
                     }
                 }
-                backoff_secs = (backoff_secs * 2).min(30);
             }
         });
 
@@ -135,7 +142,7 @@ impl TrayService {
 
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
-        self.stop_notify.notify_one();
+        self.stop_notify.notify_waiters();
     }
 
     pub(super) fn broadcast(subscribers: &Arc<Mutex<Vec<async_channel::Sender<TrayEvent>>>>, ev: TrayEvent) {
@@ -338,7 +345,7 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
         }
     };
 
-    let mut _session_tasks = AbortOnDrop(Vec::new());
+    let mut session_tasks = DbusSubscriptions::new(Vec::new());
 
     // Proactive discovery: Probe all already-running applications on DBus concurrently
     {
@@ -346,7 +353,7 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
         let proxy_p = Arc::clone(&dbus_proxy);
         let reg_tx_p = reg_item_tx.clone();
         let state_p = state.clone();
-        _session_tasks.0.push(tokio::spawn(async move {
+        session_tasks.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             probe_and_register_all(&conn_p, &proxy_p, &reg_tx_p, &state_p).await;
         }));
@@ -357,7 +364,7 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
     {
         let proxy_r = Arc::clone(&dbus_proxy);
         let state_r = state.clone();
-        _session_tasks.0.push(tokio::spawn(async move {
+        session_tasks.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
             reconcile_item_owners(&proxy_r, &state_r).await;
         }));
@@ -365,11 +372,14 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
 
     use futures_util::StreamExt;
     loop {
+        let notified = state.stop_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if state.stopped.load(Ordering::Acquire) {
             return None;
         }
         tokio::select! {
-            _ = state.stop_notify.notified() => {
+            _ = notified => {
                 return None;
             }
             Some((bus_name, object_path, key)) = reg_item_rx.recv() => {
@@ -423,7 +433,8 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
                     let sem_new = Arc::clone(&state.probe_sem);
                     let n = name.to_string();
                     let owner = new_owner.to_string();
-                    tokio::spawn(async move {
+                    session_tasks.prune_finished();
+                    session_tasks.push(tokio::spawn(async move {
                         let Ok(_permit) = sem_new.acquire_owned().await else {
                             return;
                         };
@@ -437,7 +448,7 @@ async fn run_tray_session(state: &SessionState, act_rx: &mut mpsc::Receiver<Acti
                             &reg_items_new,
                         )
                         .await;
-                    });
+                    }));
                 }
             }
         }
@@ -490,6 +501,7 @@ async fn probe_and_register_all(
         log_debug!("tray", "Probe skipped: list_names failed");
         return;
     };
+    let mut probes = tokio::task::JoinSet::new();
     for name in names {
         let s = name.to_string();
         if !s.starts_with(':') {
@@ -500,9 +512,11 @@ async fn probe_and_register_all(
         let reg_tx_c = reg_tx.clone();
         let reg_set_c = Arc::clone(&state.registered_items);
         let sem_c = Arc::clone(&state.probe_sem);
-        tokio::spawn(async move {
+        probes.spawn(async move {
             // Bound login-storm fan-out; excess probes wait.
-            let _permit = sem_c.acquire_owned().await.ok()?;
+            let Ok(_permit) = sem_c.acquire_owned().await else {
+                return;
+            };
             probe_single_service(
                 &conn_c,
                 Some(proxy_c.as_ref()),
@@ -512,9 +526,9 @@ async fn probe_and_register_all(
                 &reg_set_c,
             )
             .await;
-            Some(())
         });
     }
+    while probes.join_next().await.is_some() {}
 }
 
 async fn probe_prop(conn: &Connection, service: &str, path: &str, iface: &str, prop: &str) -> bool {
@@ -982,5 +996,17 @@ mod tests {
             assert!(reg_rx.try_recv().is_err());
             drop(server_conn);
         });
+    }
+
+    #[test]
+    fn test_compute_tray_backoff_resets_after_healthy_session() {
+        // Short sessions back off exponentially, capped at 30s.
+        assert_eq!(compute_tray_backoff(1, Duration::from_secs(0)), (1, 2));
+        assert_eq!(compute_tray_backoff(2, Duration::from_secs(2)), (2, 4));
+        assert_eq!(compute_tray_backoff(16, Duration::from_secs(9)), (16, 30));
+
+        // Healthy session (>= 10s) resets backoff back to 1s.
+        assert_eq!(compute_tray_backoff(30, Duration::from_secs(10)), (1, 2));
+        assert_eq!(compute_tray_backoff(30, Duration::from_secs(120)), (1, 2));
     }
 }

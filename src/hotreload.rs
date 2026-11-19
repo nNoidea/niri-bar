@@ -86,6 +86,46 @@ pub fn is_watched_file_event(event: gio::FileMonitorEvent) -> bool {
     )
 }
 
+fn apply_config_reload(
+    ctx: &ReconcileCtx,
+    sched: &Rc<dyn Fn()>,
+    new_config: crate::config::AppConfig,
+    warning: Option<String>,
+) {
+    let (Ok(mut cfg), Ok(mut mods), Ok(mut bars)) = (
+        ctx.config.try_borrow_mut(),
+        ctx.modules.try_borrow_mut(),
+        ctx.bars.try_borrow_mut(),
+    ) else {
+        log_warn!("config", "Config reload contended; rescheduling");
+        let next = ctx.clone();
+        let next_sched = Rc::clone(sched);
+        glib::idle_add_local_once(move || apply_config_reload(&next, &next_sched, new_config, warning));
+        return;
+    };
+
+    *cfg = new_config.clone();
+    mods.shutdown();
+    *mods = crate::modules::SharedModules::new(&new_config);
+    let old_bars: Vec<BarWindow> = bars.drain(..).collect();
+    drop(bars);
+    drop(mods);
+    drop(cfg);
+
+    crate::monitor::sync_tray_service(&ctx.tray_service, &new_config);
+    update_error_slot(ctx, false, warning, false);
+
+    if !old_bars.is_empty() {
+        ctx.niri.drag.cancel_active();
+        crate::niri::drag::reset_all_cursors_and_overlay(None);
+        for b in old_bars {
+            b.window.set_visible(false);
+            b.window.close();
+        }
+    }
+    sched();
+}
+
 pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -> Option<gio::FileMonitor> {
     let config_dir = crate::config::get_config_dir();
     let watch_path = fs::canonicalize(&config_dir).unwrap_or(config_dir);
@@ -142,27 +182,15 @@ pub fn setup_file_watcher(ctx: ReconcileCtx, schedule_reconcile: Rc<dyn Fn()>) -
                     }
                 }
             } else {
-                match crate::config::reload_config() {
-                    Ok(new_config) => {
-                        log_info!("config", "config.toml live-reloaded successfully; updating layout");
-                        if let Ok(mut cfg) = ctx.config.try_borrow_mut() {
-                            *cfg = new_config.clone();
+                match crate::config::reload_config_with_warnings() {
+                    Ok((new_config, warnings)) => {
+                        let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
+                        if warning.is_some() {
+                            log_warn!("config", "config.toml live-reloaded with warnings; updating layout");
+                        } else {
+                            log_info!("config", "config.toml live-reloaded successfully; updating layout");
                         }
-                        if let Ok(mut mods) = ctx.modules.try_borrow_mut() {
-                            mods.shutdown();
-                            *mods = crate::modules::SharedModules::new(&new_config);
-                        }
-                        crate::monitor::sync_tray_service(&ctx.tray_service, &new_config);
-
-                        update_error_slot(&ctx, false, None, false);
-
-                        if let Ok(mut bars) = ctx.bars.try_borrow_mut() {
-                            for b in bars.drain(..) {
-                                b.window.set_visible(false);
-                                b.window.close();
-                            }
-                        }
-                        sched();
+                        apply_config_reload(&ctx, &sched, new_config, warning);
                     }
                     Err(e) => {
                         log_warn!("config", "Live config reload error: {e}");

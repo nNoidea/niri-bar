@@ -1,8 +1,9 @@
 use chrono::Local;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixDatagram;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Persistent log file — written alongside stderr and journal so logs are always available
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
@@ -27,12 +28,31 @@ pub fn format_log_line(ts: &str, level: &str, tag: &str, content: &str) -> Strin
     format!("[{}] [{: <5}] [{}] {}", ts, level, tag, content)
 }
 
-/// Format a systemd-journal datagram payload for `tag`/`content`/`priority`.
-pub fn format_journal_payload(tag: &str, content: &str, priority: &str) -> String {
-    format!(
-        "MESSAGE=[{}] {}\nSYSLOG_IDENTIFIER=niri-bar\nPRIORITY={}\nNIRI_TAG={}\n",
-        tag, content, priority, tag
-    )
+fn append_journal_field(out: &mut Vec<u8>, key: &str, value: &str) {
+    if !value.contains('\n') && !value.contains('\r') {
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    } else {
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+}
+
+/// Encode a systemd-journal native datagram payload for `tag`/`content`/`priority`.
+/// Multiline fields use journald's binary length-prefixed encoding so errors are not dropped.
+pub fn encode_journal_payload(tag: &str, content: &str, priority: &str) -> Vec<u8> {
+    let message = format!("[{tag}] {content}");
+    let mut out = Vec::with_capacity(message.len() + tag.len() + 64);
+    append_journal_field(&mut out, "MESSAGE", &message);
+    append_journal_field(&mut out, "SYSLOG_IDENTIFIER", "niri-bar");
+    append_journal_field(&mut out, "PRIORITY", priority);
+    append_journal_field(&mut out, "NIRI_TAG", tag);
+    out
 }
 
 /// True when debug logging is enabled via `RUST_LOG` (contains
@@ -72,8 +92,8 @@ pub fn emit(level: &str, tag: &str, content: &str) {
     if let Ok(guard) = JOURNAL_SOCKET.lock() {
         if let Some(ref sock) = *guard {
             let priority = priority_for_level(level);
-            let payload = format_journal_payload(tag, content, priority);
-            let _ = sock.send(payload.as_bytes());
+            let payload = encode_journal_payload(tag, content, priority);
+            let _ = sock.send(&payload);
         }
     }
 }
@@ -115,9 +135,16 @@ pub fn timestamp() -> String {
 
 /// True when debug logging is currently enabled (see [`parse_debug_flag`]).
 pub fn is_debug_enabled() -> bool {
-    let rust_log = std::env::var("RUST_LOG").ok();
-    let niri_debug = std::env::var("NIRI_BAR_DEBUG").ok();
-    parse_debug_flag(rust_log.as_deref(), niri_debug.as_deref())
+    static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+    *DEBUG_ENABLED.get_or_init(|| {
+        let rust_log = std::env::var("RUST_LOG").ok();
+        let niri_debug = std::env::var("NIRI_BAR_DEBUG").ok();
+        parse_debug_flag(rust_log.as_deref(), niri_debug.as_deref())
+    })
+}
+
+fn current_uid() -> Option<u32> {
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 fn log_file_path() -> Option<std::path::PathBuf> {
@@ -127,28 +154,35 @@ fn log_file_path() -> Option<std::path::PathBuf> {
         }
     }
     // Per-UID fallback (no predictable /tmp symlink target).
-    if let Ok(uid) = std::env::var("UID").or_else(|_| std::env::var("EUID")) {
+    if let Some(uid) = current_uid() {
         return Some(std::path::PathBuf::from(format!("/tmp/niri-bar-{uid}.log")));
     }
     None
 }
 
-fn open_log_file() -> Option<File> {
-    let log_path = log_file_path()?;
+fn open_log_file_at(log_path: &std::path::Path) -> Option<File> {
     // Refuse symlinks (same-user hijack → append to victim file).
-    if let Ok(meta) = std::fs::symlink_metadata(&log_path) {
+    if let Ok(meta) = std::fs::symlink_metadata(log_path) {
         if meta.file_type().is_symlink() {
             eprintln!("niri-bar: refusing to log to symlink {log_path:?}");
             return None;
         }
         if should_rotate_log(meta.len()) {
             let backup = log_path.with_extension("log.1");
-            let _ = std::fs::rename(&log_path, &backup);
+            let _ = std::fs::rename(log_path, &backup);
         }
     }
-    // Mode 0600 via OpenOptions (umask applies); no O_NOFOLLOW in std, the
-    // symlink check above is the portable guard.
-    OpenOptions::new().create(true).append(true).open(&log_path).ok()
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)
+        .ok()
+}
+
+fn open_log_file() -> Option<File> {
+    let log_path = log_file_path()?;
+    open_log_file_at(&log_path)
 }
 
 /// Pure rotation decision for tests: true when `len` exceeds the 5MB cap.
@@ -233,11 +267,12 @@ mod tests {
 
     #[test]
     fn test_format_journal_payload() {
-        let payload = format_journal_payload("volume", "Volume changed to 80%", "6");
-        assert!(payload.contains("MESSAGE=[volume] Volume changed to 80%"));
-        assert!(payload.contains("SYSLOG_IDENTIFIER=niri-bar"));
-        assert!(payload.contains("PRIORITY=6"));
-        assert!(payload.contains("NIRI_TAG=volume"));
+        let payload = encode_journal_payload("volume", "Volume changed to 80%", "6");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("MESSAGE=[volume] Volume changed to 80%"));
+        assert!(text.contains("SYSLOG_IDENTIFIER=niri-bar"));
+        assert!(text.contains("PRIORITY=6"));
+        assert!(text.contains("NIRI_TAG=volume"));
     }
 
     #[test]
@@ -266,5 +301,53 @@ mod tests {
         assert!(!ts.is_empty());
         assert!(ts.contains('-'));
         assert!(ts.contains(':'));
+    }
+
+    #[test]
+    fn test_format_journal_payload_multiline_uses_binary_framing() {
+        let long_tail = "x".repeat(150);
+        let msg = format!("line1\n{long_tail}");
+        let bytes = encode_journal_payload("config", &msg, "4");
+        let expected_msg = format!("[config] {msg}");
+        let mut expected_prefix = Vec::new();
+        expected_prefix.extend_from_slice(b"MESSAGE\n");
+        expected_prefix.extend_from_slice(&(expected_msg.len() as u64).to_le_bytes());
+        expected_prefix.extend_from_slice(expected_msg.as_bytes());
+        expected_prefix.push(b'\n');
+        assert!(
+            bytes.starts_with(&expected_prefix),
+            "Multiline journald MESSAGE must use binary framing (MESSAGE\\n<u64 LE><bytes>\\n)"
+        );
+        assert!(bytes.ends_with(b"SYSLOG_IDENTIFIER=niri-bar\nPRIORITY=4\nNIRI_TAG=config\n"));
+    }
+
+    #[test]
+    fn test_current_uid_succeeds_on_linux() {
+        assert!(current_uid().is_some());
+    }
+
+    #[test]
+    fn test_open_log_file_at_sets_0600_and_refuses_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("niri_bar_logger_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let log_path = dir.join("niri-bar.log");
+        let file = open_log_file_at(&log_path).expect("log file must open");
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "Log file must be owner-only (0600), got {mode:o}");
+        drop(file);
+
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "secret").unwrap();
+        let link_path = dir.join("sym.log");
+        std::os::unix::fs::symlink(&victim, &link_path).unwrap();
+        assert!(
+            open_log_file_at(&link_path).is_none(),
+            "Symlink log target must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

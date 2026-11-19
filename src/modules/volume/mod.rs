@@ -70,7 +70,19 @@ impl VolumeModule {
                 let mut fail_streak: u32 = 0;
                 while !core_worker.is_stopped() {
                     let stream_res = match Self::resolve_pulse_socket() {
-                        Some(path) => tokio::net::UnixStream::connect(path).await.map_err(|e| e.to_string()),
+                        Some(path) => {
+                            let connect_fut =
+                                tokio::time::timeout(Duration::from_secs(2), tokio::net::UnixStream::connect(path));
+                            tokio::select! {
+                                biased;
+                                () = core_worker.wait_stopped() => break,
+                                res = connect_fut => match res {
+                                    Ok(Ok(s)) => Ok(s),
+                                    Ok(Err(e)) => Err(e.to_string()),
+                                    Err(_) => Err("PulseAudio connect timed out".to_string()),
+                                }
+                            }
+                        }
                         None => Err("PulseAudio socket not found".to_string()),
                     };
 
@@ -128,15 +140,24 @@ impl VolumeModule {
         cur_muted: &Arc<AtomicBool>,
         cur_sink: &Arc<Mutex<SinkInfo>>,
     ) {
-        let mut session = match PulseSession::connect(stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                log_debug!("volume", "PulseAudio handshake failed: {e}");
-                return;
+        let mut session = tokio::select! {
+            biased;
+            () = core.wait_stopped() => return,
+            res = PulseSession::connect(stream) => match res {
+                Ok(s) => s,
+                Err(e) => {
+                    log_debug!("volume", "PulseAudio handshake failed: {e}");
+                    return;
+                }
             }
         };
 
-        if let Ok((vol, muted, sink)) = session.fetch_state().await {
+        let init_fetch = tokio::select! {
+            biased;
+            () = core.wait_stopped() => return,
+            res = session.fetch_state() => res,
+        };
+        if let Ok((vol, muted, sink)) = init_fetch {
             cur_vol.store(vol, Ordering::Relaxed);
             cur_muted.store(muted, Ordering::Relaxed);
             *crate::util::lock(cur_sink) = sink.clone();
