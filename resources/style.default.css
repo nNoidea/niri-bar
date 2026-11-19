@@ -251,11 +251,6 @@ window.niri-bar.horizontal button.module-spacer {
     margin: 0;
 }
 
-
-.module-tray {
-    background-color: transparent;
-}
-
 /* System Tray Popup Menu Dark Mode Styling */
 popover.tray-menu > contents,
 popover.tray-menu contents,

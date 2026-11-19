@@ -213,9 +213,15 @@ impl DragController {
         }
     }
 
+    /// Unconditionally clears any active drag (e.g. on monitor disconnect or config hot-reload).
+    pub fn cancel_active(&self) -> bool {
+        crate::util::lock(&self.state).take().is_some()
+    }
+
     /// Take the active drag (if it belongs to `window_id`), decide the action,
-    /// and dispatch the Niri IPC off the GTK thread.
-    pub fn finish_drag(&self, window_id: u64, click_to_focus: bool) {
+    /// and dispatch the Niri IPC off the GTK thread. Returns `true` if a
+    /// matching drag was taken.
+    pub fn finish_drag(&self, window_id: u64, click_to_focus: bool) -> bool {
         let drag_opt = {
             let mut g = crate::util::lock(&self.state);
             match g.take() {
@@ -246,10 +252,11 @@ impl DragController {
                 }
                 action
             }
-            None => return,
+            None => return false,
         };
 
         dispatch_drag_action(window_id, action);
+        true
     }
 
     /// Handle `GestureDrag::drag_end` on a taskbar source button.
@@ -409,8 +416,11 @@ pub fn bar_logical_origin(
 /// 2. Deterministic fallback to the nearest monitor by clamped Euclidean distance,
 ///    so cursor positions in 1-pixel rounding gaps or bezel borders never drop the target.
 pub fn find_output_at_point(px: f64, py: f64, outputs: &HashMap<String, OutputInfo>) -> Option<String> {
+    let mut sorted: Vec<(&String, &OutputInfo)> = outputs.iter().collect();
+    sorted.sort_by_key(|(name, _)| name.as_str());
+
     let mut best: Option<(&String, f64)> = None;
-    for (name, out) in outputs {
+    for (name, out) in sorted {
         let Some(ref logical) = out.logical else {
             continue;
         };
@@ -482,10 +492,11 @@ pub fn close_overlay_windows() {
 }
 
 fn complete_overlay_drag(drag: &DragController, wid: u64, source_btn: &Button, tx: &async_channel::Sender<()>) {
-    reset_all_cursors_and_overlay(Some(source_btn));
     // Overlay exists only mid-drag: never click-to-focus.
-    drag.finish_drag(wid, false);
-    crate::util::nudge(tx);
+    if drag.finish_drag(wid, false) {
+        reset_all_cursors_and_overlay(Some(source_btn));
+        crate::util::nudge(tx);
+    }
 }
 
 /// Spawn fullscreen transparent layer-shell overlays on every monitor so a
@@ -1385,5 +1396,60 @@ mod tests {
         assert!(a.cancel_window(20));
         assert!(a.should_cleanup_cancel());
         assert!(!a.should_cleanup_cancel());
+
+        // Unconditional cancel_active clears active drag and returns true/false accurately.
+        assert!(!a.cancel_active());
+        a.begin_press(30, Some("eDP-1".into()), 0, (0.0, 0.0), (0.0, 0.0));
+        assert!(a.cancel_active());
+        assert_eq!(a.active_window_id(), None);
+
+        // finish_drag is idempotent: first release returns true, duplicate returns false.
+        assert!(!a.finish_drag(40, false));
+        a.begin_press(40, Some("eDP-1".into()), 0, (0.0, 0.0), (0.0, 0.0));
+        assert!(a.finish_drag(40, false));
+        assert!(!a.finish_drag(40, false));
+    }
+
+    #[test]
+    fn test_find_output_at_point_tie_break_is_deterministic() {
+        use crate::niri::model::LogicalOutput;
+        for _ in 0..20 {
+            let mut outputs = HashMap::new();
+            outputs.insert(
+                "HDMI-A-1".to_string(),
+                OutputInfo {
+                    name: Some("HDMI-A-1".into()),
+                    make: None,
+                    model: None,
+                    physical_size: None,
+                    logical: Some(LogicalOutput {
+                        x: 1000,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                        scale: None,
+                    }),
+                },
+            );
+            outputs.insert(
+                "DP-1".to_string(),
+                OutputInfo {
+                    name: Some("DP-1".into()),
+                    make: None,
+                    model: None,
+                    physical_size: None,
+                    logical: Some(LogicalOutput {
+                        x: 0,
+                        y: 0,
+                        width: 1000,
+                        height: 1080,
+                        scale: None,
+                    }),
+                },
+            );
+            // Point in gap below both at exact equidistant x = 1000.0 (DP-1 max_x=1000, HDMI min_x=1000)
+            //Wait: y=1080 is outside both, dist_sq is identical to both! Sorted name "DP-1" < "HDMI-A-1" must win.
+            assert_eq!(find_output_at_point(1000.0, 1085.0, &outputs).as_deref(), Some("DP-1"));
+        }
     }
 }

@@ -106,7 +106,7 @@ pub fn reconcile_monitors(
     niri: &Arc<NiriService>,
     tray_service: Option<&Arc<TrayService>>,
     modules: &SharedModules,
-) {
+) -> bool {
     // NOTE: no blocking IPC fetches here. `NiriService` owns outputs/workspaces
     // freshness on its background thread (event stream + `OutputsChanged`
     // refetch without holding the state lock). Fetching synchronously would
@@ -158,9 +158,16 @@ pub fn reconcile_monitors(
                 }
             });
         }
-        Err(e) => log_warn!("monitor", "Skipping disconnect pass: bars borrow failed: {e}"),
+        Err(e) => {
+            log_warn!("monitor", "Skipping reconcile: bars borrow failed: {e}");
+            return false;
+        }
     }
 
+    if !to_destroy.is_empty() {
+        niri.drag.cancel_active();
+        crate::niri::drag::reset_all_cursors_and_overlay(None);
+    }
     for win in to_destroy {
         // Deferred safe teardown: `close()` via idle so we don't tear down
         // inside the reconcile borrow. Main thread by construction.
@@ -173,8 +180,11 @@ pub fn reconcile_monitors(
     let existing_monitors: Vec<gdk::Monitor> = match bars.try_borrow() {
         Ok(list) => list.iter().map(|b| b.monitor.clone()).collect(),
         Err(e) => {
-            log_warn!("monitor", "Bars borrow failed during hotplug check: {e}");
-            Vec::new()
+            log_warn!(
+                "monitor",
+                "Skipping reconcile: bars borrow failed during hotplug check: {e}"
+            );
+            return false;
         }
     };
     let mut new_bars = Vec::new();
@@ -195,15 +205,25 @@ pub fn reconcile_monitors(
         }
     }
 
-    // 4. Attach new bars and update all active bars in a single borrow
+    // 4. Update existing bars first, then attach new bars (which already reconciled in BarWindow::new)
     match bars.try_borrow_mut() {
         Ok(mut list) => {
-            list.extend(new_bars);
             for b in list.iter_mut() {
                 b.update(niri, config);
             }
+            list.extend(new_bars);
+            true
         }
-        Err(e) => log_warn!("monitor", "Skipping bar updates: borrow failed: {e}"),
+        Err(e) => {
+            log_warn!("monitor", "Failed to attach new bars; closing and rescheduling: {e}");
+            for b in new_bars {
+                b.window.set_visible(false);
+                glib::idle_add_local_once(move || {
+                    b.window.close();
+                });
+            }
+            false
+        }
     }
 }
 
@@ -225,7 +245,9 @@ pub fn do_reconcile(ctx: &ReconcileCtx) {
             return;
         }
     };
-    reconcile_monitors(&ctx.display, &ctx.bars, &cfg, &ctx.niri, tray.as_ref(), &mods);
+    if !reconcile_monitors(&ctx.display, &ctx.bars, &cfg, &ctx.niri, tray.as_ref(), &mods) {
+        let _ = ctx.gate.try_schedule();
+    }
 
     if !err.is_empty() {
         refresh_error_badges(&ctx.bars, &err);
@@ -438,5 +460,43 @@ mod tests {
         });
         assert!(slot.borrow().is_none());
         assert!(first.is_stopped());
+    }
+
+    #[test]
+    fn test_reconcile_monitors_does_not_leak_or_duplicate_when_bars_borrowed() {
+        crate::util::run_gtk_test(|| {
+            let Some(display) = gdk::Display::default() else {
+                return;
+            };
+            let bars: Rc<RefCell<Vec<BarWindow>>> = Rc::new(RefCell::new(Vec::new()));
+            let cfg = AppConfig::default();
+            let niri = Arc::new(NiriService::new_mock());
+            let modules = SharedModules::new(&cfg);
+
+            reconcile_monitors(&display, &bars, &cfg, &niri, None, &modules);
+            let initial_bars = bars.borrow().len();
+            let before_toplevels = gtk::Window::list_toplevels().len();
+
+            // Hold an active borrow on `bars` (e.g. re-entrant GTK callback) and reconcile.
+            let guard = bars.borrow();
+            let ok = reconcile_monitors(&display, &bars, &cfg, &niri, None, &modules);
+            let after_toplevels = gtk::Window::list_toplevels().len();
+            drop(guard);
+            assert!(
+                !ok,
+                "Contended reconcile_monitors must return false so caller reschedules"
+            );
+
+            // Cleanup any bars we created (plus any leaked toplevels if buggy).
+            for b in bars.borrow_mut().drain(..) {
+                b.window.close();
+            }
+            modules.shutdown();
+
+            assert_eq!(
+                after_toplevels, before_toplevels,
+                "Contended bars borrow must not spawn duplicate/leaked BarWindows (initial bars: {initial_bars})"
+            );
+        });
     }
 }

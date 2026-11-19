@@ -84,7 +84,97 @@ struct AsarPackageJson {
 /// Uses a zero-tree selective serde visitor (`AsarSelectiveRoot`) so large `node_modules`
 /// trees in the JSON header are skipped in microseconds without heap allocations.
 pub fn extract_icon_bytes_from_asar(asar_path: &Path) -> Option<Vec<u8>> {
-    extract_icon_bytes_from_asar_selective(asar_path)
+    let mut file = fs::File::open(asar_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 16 {
+        return None;
+    }
+
+    let mut pre = [0u8; 16];
+    file.read_exact(&mut pre).ok()?;
+    let u0 = u32::from_le_bytes([pre[0], pre[1], pre[2], pre[3]]);
+    let u1 = u64::from(u32::from_le_bytes([pre[4], pre[5], pre[6], pre[7]]));
+    let json_len = u64::from(u32::from_le_bytes([pre[12], pre[13], pre[14], pre[15]]));
+
+    if u0 != 4 || json_len == 0 || json_len > MAX_ASAR_HEADER_BYTES || u1 > MAX_ASAR_HEADER_BYTES {
+        return None;
+    }
+    let data_base = 8u64.checked_add(u1)?;
+    if data_base > file_len || 16u64.checked_add(json_len)? > file_len {
+        return None;
+    }
+
+    let mut json_buf = vec![0u8; json_len as usize];
+    file.read_exact(&mut json_buf).ok()?;
+    let parsed: AsarSelectiveRoot = serde_json::from_slice(&json_buf).ok()?;
+    let top = parsed.files?;
+
+    let read_entry = |file: &mut fs::File, offset: u64, size: u64| -> Option<Vec<u8>> {
+        if size == 0 || size > MAX_ASAR_ICON_BYTES {
+            return None;
+        }
+        let abs_start = data_base.checked_add(offset)?;
+        let abs_end = abs_start.checked_add(size)?;
+        if abs_end > file_len {
+            return None;
+        }
+        file.seek(SeekFrom::Start(abs_start)).ok()?;
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+
+    let try_load = |file: &mut fs::File, rel_path: &str| -> Option<Vec<u8>> {
+        let (off, sz) = lookup_static(&top, rel_path)?;
+        let bytes = read_entry(file, off, sz)?;
+        has_valid_image_magic(&bytes).then_some(bytes)
+    };
+
+    // Fast path: check top-level `icon.png` / `icon.svg` first (covers 95% of Electron apps without reading `package.json`)
+    for fast in ["icon.png", "icon.svg"] {
+        if let Some(bytes) = try_load(&mut file, fast) {
+            return Some(bytes);
+        }
+    }
+
+    // Check if `package.json` specifies a custom `"icon"` path
+    if let Some((pkg_off, pkg_sz)) = resolve_leaf(top.package_json.as_ref()) {
+        if pkg_sz <= 64 * 1024 {
+            if let Some(pkg_bytes) = read_entry(&mut file, pkg_off, pkg_sz) {
+                if let Ok(pkg_val) = serde_json::from_slice::<AsarPackageJson>(&pkg_bytes) {
+                    if let Some(ic) = pkg_val.icon {
+                        let custom = ic.trim_start_matches("./");
+                        if let Some((off, sz)) =
+                            lookup_static(&top, custom).or_else(|| find_asar_entry_streaming(&json_buf, custom))
+                        {
+                            if let Some(bytes) = read_entry(&mut file, off, sz) {
+                                if has_valid_image_magic(&bytes) {
+                                    return Some(bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let subdir_candidates = [
+        "assets/icon.png",
+        "assets/icon.svg",
+        "resources/icon.png",
+        "resources/icon.svg",
+        "build/icon.png",
+        "dist/icon.png",
+    ];
+
+    for candidate in subdir_candidates {
+        if let Some(bytes) = try_load(&mut file, candidate) {
+            return Some(bytes);
+        }
+    }
+
+    None
 }
 
 fn resolve_leaf(leaf: Option<&AsarLeafEntry>) -> Option<(u64, u64)> {
@@ -204,100 +294,6 @@ fn find_asar_entry_streaming(json: &[u8], rel_path: &str) -> Option<(u64, u64)> 
         .flatten()
 }
 
-pub fn extract_icon_bytes_from_asar_selective(asar_path: &Path) -> Option<Vec<u8>> {
-    let mut file = fs::File::open(asar_path).ok()?;
-    let file_len = file.metadata().ok()?.len();
-    if file_len < 16 {
-        return None;
-    }
-
-    let mut pre = [0u8; 16];
-    file.read_exact(&mut pre).ok()?;
-    let u0 = u32::from_le_bytes([pre[0], pre[1], pre[2], pre[3]]);
-    let u1 = u64::from(u32::from_le_bytes([pre[4], pre[5], pre[6], pre[7]]));
-    let json_len = u64::from(u32::from_le_bytes([pre[12], pre[13], pre[14], pre[15]]));
-
-    if u0 != 4 || json_len == 0 || json_len > MAX_ASAR_HEADER_BYTES || u1 > MAX_ASAR_HEADER_BYTES {
-        return None;
-    }
-    let data_base = 8u64.checked_add(u1)?;
-    if data_base > file_len || 16u64.checked_add(json_len)? > file_len {
-        return None;
-    }
-
-    let mut json_buf = vec![0u8; json_len as usize];
-    file.read_exact(&mut json_buf).ok()?;
-    let parsed: AsarSelectiveRoot = serde_json::from_slice(&json_buf).ok()?;
-    let top = parsed.files?;
-
-    let read_entry = |file: &mut fs::File, offset: u64, size: u64| -> Option<Vec<u8>> {
-        if size == 0 || size > MAX_ASAR_ICON_BYTES {
-            return None;
-        }
-        let abs_start = data_base.checked_add(offset)?;
-        let abs_end = abs_start.checked_add(size)?;
-        if abs_end > file_len {
-            return None;
-        }
-        file.seek(SeekFrom::Start(abs_start)).ok()?;
-        let mut buf = vec![0u8; size as usize];
-        file.read_exact(&mut buf).ok()?;
-        Some(buf)
-    };
-
-    let try_load = |file: &mut fs::File, rel_path: &str| -> Option<Vec<u8>> {
-        let (off, sz) = lookup_static(&top, rel_path)?;
-        let bytes = read_entry(file, off, sz)?;
-        has_valid_image_magic(&bytes).then_some(bytes)
-    };
-
-    // Fast path: check top-level `icon.png` / `icon.svg` first (covers 95% of Electron apps without reading `package.json`)
-    for fast in ["icon.png", "icon.svg"] {
-        if let Some(bytes) = try_load(&mut file, fast) {
-            return Some(bytes);
-        }
-    }
-
-    // Check if `package.json` specifies a custom `"icon"` path
-    if let Some((pkg_off, pkg_sz)) = resolve_leaf(top.package_json.as_ref()) {
-        if pkg_sz <= 64 * 1024 {
-            if let Some(pkg_bytes) = read_entry(&mut file, pkg_off, pkg_sz) {
-                if let Ok(pkg_val) = serde_json::from_slice::<AsarPackageJson>(&pkg_bytes) {
-                    if let Some(ic) = pkg_val.icon {
-                        let custom = ic.trim_start_matches("./");
-                        if let Some((off, sz)) =
-                            lookup_static(&top, custom).or_else(|| find_asar_entry_streaming(&json_buf, custom))
-                        {
-                            if let Some(bytes) = read_entry(&mut file, off, sz) {
-                                if has_valid_image_magic(&bytes) {
-                                    return Some(bytes);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let subdir_candidates = [
-        "assets/icon.png",
-        "assets/icon.svg",
-        "resources/icon.png",
-        "resources/icon.svg",
-        "build/icon.png",
-        "dist/icon.png",
-    ];
-
-    for candidate in subdir_candidates {
-        if let Some(bytes) = try_load(&mut file, candidate) {
-            return Some(bytes);
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,7 +373,7 @@ mod tests {
         std::fs::write(&asar_path, &asar_bytes).unwrap();
 
         let t0 = std::time::Instant::now();
-        let extracted = extract_icon_bytes_from_asar_selective(&asar_path);
+        let extracted = extract_icon_bytes_from_asar(&asar_path);
         let elapsed = t0.elapsed();
 
         assert_eq!(extracted.as_deref(), Some(png_bytes.as_slice()));
@@ -394,7 +390,7 @@ mod tests {
         // directories, node_modules noise, and PNG payloads. See its generator note
         // in `src/icon/testdata/README.md`.
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/icon/testdata/sample_app.asar");
-        let bytes = extract_icon_bytes_from_asar_selective(&fixture)
+        let bytes = extract_icon_bytes_from_asar(&fixture)
             .expect("Fixture sample_app.asar must yield top-level icon.png bytes");
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         let pb = decode_png_bytes_to_pixbuf(&bytes, 24).expect("Must decode fixture PNG via cairo fast path");

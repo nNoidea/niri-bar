@@ -12,18 +12,18 @@ pub use service::TrayService;
 pub use widget::TrayWidget;
 
 #[cfg(test)]
-pub(super) mod test_socket {
+pub(crate) mod test_socket {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Debug)]
-    pub(super) struct TestUnixSocket {
+    pub(crate) struct TestUnixSocket {
         stream: tokio::net::UnixStream,
         bytes_read: Option<Arc<AtomicUsize>>,
     }
 
     impl TestUnixSocket {
-        pub(super) fn new(stream: tokio::net::UnixStream) -> Self {
+        pub(crate) fn new(stream: tokio::net::UnixStream) -> Self {
             Self {
                 stream,
                 bytes_read: None,
@@ -39,13 +39,13 @@ pub(super) mod test_socket {
     }
 
     #[derive(Debug)]
-    pub(super) struct TestUnixReader {
+    pub(crate) struct TestUnixReader {
         read: tokio::io::ReadHalf<tokio::net::UnixStream>,
         bytes_read: Option<Arc<AtomicUsize>>,
     }
 
     #[derive(Debug)]
-    pub(super) struct TestUnixWriter(tokio::io::WriteHalf<tokio::net::UnixStream>);
+    pub(crate) struct TestUnixWriter(tokio::io::WriteHalf<tokio::net::UnixStream>);
 
     impl zbus::connection::socket::Socket for TestUnixSocket {
         type ReadHalf = TestUnixReader;

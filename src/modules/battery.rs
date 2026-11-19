@@ -15,9 +15,10 @@ const UPOWER_DEV_IFACE: &str = "org.freedesktop.UPower.Device";
 
 pub struct BatteryModule {
     config: BatteryConfig,
-    /// Last known raw reading. Updated by the background worker; `current_state`
-    /// formats this cache so the GTK thread never does blocking UPower D-Bus I/O.
-    last: Arc<Mutex<Option<(u8, String)>>>,
+    /// Last known raw reading `(capacity, status, plugged)`. Updated by the
+    /// background worker; `current_state` formats this cache purely in memory
+    /// so the GTK thread never does blocking UPower or sysfs I/O.
+    last: Arc<Mutex<Option<(u8, String, bool)>>>,
     core: ModuleCore,
 }
 
@@ -28,7 +29,7 @@ impl BatteryModule {
         // Fast non-blocking sysfs seed at construction so `current_state` has
         // real data immediately without blocking startup on UPower D-Bus I/O.
         let (initial, _) = Self::read_battery_sysfs();
-        let last: Arc<Mutex<Option<(u8, String)>>> = Arc::new(Mutex::new(initial.clone()));
+        let last: Arc<Mutex<Option<(u8, String, bool)>>> = Arc::new(Mutex::new(initial.clone()));
 
         spawn_dbus_poller(
             core.clone(),
@@ -46,7 +47,7 @@ impl BatteryModule {
             Self::subscribe_triggers,
             Self::read_battery_full,
             move |bat_opt, orient| match bat_opt {
-                Some((cap, status)) => Self::format_state_static(&cfg, *cap, status, orient),
+                Some((cap, status, plugged)) => Self::format_state_with_plugged(&cfg, *cap, status, *plugged, orient),
                 None => Self::no_battery_state(),
             },
         );
@@ -83,7 +84,14 @@ impl BatteryModule {
         is_present && (device_type == 2 || device_type == 3)
     }
 
-    async fn read_battery_upower() -> Option<(u8, String)> {
+    pub fn round_upower_percentage(pct: f64) -> u8 {
+        if pct.is_nan() {
+            return 0;
+        }
+        pct.round().clamp(0.0, 100.0) as u8
+    }
+
+    async fn read_battery_upower() -> Option<(u8, String, bool)> {
         let conn = system_bus().await?;
 
         let (present_v, type_v, pct_v, state_v) = tokio::join!(
@@ -100,18 +108,19 @@ impl BatteryModule {
             return None;
         }
 
-        let percentage = f64::try_from(pct_v?).ok()? as u8;
+        let percentage = Self::round_upower_percentage(f64::try_from(pct_v?).ok()?);
         let state_u32 = u32::try_from(state_v?).ok()?;
         let status = Self::parse_upower_state(state_u32).to_string();
+        let plugged = Self::determine_plugged_in(&status);
 
-        Some((percentage, status))
+        Some((percentage, status, plugged))
     }
 
     /// Reading plus source health. Healthy when UPower answers, when a
     /// present battery is readable via sysfs, or when no battery exists at
     /// all (desktops idle cheaply). Unhealthy only when a present battery is
     /// unreadable from every source.
-    async fn read_battery_full() -> (Option<(u8, String)>, bool) {
+    async fn read_battery_full() -> (Option<(u8, String, bool)>, bool) {
         if let Some(upower_bat) = Self::read_battery_upower().await {
             return (Some(upower_bat), true);
         }
@@ -125,10 +134,12 @@ impl BatteryModule {
     }
 
     /// Sysfs scan plus whether any `BAT*` device exists at all.
-    fn read_battery_sysfs() -> (Option<(u8, String)>, bool) {
+    fn read_battery_sysfs() -> (Option<(u8, String, bool)>, bool) {
         let mut present = false;
         if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
-            for entry in entries.flatten() {
+            let mut sorted: Vec<_> = entries.flatten().collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("BAT") {
@@ -145,7 +156,8 @@ impl BatteryModule {
                         .to_string();
 
                     if let Some(c) = cap {
-                        return (Some((c, status)), true);
+                        let plugged = Self::determine_plugged_in(&status);
+                        return (Some((c.min(100), status, plugged)), true);
                     }
                 }
             }
@@ -153,18 +165,27 @@ impl BatteryModule {
         (None, present)
     }
 
-    fn is_plugged_in(status: &str) -> bool {
+    fn status_implies_plugged(status: &str) -> Option<bool> {
         if status.eq_ignore_ascii_case("Charging")
             || status.eq_ignore_ascii_case("Full")
             || status.eq_ignore_ascii_case("Not charging")
         {
-            return true;
+            Some(true)
+        } else if status.eq_ignore_ascii_case("Discharging") {
+            Some(false)
+        } else {
+            None
         }
-        if status.eq_ignore_ascii_case("Discharging") {
-            return false;
+    }
+
+    fn determine_plugged_in(status: &str) -> bool {
+        if let Some(plugged) = Self::status_implies_plugged(status) {
+            return plugged;
         }
         if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
-            for entry in entries.flatten() {
+            let mut sorted: Vec<_> = entries.flatten().collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
                 if let Ok(online) = fs::read_to_string(entry.path().join("online")) {
                     if online.trim() == "1" {
                         return true;
@@ -175,8 +196,13 @@ impl BatteryModule {
         false
     }
 
-    fn format_state_static(config: &BatteryConfig, cap: u8, status: &str, _orientation: Orientation) -> ModuleState {
-        let plugged = Self::is_plugged_in(status);
+    pub fn format_state_with_plugged(
+        config: &BatteryConfig,
+        cap: u8,
+        status: &str,
+        plugged: bool,
+        _orientation: Orientation,
+    ) -> ModuleState {
         let is_full = status.eq_ignore_ascii_case("Full") || (plugged && cap >= 100);
         let mut css_classes = Vec::new();
 
@@ -217,6 +243,12 @@ impl BatteryModule {
             css_classes,
         }
     }
+
+    #[cfg(test)]
+    fn format_state_static(config: &BatteryConfig, cap: u8, status: &str, orientation: Orientation) -> ModuleState {
+        let plugged = Self::status_implies_plugged(status).unwrap_or(false);
+        Self::format_state_with_plugged(config, cap, status, plugged, orientation)
+    }
     fn no_battery_state() -> ModuleState {
         ModuleState {
             icon: None,
@@ -233,9 +265,9 @@ impl BarModule for BatteryModule {
     }
 
     fn current_state(&self, orientation: Orientation) -> ModuleState {
-        // Lock-only: background worker owns UPower freshness (see `new`).
-        if let Some((cap, status)) = crate::util::lock(&self.last).clone() {
-            Self::format_state_static(&self.config, cap, &status, orientation)
+        // Lock-only: background worker owns UPower/sysfs freshness (see `new`).
+        if let Some((cap, status, plugged)) = crate::util::lock(&self.last).clone() {
+            Self::format_state_with_plugged(&self.config, cap, &status, plugged, orientation)
         } else {
             Self::no_battery_state()
         }
@@ -319,16 +351,42 @@ mod tests {
 
     #[test]
     fn test_current_state_uses_cached_last() {
-        // `current_state` must be lock-only (no UPower D-Bus on GTK thread).
+        // `current_state` must be lock-only (no UPower D-Bus or sysfs on GTK thread).
         let m = BatteryModule::new(BatteryConfig::default());
         let cached = crate::util::lock(&m.last).clone();
         let expected = match cached {
-            Some((cap, status)) => BatteryModule::format_state_static(&m.config, cap, &status, Orientation::Vertical),
+            Some((cap, status, plugged)) => {
+                BatteryModule::format_state_with_plugged(&m.config, cap, &status, plugged, Orientation::Vertical)
+            }
             None => BatteryModule::no_battery_state(),
         };
         let got = m.current_state(Orientation::Vertical);
         assert_eq!(got.text, expected.text);
         assert_eq!(got.tooltip, expected.tooltip);
+    }
+
+    #[test]
+    fn test_round_upower_percentage() {
+        assert_eq!(BatteryModule::round_upower_percentage(99.6), 100);
+        assert_eq!(BatteryModule::round_upower_percentage(49.4), 49);
+        assert_eq!(BatteryModule::round_upower_percentage(-5.0), 0);
+        assert_eq!(BatteryModule::round_upower_percentage(105.0), 100);
+        assert_eq!(BatteryModule::round_upower_percentage(f64::NAN), 0);
+    }
+
+    #[test]
+    fn test_format_state_with_plugged_unknown_status() {
+        let config = BatteryConfig::default();
+        let plugged_unknown =
+            BatteryModule::format_state_with_plugged(&config, 80, "Unknown", true, Orientation::Vertical);
+        assert_eq!(plugged_unknown.tooltip.as_deref(), Some("Plugged"));
+        assert!(plugged_unknown.css_classes.contains(&"charging".to_string()));
+
+        let unplugged_unknown =
+            BatteryModule::format_state_with_plugged(&config, 20, "Unknown", false, Orientation::Vertical);
+        assert_eq!(unplugged_unknown.tooltip.as_deref(), Some("Unplugged"));
+        assert!(unplugged_unknown.css_classes.contains(&"warning".to_string()));
+        assert!(!unplugged_unknown.css_classes.contains(&"charging".to_string()));
     }
 
     #[test]

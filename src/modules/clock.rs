@@ -1,5 +1,6 @@
 use chrono::{Local, Timelike};
 use gtk::Orientation;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::config::ClockConfig;
@@ -8,6 +9,25 @@ use crate::modules::{spawn_dbus_trigger, BarModule, DbusSubscriptions, ModuleCor
 pub struct ClockModule {
     config: ClockConfig,
     core: ModuleCore,
+}
+
+/// True when `fmt` contains no invalid `chrono` strftime specifiers.
+pub fn is_valid_strftime(fmt: &str) -> bool {
+    !chrono::format::StrftimeItems::new(fmt).any(|item| matches!(item, chrono::format::Item::Error))
+}
+
+/// Format `now` using `fmt`, falling back safely instead of panicking on invalid specifiers.
+pub fn format_time_safe(now: chrono::DateTime<chrono::Local>, fmt: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    if write!(out, "{}", now.format(fmt)).is_ok() {
+        return out;
+    }
+    log_warn!("clock", "Invalid clock format '{fmt}'; falling back");
+    out.clear();
+    if write!(out, "{}", now.format(fallback)).is_ok() {
+        return out;
+    }
+    format!("{:02}:{:02}", now.hour(), now.minute())
 }
 
 /// Computes duration until the next second (when `per_second` is true) or minute
@@ -54,9 +74,10 @@ impl ClockModule {
                 if cur_tick != last_tick {
                     last_tick = cur_tick;
 
-                    let text_vert = now.format(&fmt_vert).to_string();
-                    let text_horiz = now.format(&fmt_horiz).to_string();
-                    let tooltip = now.format("%A, %d %B (%m) %Y, %H:%M").to_string();
+                    let defaults = ClockConfig::default();
+                    let text_vert = format_time_safe(now, &fmt_vert, &defaults.format_vertical);
+                    let text_horiz = format_time_safe(now, &fmt_horiz, &defaults.format_horizontal);
+                    let tooltip = format_time_safe(now, "%A, %d %B (%m) %Y, %H:%M", "%Y-%m-%d %H:%M");
 
                     core_worker.broadcast(|orient| {
                         let text = if orient == Orientation::Vertical {
@@ -90,17 +111,18 @@ impl ClockModule {
     fn format_now(&self, orientation: Orientation) -> ModuleState {
         let now = Local::now();
         let is_vertical = orientation == Orientation::Vertical;
+        let defaults = ClockConfig::default();
 
         let text = if is_vertical {
-            now.format(&self.config.format_vertical).to_string()
+            format_time_safe(now, &self.config.format_vertical, &defaults.format_vertical)
         } else {
-            now.format(&self.config.format_horizontal).to_string()
+            format_time_safe(now, &self.config.format_horizontal, &defaults.format_horizontal)
         };
 
         ModuleState {
             icon: None,
             text: Some(text),
-            tooltip: Some(now.format("%A, %d %B (%m) %Y, %H:%M").to_string()),
+            tooltip: Some(format_time_safe(now, "%A, %d %B (%m) %Y, %H:%M", "%Y-%m-%d %H:%M")),
             css_classes: Vec::new(),
         }
     }
@@ -142,6 +164,7 @@ mod tests {
         let horiz_state = clock.current_state(Orientation::Horizontal);
         assert!(horiz_state.text.unwrap().contains(':'));
         assert!(horiz_state.tooltip.unwrap().contains('('));
+        clock.shutdown();
     }
 
     #[test]
@@ -153,10 +176,12 @@ mod tests {
         };
         let clock_non_clickable = ClockModule::new(config.clone());
         assert!(!clock_non_clickable.is_clickable());
+        clock_non_clickable.shutdown();
 
         config.click.on_click_left = Some("gnome-calendar".to_string());
         let clock_clickable = ClockModule::new(config);
         assert!(clock_clickable.is_clickable());
+        clock_clickable.shutdown();
     }
 
     #[test]
@@ -219,5 +244,27 @@ mod tests {
             );
         });
         clock.shutdown();
+    }
+
+    #[test]
+    fn test_is_valid_strftime() {
+        assert!(is_valid_strftime("%H:%M\n%a\n%b\n%d/%m"));
+        assert!(is_valid_strftime("%Y-%m-%d %H:%M:%S"));
+        assert!(!is_valid_strftime("%Q"));
+        assert!(!is_valid_strftime("%H:%"));
+    }
+
+    #[test]
+    fn test_clock_invalid_format_does_not_panic() {
+        let clock = ClockModule::new(ClockConfig {
+            format_vertical: "%Q".to_string(),
+            format_horizontal: "%H:%".to_string(),
+            ..Default::default()
+        });
+        let vert = clock.current_state(Orientation::Vertical);
+        let horiz = clock.current_state(Orientation::Horizontal);
+        clock.shutdown();
+        assert!(vert.text.as_deref().is_some_and(|t| !t.is_empty()));
+        assert!(horiz.text.as_deref().is_some_and(|t| !t.is_empty()));
     }
 }

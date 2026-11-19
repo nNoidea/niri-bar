@@ -18,14 +18,14 @@ pub(crate) fn has_valid_image_magic(bytes: &[u8]) -> bool {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
         return true;
     }
-    let prefix_len = bytes.len().min(512);
-    if let Ok(head) = std::str::from_utf8(&bytes[..prefix_len]) {
-        let trimmed = head.trim_start();
-        if trimmed.starts_with("<svg") || trimmed.starts_with("<?xml") {
-            return true;
-        }
-    }
-    false
+    let prefix = &bytes[..bytes.len().min(512)];
+    let head = match std::str::from_utf8(prefix) {
+        Ok(s) => s,
+        Err(e) if e.valid_up_to() > 0 => std::str::from_utf8(&prefix[..e.valid_up_to()]).unwrap_or(""),
+        Err(_) => return false,
+    };
+    let trimmed = head.trim_start_matches('\u{feff}').trim_start();
+    trimmed.starts_with("<svg") || trimmed.starts_with("<?xml")
 }
 
 /// Find the non-transparent bounding box in a pixbuf to crop empty borders.
@@ -257,11 +257,18 @@ pub fn decode_png_bytes_to_pixbuf(png_bytes: &[u8], target_size: i32) -> Option<
 /// Render a clean, lightweight fallback application icon (`Pixbuf`) in-process
 /// without touching `GtkIconTheme` or `libglycin`.
 pub fn fallback_executable_pixbuf(target_size: i32) -> Option<Pixbuf> {
-    if let Some(png_path) = crate::icon::desktop::resolve_xdg_png_icon("application-x-executable") {
-        if let Ok(bytes) = fs::read(&png_path) {
-            if let Some(pb) = decode_png_bytes_to_pixbuf(&bytes, target_size) {
-                return Some(normalize_pixbuf_to_size(pb, target_size.clamp(1, 512)));
-            }
+    static FALLBACK_ICON_PNG: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let cached_bytes = FALLBACK_ICON_PNG.get_or_init(|| {
+        let png_path = crate::icon::desktop::resolve_xdg_png_icon("application-x-executable")?;
+        let meta = fs::metadata(&png_path).ok()?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ASAR_ICON_BYTES {
+            return None;
+        }
+        fs::read(&png_path).ok()
+    });
+    if let Some(bytes) = cached_bytes.as_deref() {
+        if let Some(pb) = decode_png_bytes_to_pixbuf(bytes, target_size) {
+            return Some(normalize_pixbuf_to_size(pb, target_size.clamp(1, 512)));
         }
     }
     let size = if target_size <= 0 { 32 } else { target_size }.clamp(8, 512);
@@ -448,5 +455,22 @@ mod tests {
         dot.copy_area(4, 4, 4, 4, &pb, 20, 20);
         let norm = normalize_pixbuf_to_size(pb, 24);
         assert_eq!((norm.width(), norm.height()), (24, 24));
+    }
+
+    #[test]
+    fn test_has_valid_image_magic_handles_multibyte_utf8_at_512_boundary() {
+        // UTF-8 BOM + <svg>
+        let mut bom_svg = Vec::from("\u{feff}<svg width='16' height='16'/>");
+        assert!(has_valid_image_magic(&bom_svg));
+
+        // 512-byte cutoff lands mid-multibyte char inside leading XML comment
+        let mut pad_svg = String::from("<?xml version='1.0'?><!-- ");
+        while pad_svg.len() < 511 {
+            pad_svg.push('a');
+        }
+        pad_svg.push('é'); // 2 bytes: starts at 511, ends at 513 -> &[..512] splits 'é'!
+        pad_svg.push_str(" --><svg/>");
+        bom_svg = pad_svg.into_bytes();
+        assert!(has_valid_image_magic(&bom_svg));
     }
 }

@@ -19,9 +19,18 @@ pub fn brightness_poll_interval(has_device: bool) -> Duration {
     }
 }
 
+fn validate_backlight_dev_name(dev_name: &str) -> bool {
+    !dev_name.is_empty()
+        && dev_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '.')
+}
+
 pub struct BrightnessModule {
     config: BrightnessConfig,
     current_brightness: Arc<AtomicU32>,
+    pending_target: Arc<AtomicU32>,
+    cmd_tx: async_channel::Sender<()>,
     core: ModuleCore,
 }
 
@@ -31,39 +40,52 @@ impl BrightnessModule {
         // u32::MAX so the UI never fabricates `100%`.
         let b = Self::read_system_brightness().unwrap_or(u32::MAX);
         let current_brightness = Arc::new(AtomicU32::new(b));
+        let pending_target = Arc::new(AtomicU32::new(u32::MAX));
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<()>(1);
 
         let cur_b = Arc::clone(&current_brightness);
+        let pending_worker = Arc::clone(&pending_target);
         let cfg = config.clone();
         let core = ModuleCore::new();
         let core_worker = core.clone();
 
         crate::runtime::spawn(async move {
             let mut logged_no_device = false;
+            let mut suppress_until: Option<tokio::time::Instant> = None;
             loop {
                 if core_worker.is_stopped() {
                     break;
                 }
-                let reading = BrightnessModule::read_system_brightness();
-                match reading {
-                    Some(b) => {
-                        logged_no_device = false;
-                        let old_b = cur_b.load(Ordering::Relaxed);
-                        if b != old_b {
-                            cur_b.store(b, Ordering::Relaxed);
-                            core_worker.broadcast(|orient| BrightnessModule::format_state_with_config(&cfg, b, orient));
+                let poll_dur = brightness_poll_interval(cur_b.load(Ordering::Relaxed) != u32::MAX);
+                tokio::select! {
+                    biased;
+                    () = core_worker.wait_stopped() => break,
+                    recv = cmd_rx.recv() => {
+                        if recv.is_err() {
+                            break;
+                        }
+                        let target = pending_worker.swap(u32::MAX, Ordering::AcqRel);
+                        if target != u32::MAX {
+                            BrightnessModule::apply_set_brightness_dbus(target).await;
+                            suppress_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                         }
                     }
-                    None if !logged_no_device => {
-                        log_debug!("brightness", "No backlight device; hiding brightness value");
-                        logged_no_device = true;
+                    () = tokio::time::sleep(poll_dur) => {
+                        if let Some(until) = suppress_until {
+                            if tokio::time::Instant::now() < until {
+                                continue;
+                            }
+                            suppress_until = None;
+                        }
+                        let reading = BrightnessModule::read_system_brightness();
+                        BrightnessModule::apply_brightness_reading(
+                            &cur_b,
+                            reading,
+                            &cfg,
+                            &core_worker,
+                            &mut logged_no_device,
+                        );
                     }
-                    None => {}
-                }
-                if core_worker
-                    .wait_timeout_async(brightness_poll_interval(reading.is_some()))
-                    .await
-                {
-                    break;
                 }
             }
         });
@@ -71,13 +93,95 @@ impl BrightnessModule {
         Self {
             config,
             current_brightness,
+            pending_target,
+            cmd_tx,
             core,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(config: BrightnessConfig, initial: u32) -> (Self, async_channel::Receiver<()>) {
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<()>(1);
+        let core = ModuleCore::new();
+        core.shutdown();
+        (
+            Self {
+                config,
+                current_brightness: Arc::new(AtomicU32::new(initial)),
+                pending_target: Arc::new(AtomicU32::new(u32::MAX)),
+                cmd_tx,
+                core,
+            },
+            cmd_rx,
+        )
+    }
+
+    pub(crate) fn apply_brightness_reading(
+        cur_b: &AtomicU32,
+        reading: Option<u32>,
+        cfg: &BrightnessConfig,
+        core: &ModuleCore,
+        logged_no_device: &mut bool,
+    ) {
+        match reading {
+            Some(b) => {
+                let clamped = b.min(100);
+                *logged_no_device = false;
+                let old_b = cur_b.load(Ordering::Relaxed);
+                if clamped != old_b {
+                    cur_b.store(clamped, Ordering::Relaxed);
+                    core.broadcast(|orient| Self::format_state_with_config(cfg, clamped, orient));
+                }
+            }
+            None => {
+                if !*logged_no_device {
+                    log_debug!("brightness", "No backlight device; hiding brightness value");
+                    *logged_no_device = true;
+                }
+                let old_b = cur_b.swap(u32::MAX, Ordering::Relaxed);
+                if old_b != u32::MAX {
+                    core.broadcast(|_| Self::no_device_state());
+                }
+            }
+        }
+    }
+
+    async fn apply_set_brightness_dbus(target_pct: u32) {
+        let Some((dev_name, _, max)) = Self::get_backlight_device() else {
+            return;
+        };
+        if !validate_backlight_dev_name(&dev_name) {
+            log_warn!("brightness", "Refusing to use unexpected backlight device name");
+            return;
+        }
+        let target_units = compute_brightness_units(target_pct.min(100), max).min(u64::from(u32::MAX)) as u32;
+        let Some(conn) = system_bus().await else {
+            log_warn!("brightness", "System bus unavailable for SetBrightness");
+            return;
+        };
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.call_method(
+                Some("org.freedesktop.login1"),
+                "/org/freedesktop/login1/session/auto",
+                Some("org.freedesktop.login1.Session"),
+                "SetBrightness",
+                &("backlight", dev_name.as_str(), target_units),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log_warn!("brightness", "SetBrightness failed: {e}"),
+            Err(_) => log_warn!("brightness", "SetBrightness timed out"),
         }
     }
 
     fn get_backlight_device() -> Option<(String, u64, u64)> {
         if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
-            for entry in entries.flatten() {
+            let mut sorted: Vec<_> = entries.flatten().collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
                 let path = entry.path();
                 let dev_name = entry.file_name().to_string_lossy().to_string();
                 let cur = fs::read_to_string(path.join("brightness"))
@@ -99,7 +203,7 @@ impl BrightnessModule {
 
     fn read_system_brightness() -> Option<u32> {
         if let Some((_, cur, max)) = Self::get_backlight_device() {
-            return Some(((cur as f64 / max as f64) * 100.0).round() as u32);
+            return Some((((cur as f64 / max as f64) * 100.0).round() as u32).min(100));
         }
         None
     }
@@ -162,17 +266,15 @@ impl BarModule for BrightnessModule {
     }
 
     fn handle_scroll(&self, direction: ScrollDirection) {
-        // No device (desktop): never optimistically update the UI.
-        if self.current_brightness.load(Ordering::Relaxed) == u32::MAX && Self::get_backlight_device().is_none() {
+        // No device (desktop): never touch sysfs or optimistically update UI on GTK thread.
+        let cur = self.current_brightness.load(Ordering::Relaxed);
+        if cur == u32::MAX {
             log_debug!("brightness", "Scroll ignored: no backlight device");
             return;
         }
         let step = if self.config.step == 0 { 10 } else { self.config.step };
-        let cur = self.current_brightness.load(Ordering::Relaxed);
-        let cur = if cur == u32::MAX { 100 } else { cur };
-
         let new_b = match direction {
-            ScrollDirection::Up => (cur + step).min(100),
+            ScrollDirection::Up => cur.saturating_add(step).min(100),
             ScrollDirection::Down => cur.saturating_sub(step),
         };
 
@@ -180,40 +282,9 @@ impl BarModule for BrightnessModule {
         self.current_brightness.store(new_b, Ordering::Relaxed);
         self.dispatch_immediate_update();
 
-        // 2. Non-blocking in-process D-Bus call to systemd-logind (`SetBrightness("backlight", dev, u32)`).
-        if let Some((dev_name, _, max)) = BrightnessModule::get_backlight_device() {
-            if !dev_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '.')
-                || dev_name.is_empty()
-            {
-                log_warn!("brightness", "Refusing to use unexpected backlight device name");
-                return;
-            }
-            let target_units = compute_brightness_units(new_b, max).min(u64::from(u32::MAX)) as u32;
-            crate::runtime::spawn(async move {
-                let Some(conn) = system_bus().await else {
-                    log_warn!("brightness", "System bus unavailable for SetBrightness");
-                    return;
-                };
-                match tokio::time::timeout(
-                    Duration::from_millis(500),
-                    conn.call_method(
-                        Some("org.freedesktop.login1"),
-                        "/org/freedesktop/login1/session/auto",
-                        Some("org.freedesktop.login1.Session"),
-                        "SetBrightness",
-                        &("backlight", dev_name.as_str(), target_units),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => log_warn!("brightness", "SetBrightness failed: {e}"),
-                    Err(_) => log_warn!("brightness", "SetBrightness timed out"),
-                }
-            });
-        }
+        // 2. Coalesce onto the serialized background worker channel (`SetBrightness`).
+        self.pending_target.store(new_b, Ordering::Release);
+        let _ = self.cmd_tx.try_send(());
     }
 }
 
@@ -283,5 +354,49 @@ mod tests {
         assert_eq!(compute_brightness_units(100, 1000), 1000);
         assert_eq!(brightness_poll_interval(true), Duration::from_millis(500));
         assert_eq!(brightness_poll_interval(false), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_brightness_handle_scroll_no_device_is_noop_and_valid_device_queues_command() {
+        let (no_dev, rx_none) = BrightnessModule::new_for_test(BrightnessConfig::default(), u32::MAX);
+        no_dev.handle_scroll(ScrollDirection::Up);
+        assert_eq!(no_dev.current_brightness.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(no_dev.pending_target.load(Ordering::Relaxed), u32::MAX);
+        assert!(rx_none.try_recv().is_err());
+
+        let (valid_dev, rx_valid) = BrightnessModule::new_for_test(
+            BrightnessConfig {
+                step: 10,
+                ..Default::default()
+            },
+            50,
+        );
+        valid_dev.handle_scroll(ScrollDirection::Up);
+        valid_dev.handle_scroll(ScrollDirection::Up);
+        assert_eq!(valid_dev.current_brightness.load(Ordering::Relaxed), 70);
+        assert_eq!(valid_dev.pending_target.load(Ordering::Relaxed), 70);
+        // Channel bounded(1) coalesces multiple rapid scrolls to one wakeup carrying the latest target.
+        assert!(rx_valid.try_recv().is_ok());
+        assert!(rx_valid.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_brightness_apply_reading_resets_to_no_device_on_none() {
+        let cfg = BrightnessConfig::default();
+        let core = ModuleCore::new();
+        let rx = core.subscribe(Orientation::Vertical);
+        let cur = AtomicU32::new(60);
+        let mut logged = false;
+
+        BrightnessModule::apply_brightness_reading(&cur, None, &cfg, &core, &mut logged);
+        assert_eq!(cur.load(Ordering::Relaxed), u32::MAX);
+        assert!(logged);
+        let state = rx.try_recv().expect("must broadcast no-device state");
+        assert!(state.text.is_none());
+        assert!(state.css_classes.contains(&"no-device".to_string()));
+
+        // Repeated None must not re-broadcast unnecessarily.
+        BrightnessModule::apply_brightness_reading(&cur, None, &cfg, &core, &mut logged);
+        assert!(rx.try_recv().is_err());
     }
 }

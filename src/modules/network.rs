@@ -27,15 +27,9 @@ pub struct NetworkModule {
 
 /// Extract a string or object path from a `Properties.Get` reply variant.
 pub(crate) fn variant_to_string(v: &zbus::OwnedVariant) -> Option<String> {
-    fn inner_str(val: &zbus::Variant<'_>) -> Option<String> {
-        match val {
-            zbus::Variant::Str(s) => Some(s.as_str().to_string()),
-            zbus::Variant::ObjectPath(p) => Some(p.as_str().to_string()),
-            zbus::Variant::Variant(inner) => inner_str(inner),
-            _ => None,
-        }
-    }
-    inner_str(v.deref()).filter(|s| !s.is_empty())
+    crate::modules::dbus_variant_str_or_path(v.deref())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub(crate) fn variant_to_objpath_list(v: &zbus::OwnedVariant) -> Option<Vec<String>> {
@@ -44,12 +38,7 @@ pub(crate) fn variant_to_objpath_list(v: &zbus::OwnedVariant) -> Option<Vec<Stri
             zbus::Variant::Array(arr) => {
                 let mut list = Vec::new();
                 for item in arr.iter() {
-                    let s = match item {
-                        zbus::Variant::ObjectPath(p) => Some(p.as_str()),
-                        zbus::Variant::Str(st) => Some(st.as_str()),
-                        _ => None,
-                    };
-                    if let Some(s) = s {
+                    if let Some(s) = crate::modules::dbus_variant_str_or_path(item) {
                         // Skip the null path "/" used by NM for "no primary connection".
                         if s != "/" && !s.is_empty() {
                             list.push(s.to_string());
@@ -160,73 +149,94 @@ impl NetworkModule {
         }
     }
 
-    async fn read_network_state_dbus() -> Option<(NetworkType, Option<String>)> {
-        let conn = system_bus().await?;
-
-        // 1. Check PrimaryConnection
-        let primary_path = get_dbus_property_string(
-            &conn,
-            "org.freedesktop.NetworkManager",
-            "/org/freedesktop/NetworkManager",
-            "org.freedesktop.NetworkManager",
-            "PrimaryConnection",
-        )
-        .await;
-
-        let mut candidate_paths = Vec::new();
-        if let Some(ref path) = primary_path {
-            if path != "/" && !path.is_empty() {
-                candidate_paths.push(path.clone());
-            }
-        }
-
-        // 2. If no primary connection or invalid, check ActiveConnections
-        if candidate_paths.is_empty() {
-            if let Some(active_list) = get_dbus_property_objpath_list(
-                &conn,
-                "org.freedesktop.NetworkManager",
-                "/org/freedesktop/NetworkManager",
-                "org.freedesktop.NetworkManager",
-                "ActiveConnections",
-            )
-            .await
-            {
-                candidate_paths.extend(active_list);
-            }
-        }
-
-        for path in candidate_paths {
-            let (conn_type, id) = tokio::join!(
-                get_dbus_property_string(
-                    &conn,
-                    "org.freedesktop.NetworkManager",
-                    &path,
-                    "org.freedesktop.NetworkManager.Connection.Active",
-                    "Type",
-                ),
-                get_dbus_property_string(
-                    &conn,
-                    "org.freedesktop.NetworkManager",
-                    &path,
-                    "org.freedesktop.NetworkManager.Connection.Active",
-                    "Id",
-                ),
-            );
-            let conn_type = conn_type.unwrap_or_default();
-            let id = id.unwrap_or_default();
-
+    async fn resolve_nm_connections_with<Fp, Fa, Ft, FutP, FutA, FutT>(
+        mut get_primary: Fp,
+        mut get_actives: Fa,
+        mut get_type_and_id: Ft,
+    ) -> Option<(NetworkType, Option<String>)>
+    where
+        Fp: FnMut() -> FutP,
+        Fa: FnMut() -> FutA,
+        Ft: FnMut(String) -> FutT,
+        FutP: std::future::Future<Output = Option<String>>,
+        FutA: std::future::Future<Output = Option<Vec<String>>>,
+        FutT: std::future::Future<Output = (String, String)>,
+    {
+        let primary = get_primary().await.filter(|p| !p.is_empty() && p != "/");
+        if let Some(ref path) = primary {
+            let (conn_type, id) = get_type_and_id(path.clone()).await;
             let (ntype, ssid) = Self::parse_nm_connection_type_and_id(&conn_type, &id);
             if ntype != NetworkType::Disconnected {
                 return Some((ntype, ssid));
             }
         }
 
+        if let Some(active_list) = get_actives().await {
+            for path in active_list {
+                if primary.as_deref() == Some(path.as_str()) {
+                    continue;
+                }
+                let (conn_type, id) = get_type_and_id(path).await;
+                let (ntype, ssid) = Self::parse_nm_connection_type_and_id(&conn_type, &id);
+                if ntype != NetworkType::Disconnected {
+                    return Some((ntype, ssid));
+                }
+            }
+        }
+
         None
+    }
+
+    async fn read_network_state_dbus() -> Option<(NetworkType, Option<String>)> {
+        let conn = system_bus().await?;
+        Self::resolve_nm_connections_with(
+            || {
+                get_dbus_property_string(
+                    &conn,
+                    "org.freedesktop.NetworkManager",
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.NetworkManager",
+                    "PrimaryConnection",
+                )
+            },
+            || {
+                get_dbus_property_objpath_list(
+                    &conn,
+                    "org.freedesktop.NetworkManager",
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.NetworkManager",
+                    "ActiveConnections",
+                )
+            },
+            |path| {
+                let conn_ref = &conn;
+                async move {
+                    let (conn_type, id) = tokio::join!(
+                        get_dbus_property_string(
+                            conn_ref,
+                            "org.freedesktop.NetworkManager",
+                            &path,
+                            "org.freedesktop.NetworkManager.Connection.Active",
+                            "Type",
+                        ),
+                        get_dbus_property_string(
+                            conn_ref,
+                            "org.freedesktop.NetworkManager",
+                            &path,
+                            "org.freedesktop.NetworkManager.Connection.Active",
+                            "Id",
+                        ),
+                    );
+                    (conn_type.unwrap_or_default(), id.unwrap_or_default())
+                }
+            },
+        )
+        .await
     }
 
     fn update_best_route(best: &mut Option<(String, u32)>, iface: &str, flags: u32, metric: u32) {
         const RTF_UP: u32 = 0x1;
-        if flags & RTF_UP != 0 && best.as_ref().is_none_or(|(_, m)| metric < *m) {
+        if flags & RTF_UP != 0 && !is_virtual_interface(iface) && best.as_ref().is_none_or(|(_, m)| metric < *m) {
             *best = Some((iface.to_string(), metric));
         }
     }
@@ -482,6 +492,12 @@ mod tests {
         // Route not UP (flags & 0x1 == 0) ignored even with lower metric
         NetworkModule::update_best_route(&mut best, "eth2", 0x2, 10);
         assert_eq!(best, Some(("wlan0".to_string(), 50)));
+
+        // Virtual/container/VPN interfaces ignored even with metric 0
+        for virt in ["wg0", "tun0", "docker0"] {
+            NetworkModule::update_best_route(&mut best, virt, 0x3, 0);
+            assert_eq!(best, Some(("wlan0".to_string(), 50)));
+        }
     }
 
     #[test]
@@ -507,5 +523,58 @@ mod tests {
             variant_to_objpath_list(&paths_arr),
             Some(vec!["/org/freedesktop/NetworkManager/ActiveConnection/2".to_string()])
         );
+    }
+
+    #[test]
+    fn test_resolve_nm_candidates_falls_through_vpn_primary_to_wifi() {
+        use std::cell::Cell;
+        crate::runtime::handle().block_on(async {
+            // Case 1: PrimaryConnection is a VPN ("wireguard"), ActiveConnections has VPN + WiFi -> falls through to WiFi
+            let queried_actives = Cell::new(false);
+            let res = NetworkModule::resolve_nm_connections_with(
+                || async { Some("/org/freedesktop/NM/Active/vpn1".to_string()) },
+                || {
+                    queried_actives.set(true);
+                    async {
+                        Some(vec![
+                            "/org/freedesktop/NM/Active/vpn1".to_string(),
+                            "/org/freedesktop/NM/Active/wifi1".to_string(),
+                        ])
+                    }
+                },
+                |path| async move {
+                    if path.ends_with("vpn1") {
+                        ("wireguard".to_string(), "wg0".to_string())
+                    } else if path.ends_with("wifi1") {
+                        ("802-11-wireless".to_string(), "HomeNet".to_string())
+                    } else {
+                        ("unknown".to_string(), "".to_string())
+                    }
+                },
+            )
+            .await;
+            assert!(
+                queried_actives.get(),
+                "must query ActiveConnections when PrimaryConnection is VPN"
+            );
+            assert_eq!(res, Some((NetworkType::Wifi, Some("HomeNet".to_string()))));
+
+            // Case 2: PrimaryConnection is already WiFi -> ActiveConnections not queried
+            let queried_actives2 = Cell::new(false);
+            let res2 = NetworkModule::resolve_nm_connections_with(
+                || async { Some("/org/freedesktop/NM/Active/wifi2".to_string()) },
+                || {
+                    queried_actives2.set(true);
+                    async { None }
+                },
+                |_path| async move { ("802-11-wireless".to_string(), "WorkNet".to_string()) },
+            )
+            .await;
+            assert!(
+                !queried_actives2.get(),
+                "should skip ActiveConnections when PrimaryConnection resolved"
+            );
+            assert_eq!(res2, Some((NetworkType::Wifi, Some("WorkNet".to_string()))));
+        });
     }
 }

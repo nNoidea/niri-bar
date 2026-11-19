@@ -30,6 +30,7 @@ struct ModuleCoreInner {
     subscribers: Mutex<Vec<ModuleSubscriber>>,
     stopped: AtomicBool,
     notified: AtomicBool,
+    fast_poll: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -39,9 +40,14 @@ impl Default for ModuleCoreInner {
             subscribers: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             notified: AtomicBool::new(false),
+            fast_poll: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
+}
+
+pub(crate) fn is_dbus_conn_alive(conn: &zbus::Connection) -> bool {
+    !conn.is_closed()
 }
 
 /// Shared lazily-connected system D-Bus connection (`zbus`).
@@ -54,7 +60,7 @@ pub async fn system_bus() -> Option<zbus::Connection> {
     let cell = SYSTEM_BUS.get_or_init(|| tokio::sync::Mutex::new(None));
     let mut guard = cell.lock().await;
     if let Some(ref conn) = *guard {
-        if conn.unique_name().is_some() {
+        if is_dbus_conn_alive(conn) {
             return Some(conn.clone());
         }
     }
@@ -85,6 +91,14 @@ pub struct DbusSubscriptions(Vec<tokio::task::JoinHandle<()>>);
 impl DbusSubscriptions {
     pub fn new(handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
         Self(handles)
+    }
+
+    pub fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.0.push(handle);
+    }
+
+    pub fn prune_finished(&mut self) {
+        self.0.retain(|h| !h.is_finished());
     }
 }
 
@@ -160,6 +174,43 @@ pub async fn dbus_get_property(
     }
 }
 
+pub(crate) fn dbus_variant_str<'a>(val: &'a zbus::Variant<'a>) -> Option<&'a str> {
+    match val {
+        zbus::Variant::Str(s) => Some(s.as_str()),
+        zbus::Variant::Variant(inner) => dbus_variant_str(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn dbus_variant_str_or_path<'a>(val: &'a zbus::Variant<'a>) -> Option<&'a str> {
+    match val {
+        zbus::Variant::Str(s) => Some(s.as_str()),
+        zbus::Variant::ObjectPath(p) => Some(p.as_str()),
+        zbus::Variant::Variant(inner) => dbus_variant_str_or_path(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn dbus_variant_bool(val: &zbus::Variant<'_>) -> Option<bool> {
+    match val {
+        zbus::Variant::Bool(b) => Some(*b),
+        zbus::Variant::I32(i) => Some(*i != 0),
+        zbus::Variant::U32(u) => Some(*u != 0),
+        zbus::Variant::Variant(inner) => dbus_variant_bool(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn dbus_variant_i32(val: &zbus::Variant<'_>) -> Option<i32> {
+    match val {
+        zbus::Variant::I32(i) => Some(*i),
+        zbus::Variant::U32(u) => Some(*u as i32),
+        zbus::Variant::Bool(b) => Some(i32::from(*b)),
+        zbus::Variant::Variant(inner) => dbus_variant_i32(inner),
+        _ => None,
+    }
+}
+
 /// Core subscription and lifecycle helper shared across modules.
 #[derive(Clone, Default)]
 pub struct ModuleCore(Arc<ModuleCoreInner>);
@@ -192,6 +243,15 @@ impl ModuleCore {
     pub fn notify(&self) {
         self.0.notified.store(true, Ordering::SeqCst);
         self.0.notify.notify_waiters();
+    }
+
+    pub fn notify_fast(&self) {
+        self.0.fast_poll.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    pub fn take_fast_poll(&self) -> bool {
+        self.0.fast_poll.swap(false, Ordering::SeqCst)
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -293,7 +353,7 @@ pub fn spawn_dbus_poller<S, Fut>(
                 if stopped {
                     break;
                 }
-                if notified && spec.fast_poll_on_notify {
+                if notified && core.take_fast_poll() && spec.fast_poll_on_notify {
                     fast_poll_ticks = 40;
                     last_cached = None;
                 }
@@ -328,7 +388,7 @@ pub fn spawn_dbus_poller<S, Fut>(
                 fast_poll_ticks = 20;
             }
 
-            if last_renew.elapsed() >= Duration::from_secs(300) || fail_streak >= 3 {
+            if should_renew_subscriptions(last_renew.elapsed(), fail_streak) {
                 _live_subs = DbusSubscriptions::new(triggers(&core));
                 last_renew = std::time::Instant::now();
             }
@@ -436,17 +496,7 @@ pub trait BarModule: Send + Sync + 'static {
         (None, None, None)
     }
     fn handle_click(&self, button: MouseButton) {
-        let (left, right, middle) = self.click_commands();
-        let cmd = match button {
-            MouseButton::Left => left,
-            MouseButton::Right => right,
-            MouseButton::Middle => middle,
-        };
-        if let Some(c) = cmd {
-            if !c.trim().is_empty() {
-                spawn_command(c);
-            }
-        }
+        let _ = run_click_command(self.click_commands(), button);
     }
     fn handle_scroll(&self, _direction: ScrollDirection) {}
     fn is_clickable(&self) -> bool {
@@ -487,6 +537,39 @@ pub fn poll_backoff(base: std::time::Duration, fail_streak: u32, max: std::time:
     scaled.min(max)
 }
 
+/// Whether D-Bus signal match rules should be renewed on this poll tick.
+pub fn should_renew_subscriptions(elapsed: Duration, fail_streak: u32) -> bool {
+    elapsed >= Duration::from_secs(300) || fail_streak == 3
+}
+
+pub(crate) async fn run_shell_command_async(cmd: &str) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut command = tokio::process::Command::new("sh");
+    command.args(["-c", trimmed]);
+    crate::util::sanitize_child_command(&mut command);
+    match command.spawn() {
+        Ok(mut child) => match child.wait().await {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                crate::logger::emit("WARN", "modules", &format!("command exited with {status}: {trimmed}"));
+            }
+            Err(e) => {
+                crate::logger::emit(
+                    "WARN",
+                    "modules",
+                    &format!("failed waiting on command '{trimmed}': {e}"),
+                );
+            }
+        },
+        Err(e) => {
+            crate::logger::emit("WARN", "modules", &format!("failed to spawn command '{trimmed}': {e}"));
+        }
+    }
+}
+
 /// Spawn a user-configured shell command in the background.
 ///
 /// `sh -c` is kept intentionally: `on_click_*` values commonly use shell
@@ -501,32 +584,25 @@ pub fn spawn_command(cmd: &str) {
     }
     let cmd_owned = trimmed.to_string();
     crate::runtime::spawn(async move {
-        let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", &cmd_owned]);
-        crate::util::sanitize_child_command(&mut command);
-        match command.spawn() {
-            Ok(mut child) => match child.wait().await {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    crate::logger::emit("WARN", "modules", &format!("command exited with {status}: {cmd_owned}"));
-                }
-                Err(e) => {
-                    crate::logger::emit(
-                        "WARN",
-                        "modules",
-                        &format!("failed waiting on command '{cmd_owned}': {e}"),
-                    );
-                }
-            },
-            Err(e) => {
-                crate::logger::emit(
-                    "WARN",
-                    "modules",
-                    &format!("failed to spawn command '{cmd_owned}': {e}"),
-                );
-            }
-        }
+        run_shell_command_async(&cmd_owned).await;
     });
+}
+
+pub(crate) fn run_click_command(
+    (left, right, middle): (Option<&str>, Option<&str>, Option<&str>),
+    button: MouseButton,
+) -> bool {
+    let cmd = match button {
+        MouseButton::Left => left,
+        MouseButton::Right => right,
+        MouseButton::Middle => middle,
+    };
+    if let Some(c) = cmd.map(str::trim).filter(|c| !c.is_empty()) {
+        spawn_command(c);
+        true
+    } else {
+        false
+    }
 }
 
 pub fn update_button_cursor(button: &Button) {
@@ -538,8 +614,10 @@ pub fn update_button_cursor(button: &Button) {
             && !button.has_css_class("cursor-pointer"));
 
     if is_disabled {
-        button.set_cursor_from_name(None);
-    } else {
+        if button.cursor().is_some() {
+            button.set_cursor_from_name(None);
+        }
+    } else if button.cursor().and_then(|c| c.name()).as_deref() != Some("pointer") {
         button.set_cursor_from_name(Some("pointer"));
     }
 }
@@ -1292,5 +1370,141 @@ mod tests {
             assert!(button.has_css_class("two"));
             assert!(button.has_css_class("clickable"));
         });
+    }
+
+    #[test]
+    fn test_is_dbus_conn_alive_detects_closed_connection() {
+        crate::runtime::handle().block_on(async {
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let _server_conn = zbus::connection::Builder::authenticated_socket(
+                crate::modules::tray::test_socket::TestUnixSocket::new(server_stream),
+                "0123456789abcdef0123456789abcdef",
+            )
+            .build()
+            .await
+            .unwrap();
+            let conn = zbus::connection::Builder::authenticated_socket(
+                crate::modules::tray::test_socket::TestUnixSocket::new(client_stream),
+                "0123456789abcdef0123456789abcdef",
+            )
+            .build()
+            .await
+            .unwrap();
+            assert!(is_dbus_conn_alive(&conn));
+            conn.clone().close().await.unwrap();
+            assert!(
+                !is_dbus_conn_alive(&conn),
+                "Closed D-Bus connection must report not alive so system_bus reconnects"
+            );
+        });
+    }
+
+    #[test]
+    fn test_should_renew_subscriptions_does_not_churn_past_streak_three() {
+        assert!(!should_renew_subscriptions(Duration::from_secs(10), 0));
+        assert!(!should_renew_subscriptions(Duration::from_secs(10), 2));
+        assert!(should_renew_subscriptions(Duration::from_secs(10), 3));
+        assert!(
+            !should_renew_subscriptions(Duration::from_secs(10), 4),
+            "Must not re-create D-Bus subscriptions on every tick while backend stays absent"
+        );
+        assert!(should_renew_subscriptions(Duration::from_secs(300), 10));
+    }
+
+    #[test]
+    fn test_dbus_poller_does_not_fast_poll_on_plain_notify() {
+        use std::sync::atomic::AtomicUsize;
+
+        let core = ModuleCore::new();
+        let last = Arc::new(Mutex::new(0u32));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_w = Arc::clone(&polls);
+
+        spawn_dbus_poller(
+            core.clone(),
+            0u32,
+            last,
+            DbusPollSpec {
+                tag: "test",
+                base_interval: Duration::from_secs(60),
+                max_interval: Duration::from_secs(60),
+                fast_poll_on_notify: true,
+                degraded_msg: "degraded",
+                degraded_is_warn: false,
+                is_transitional: |_| false,
+            },
+            |_| Vec::new(),
+            move || {
+                let p = Arc::clone(&polls_w);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                    (1u32, true)
+                }
+            },
+            |_, _| ModuleState::default(),
+        );
+
+        crate::runtime::handle().block_on(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            core.notify();
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        });
+        let count = polls.load(Ordering::SeqCst);
+        core.shutdown();
+        assert!(
+            count <= 2,
+            "Plain D-Bus signal notify() must not trigger a 100ms fast-poll storm (got {count} polls)"
+        );
+    }
+
+    #[test]
+    fn test_dbus_poller_fast_polls_on_notify_fast() {
+        use std::sync::atomic::AtomicUsize;
+
+        let core = ModuleCore::new();
+        let last = Arc::new(Mutex::new(0u32));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_w = Arc::clone(&polls);
+
+        spawn_dbus_poller(
+            core.clone(),
+            0u32,
+            last,
+            DbusPollSpec {
+                tag: "test",
+                base_interval: Duration::from_secs(60),
+                max_interval: Duration::from_secs(60),
+                fast_poll_on_notify: true,
+                degraded_msg: "degraded",
+                degraded_is_warn: false,
+                is_transitional: |_| false,
+            },
+            |_| Vec::new(),
+            move || {
+                let p = Arc::clone(&polls_w);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                    (1u32, true)
+                }
+            },
+            |_, _| ModuleState::default(),
+        );
+
+        crate::runtime::handle().block_on(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            core.notify_fast();
+            for _ in 0..30 {
+                if polls.load(Ordering::SeqCst) >= 4 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let count = polls.load(Ordering::SeqCst);
+        core.shutdown();
+        assert!(
+            count >= 4,
+            "Explicit notify_fast() must trigger 100ms fast-poll burst (got {count} polls)"
+        );
     }
 }

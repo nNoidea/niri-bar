@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
@@ -8,11 +9,18 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 #[allow(clippy::exit)]
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
+        static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
         match Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
             .thread_keep_alive(std::time::Duration::from_millis(50))
-            .thread_name("niri-bar-tokio")
+            .thread_name_fn(|| {
+                if THREAD_ID.fetch_add(1, Ordering::Relaxed) == 0 {
+                    "niri-bar-tokio".to_string()
+                } else {
+                    "niri-bar-block".to_string()
+                }
+            })
             .enable_all()
             .build()
         {
@@ -38,6 +46,15 @@ where
     F::Output: Send + 'static,
 {
     handle().spawn(future)
+}
+
+/// Spawns a blocking closure onto Tokio's blocking thread pool.
+pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    handle().spawn_blocking(f)
 }
 
 /// Number of OS threads in the current process.
@@ -115,5 +132,15 @@ mod tests {
             count, 1,
             "Expected exactly 1 permanent niri-bar-tokio worker thread, got {count}"
         );
+    }
+
+    #[test]
+    fn test_spawn_blocking_uses_separate_thread_and_preserves_single_worker_count() {
+        let name = handle()
+            .block_on(spawn_blocking(|| {
+                std::thread::current().name().unwrap_or("").to_string()
+            }))
+            .unwrap();
+        assert_eq!(name, "niri-bar-block");
     }
 }

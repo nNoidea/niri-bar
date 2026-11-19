@@ -18,6 +18,44 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values.
+pub fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// Truncate an optional owned string to at most `max_chars` Unicode scalar values.
+pub fn truncate_opt(s: Option<String>, max_chars: usize) -> Option<String> {
+    s.map(|v| {
+        if v.len() <= max_chars {
+            v
+        } else {
+            v.chars().take(max_chars).collect()
+        }
+    })
+}
+
+/// Pure XDG data home resolution: prefers non-blank `XDG_DATA_HOME`,
+/// falling back to `<HOME>/.local/share`.
+pub fn resolve_xdg_data_home(xdg: Option<&str>, home: Option<&str>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = xdg.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    home.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|h| std::path::PathBuf::from(h).join(".local/share"))
+}
+
+/// Resolve `$XDG_DATA_HOME` (or `$HOME/.local/share`), ignoring blank overrides.
+pub fn xdg_data_home() -> Option<std::path::PathBuf> {
+    let xdg = std::env::var("XDG_DATA_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    resolve_xdg_data_home(xdg.as_deref(), home.as_deref())
+}
+
 /// Nudge the main-thread updater.
 ///
 /// The update channel is unbounded and coalesced by the receiver (`while
@@ -500,5 +538,31 @@ mod tests {
         .join()
         .unwrap();
         assert!(*lock(&ran_second));
+    }
+
+    #[test]
+    fn test_resolve_xdg_data_home_ignores_blank() {
+        assert_eq!(
+            resolve_xdg_data_home(Some(""), Some("/home/tester")),
+            Some(std::path::PathBuf::from("/home/tester/.local/share"))
+        );
+        assert_eq!(
+            resolve_xdg_data_home(Some("   "), Some("/home/tester")),
+            Some(std::path::PathBuf::from("/home/tester/.local/share"))
+        );
+        assert_eq!(
+            resolve_xdg_data_home(Some("/custom/data"), Some("/home/tester")),
+            Some(std::path::PathBuf::from("/custom/data"))
+        );
+        assert_eq!(resolve_xdg_data_home(Some(""), Some("  ")), None);
+    }
+
+    #[test]
+    fn test_truncate_str_and_opt() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello");
+        assert_eq!(truncate_str("éééé", 2), "éé");
+        assert_eq!(truncate_opt(None, 5), None);
+        assert_eq!(truncate_opt(Some("abcdef".to_string()), 3), Some("abc".to_string()));
     }
 }

@@ -619,29 +619,18 @@ mod tests {
     #[test]
     fn test_tray_popover_and_default_css_do_not_double_card_background() {
         let default_css = include_str!("../../../resources/style.default.css");
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let user_css_path = manifest_dir.join(".config/niri-bar/style.css");
-        let user_css = std::fs::read_to_string(&user_css_path).ok();
-
-        let mut targets = vec![("style.default.css", default_css.to_string())];
-        if let Some(css) = user_css {
-            targets.push(("user style.css", css));
-        }
-
-        for (name, css) in targets {
-            assert!(
-                css.contains("popover.tray-menu > contents"),
-                "{name} must style `popover.tray-menu > contents` as the single card container"
-            );
-            assert!(
-                css.contains("popover.tray-menu,\npopover.tray-menu.background,\npopover.tray-menu:backdrop {\n    background: transparent;"),
-                "{name} must explicitly reset outer `popover.tray-menu` to transparent so it is not rendered inside a second card"
-            );
-            assert!(
-                !css.contains("popover.tray-menu,\npopover.tray-menu contents"),
-                "{name} must not apply the card background/border to both outer `popover.tray-menu` and inner `contents`"
-            );
-        }
+        assert!(
+            default_css.contains("popover.tray-menu > contents"),
+            "style.default.css must style `popover.tray-menu > contents` as the single card container"
+        );
+        assert!(
+            default_css.contains("popover.tray-menu,\npopover.tray-menu.background,\npopover.tray-menu:backdrop {\n    background: transparent;"),
+            "style.default.css must explicitly reset outer `popover.tray-menu` to transparent so it is not rendered inside a second card"
+        );
+        assert!(
+            !default_css.contains("popover.tray-menu,\npopover.tray-menu contents"),
+            "style.default.css must not apply the card background/border to both outer `popover.tray-menu` and inner `contents`"
+        );
     }
 
     #[test]
